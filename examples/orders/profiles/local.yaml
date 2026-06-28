@@ -1,9 +1,0 @@
-# Binding profile: local. Selected by default (`datamk run`).
-# Environment-specific; values may reference ${VARS} for secrets.
-catalog: ./.cell/catalog.ducklake    # file -> sqlite: -> postgres:
-storage: ./.cell/data                # file:// -> s3:// -> gs://
-# principals: ./.cell/principals.json   # token -> roles (only when access.roles is set)
-# s3:                                # only when storage/sources are s3://
-#   region: ${AWS_REGION:-us-east-1} # omit key_id/secret to use the AWS credential chain
-#   # endpoint: ${S3_ENDPOINT}       # MinIO / Cloudflare R2
-#   # url_style: path

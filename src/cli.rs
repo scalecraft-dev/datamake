@@ -2,7 +2,11 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "datamk", version, about = "the cell — reduce time to value for data")]
+#[command(
+    name = "datamk",
+    version,
+    about = "the cell — reduce time to value for data"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

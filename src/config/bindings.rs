@@ -139,3 +139,237 @@ pub fn expand(input: &str) -> Result<String> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::schema::{Bindings, CellLocation, Export, S3Binding};
+    use super::*;
+
+    #[test]
+    fn expand_passes_literals_through() {
+        assert_eq!(
+            expand("plain text, no vars").unwrap(),
+            "plain text, no vars"
+        );
+        assert_eq!(expand("").unwrap(), "");
+    }
+
+    #[test]
+    fn expand_substitutes_a_set_var() {
+        std::env::set_var("DATAMK_TEST_EXPAND_SET", "world");
+        assert_eq!(
+            expand("hello ${DATAMK_TEST_EXPAND_SET}!").unwrap(),
+            "hello world!"
+        );
+    }
+
+    #[test]
+    fn expand_uses_default_when_var_unset() {
+        // A var name that is (almost certainly) never set in the environment.
+        assert_eq!(
+            expand("${DATAMK_TEST_UNSET_XYZ:-fallback}").unwrap(),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn expand_empty_default_yields_empty() {
+        assert_eq!(expand("${DATAMK_TEST_UNSET_EMPTY:-}").unwrap(), "");
+    }
+
+    #[test]
+    fn expand_prefers_set_var_over_default() {
+        std::env::set_var("DATAMK_TEST_EXPAND_PREF", "real");
+        assert_eq!(
+            expand("${DATAMK_TEST_EXPAND_PREF:-fallback}").unwrap(),
+            "real"
+        );
+    }
+
+    #[test]
+    fn expand_errors_on_unset_without_default() {
+        let err = expand("${DATAMK_TEST_DEFINITELY_UNSET}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unset"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn expand_errors_on_unterminated() {
+        let err = expand("oops ${VAR").unwrap_err().to_string();
+        assert!(err.contains("unterminated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn expand_handles_multiple_and_unicode() {
+        std::env::set_var("DATAMK_TEST_A", "1");
+        std::env::set_var("DATAMK_TEST_B", "2");
+        assert_eq!(
+            expand("café ${DATAMK_TEST_A}-${DATAMK_TEST_B} ✓").unwrap(),
+            "café 1-2 ✓"
+        );
+    }
+
+    #[test]
+    fn expand_opt_treats_empty_result_as_none() {
+        assert_eq!(expand_opt(&None).unwrap(), None);
+        assert_eq!(expand_opt(&Some("".to_string())).unwrap(), None);
+        assert_eq!(
+            expand_opt(&Some("${DATAMK_TEST_UNSET_OPT:-}".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(
+            expand_opt(&Some("value".to_string())).unwrap(),
+            Some("value".to_string())
+        );
+    }
+
+    fn bindings_with_cell(cell: &str, loc: CellLocation) -> Bindings {
+        let mut cells = IndexMap::new();
+        cells.insert(cell.to_string(), loc);
+        Bindings {
+            catalog: "./cat.ducklake".to_string(),
+            storage: "./data".to_string(),
+            s3: None,
+            principals: None,
+            cells,
+        }
+    }
+
+    fn cell_with_source(name: &str, src: Source) -> CellDef {
+        let mut sources = IndexMap::new();
+        sources.insert(name.to_string(), src);
+        CellDef {
+            cell: "c".to_string(),
+            sources,
+            transforms: vec![],
+            interface: vec![] as Vec<Export>,
+            access: Default::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_passes_through_a_raw_source() {
+        let def = cell_with_source("raw", Source::Raw("s3://bucket/x.parquet".to_string()));
+        let b = Bindings {
+            catalog: "c".into(),
+            storage: "s".into(),
+            s3: None,
+            principals: None,
+            cells: IndexMap::new(),
+        };
+        let r = resolve(&def, &b).unwrap();
+        match r.sources.get("raw").unwrap() {
+            ResolvedSource::Raw(uri) => assert_eq!(uri, "s3://bucket/x.parquet"),
+            other => panic!("expected raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_links_a_cell_source_via_the_profile() {
+        let def = cell_with_source(
+            "upstream",
+            Source::Cell {
+                cell: "other".to_string(),
+                table: "orders".to_string(),
+                version: Some(7),
+            },
+        );
+        let b = bindings_with_cell(
+            "other",
+            CellLocation {
+                catalog: "/lake/other.ducklake".to_string(),
+                storage: "/lake/other/data".to_string(),
+            },
+        );
+        let r = resolve(&def, &b).unwrap();
+        match r.sources.get("upstream").unwrap() {
+            ResolvedSource::Cell {
+                catalog,
+                storage,
+                table,
+                version,
+            } => {
+                assert_eq!(catalog, "/lake/other.ducklake");
+                assert_eq!(storage, "/lake/other/data");
+                assert_eq!(table, "orders");
+                assert_eq!(*version, Some(7));
+            }
+            other => panic!("expected cell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_errors_when_cell_location_is_missing() {
+        let def = cell_with_source(
+            "upstream",
+            Source::Cell {
+                cell: "missing".to_string(),
+                table: "t".to_string(),
+                version: None,
+            },
+        );
+        let b = Bindings {
+            catalog: "c".into(),
+            storage: "s".into(),
+            s3: None,
+            principals: None,
+            cells: IndexMap::new(),
+        };
+        let err = resolve(&def, &b).unwrap_err().to_string();
+        assert!(err.contains("missing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_expands_s3_and_drops_empty_endpoint() {
+        std::env::set_var("DATAMK_TEST_REGION", "us-west-2");
+        let def = CellDef {
+            cell: "c".into(),
+            sources: IndexMap::new(),
+            transforms: vec![],
+            interface: vec![] as Vec<Export>,
+            access: Default::default(),
+        };
+        let b = Bindings {
+            catalog: "c".into(),
+            storage: "s".into(),
+            s3: Some(S3Binding {
+                region: Some("${DATAMK_TEST_REGION}".to_string()),
+                endpoint: Some("${DATAMK_TEST_NO_ENDPOINT:-}".to_string()),
+                url_style: None,
+                key_id: None,
+                secret: None,
+                use_ssl: Some(true),
+            }),
+            principals: None,
+            cells: IndexMap::new(),
+        };
+        let r = resolve(&def, &b).unwrap();
+        let s3 = r.s3.unwrap();
+        assert_eq!(s3.region.as_deref(), Some("us-west-2"));
+        assert_eq!(s3.endpoint, None); // empty expansion collapses to None
+        assert_eq!(s3.use_ssl, Some(true));
+    }
+
+    #[test]
+    fn resolved_source_remote_detection() {
+        assert!(ResolvedSource::Raw("s3://b/x".into()).is_remote());
+        assert!(ResolvedSource::Raw("gs://b/x".into()).is_remote());
+        assert!(ResolvedSource::Raw("gcs://b/x".into()).is_remote());
+        assert!(!ResolvedSource::Raw("./local.parquet".into()).is_remote());
+        assert!(ResolvedSource::Cell {
+            catalog: "c".into(),
+            storage: "s3://b/d".into(),
+            table: "t".into(),
+            version: None,
+        }
+        .is_remote());
+        assert!(!ResolvedSource::Cell {
+            catalog: "c".into(),
+            storage: "/local/d".into(),
+            table: "t".into(),
+            version: None,
+        }
+        .is_remote());
+    }
+}

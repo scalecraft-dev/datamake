@@ -120,7 +120,9 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
         bind_source(&cell.conn, i, name, src, &cell.dir)?;
     }
 
-    cell.conn.execute_batch("BEGIN").context("begin transaction")?;
+    cell.conn
+        .execute_batch("BEGIN")
+        .context("begin transaction")?;
     for t in &cell.def.transforms {
         let sql_path = cell.dir.join(t);
         let sql = std::fs::read_to_string(&sql_path)
@@ -130,7 +132,9 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
             .execute_batch(&sql)
             .with_context(|| format!("executing transform {t}"))?;
     }
-    cell.conn.execute_batch("COMMIT").context("commit snapshot")?;
+    cell.conn
+        .execute_batch("COMMIT")
+        .context("commit snapshot")?;
 
     tracing::info!("verifying interface");
     crate::verify::check(&cell.conn, &cell.def)?;
@@ -258,8 +262,74 @@ fn resolve_local(p: &str, dir: &Path, is_dir: bool) -> Result<String> {
             .with_context(|| format!("creating catalog dir {}", parent.display()))?;
         let canon = std::fs::canonicalize(parent)
             .with_context(|| format!("canonicalizing {}", parent.display()))?;
-        Ok(canon.join(abs.file_name().unwrap()).to_string_lossy().into_owned())
+        Ok(canon
+            .join(abs.file_name().unwrap())
+            .to_string_lossy()
+            .into_owned())
     } else {
         Ok(abs.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_remote_detects_object_storage_schemes() {
+        assert!(is_remote("s3://bucket/key"));
+        assert!(is_remote("gs://bucket/key"));
+        assert!(is_remote("gcs://bucket/key"));
+        assert!(!is_remote("/local/path"));
+        assert!(!is_remote("./relative.parquet"));
+        assert!(!is_remote("file:///abs"));
+    }
+
+    #[test]
+    fn esc_doubles_single_quotes() {
+        assert_eq!(esc("plain"), "plain");
+        assert_eq!(esc("o'brien"), "o''brien");
+        assert_eq!(esc("a'b'c"), "a''b''c");
+    }
+
+    #[test]
+    fn resolve_source_uri_passes_remote_through_untouched() {
+        let dir = Path::new("/cell");
+        assert_eq!(
+            resolve_source_uri("s3://b/x.parquet", dir),
+            "s3://b/x.parquet"
+        );
+        assert_eq!(
+            resolve_source_uri("gs://b/*.parquet", dir),
+            "gs://b/*.parquet"
+        );
+    }
+
+    #[test]
+    fn resolve_source_uri_keeps_absolute_local_paths() {
+        let dir = Path::new("/cell");
+        assert_eq!(
+            resolve_source_uri("/data/x.parquet", dir),
+            "/data/x.parquet"
+        );
+        // file:// prefix is stripped before checking absoluteness.
+        assert_eq!(
+            resolve_source_uri("file:///data/x.parquet", dir),
+            "/data/x.parquet"
+        );
+    }
+
+    #[test]
+    fn resolve_source_uri_joins_relative_paths_to_cell_dir() {
+        let dir = Path::new("/cell");
+        assert_eq!(
+            resolve_source_uri("data/x.parquet", dir),
+            "/cell/data/x.parquet"
+        );
+        // Globs are preserved through the join.
+        assert_eq!(
+            resolve_source_uri("data/*.parquet", dir),
+            "/cell/data/*.parquet"
+        );
     }
 }

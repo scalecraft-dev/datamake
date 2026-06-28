@@ -1,12 +1,6 @@
-# datamk — the cell
+# Datamake - Composable Data Products
 
-> Reduce time to value for data. See [`docs/VISION.md`](docs/VISION.md) and
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
-A **cell** is a self-contained, independently deployable unit of one use case — its
-storage, catalog binding, engine, and transforms — exposing a narrow, versioned
-interface. Built on the decoupled lakehouse: DuckDB (compute) + DuckLake (catalog) +
-Parquet on object storage (data).
+Deploy self-contained data pipelines that create value for particular use cases.
 
 ## CLI
 

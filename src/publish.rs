@@ -34,7 +34,10 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let manifest = Published { snapshot_id: snapshot, routes };
+    let manifest = Published {
+        snapshot_id: snapshot,
+        routes,
+    };
     std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("writing {}", path.display()))?;
 

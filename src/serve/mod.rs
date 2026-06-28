@@ -34,6 +34,10 @@ struct AppState {
 }
 
 /// Result of an authorization check: an error response, or pass.
+// The `Err` variant is an axum `Response` by design — callers early-return it
+// directly. The size is acceptable on the unauthorized path; boxing every call
+// site would only add noise.
+#[allow(clippy::result_large_err)]
 fn authorize(s: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     if !s.shareable {
         return Err((StatusCode::FORBIDDEN, "cell is not shareable").into_response());
@@ -81,7 +85,9 @@ pub async fn run(file: &Path, profile: &str, port: u16) -> Result<()> {
 
     let principals = load_principals(cell.principals.as_deref());
     if !cell.def.access.roles.is_empty() && principals.is_empty() {
-        tracing::warn!("access.roles set but no principals loaded; all authorized requests will be denied");
+        tracing::warn!(
+            "access.roles set but no principals loaded; all authorized requests will be denied"
+        );
     }
 
     let state = Arc::new(AppState {
@@ -230,4 +236,119 @@ fn run_json_query(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<Vec<St
         out.push(r?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexmap::IndexMap;
+
+    fn export() -> Export {
+        let mut schema = IndexMap::new();
+        schema.insert("order_date".to_string(), "date".to_string());
+        schema.insert("region".to_string(), "string".to_string());
+        schema.insert("revenue".to_string(), "decimal".to_string());
+        Export {
+            name: "orders_daily".to_string(),
+            version: "2.1.0".to_string(),
+            source: Some("orders_daily".to_string()),
+            grain: vec!["order_date".to_string(), "region".to_string()],
+            schema,
+            freshness: None,
+            visibility: Visibility::Discoverable,
+            contract: Contract::Experimental,
+        }
+    }
+
+    #[test]
+    fn selects_declared_columns_in_order() {
+        let sql = build_query(&export(), &HashMap::new(), None);
+        assert!(
+            sql.contains("SELECT order_date, region, revenue FROM orders_daily"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn empty_schema_selects_star() {
+        let mut e = export();
+        e.schema = IndexMap::new();
+        let sql = build_query(&e, &HashMap::new(), None);
+        assert!(sql.contains("SELECT * FROM orders_daily"), "got: {sql}");
+    }
+
+    #[test]
+    fn defaults_to_limit_100_offset_0_and_no_where() {
+        let sql = build_query(&export(), &HashMap::new(), None);
+        assert!(sql.contains("LIMIT 100 OFFSET 0"), "got: {sql}");
+        assert!(!sql.contains("WHERE"), "got: {sql}");
+    }
+
+    #[test]
+    fn grain_params_become_escaped_where_filters() {
+        let mut params = HashMap::new();
+        params.insert("order_date".to_string(), "2026-06-01".to_string());
+        params.insert("region".to_string(), "us-east".to_string());
+        let sql = build_query(&export(), &params, None);
+        assert!(sql.contains("order_date = '2026-06-01'"), "got: {sql}");
+        assert!(sql.contains("region = 'us-east'"), "got: {sql}");
+        assert!(sql.contains(" WHERE "), "got: {sql}");
+    }
+
+    #[test]
+    fn grain_filter_values_are_quote_escaped() {
+        let mut params = HashMap::new();
+        params.insert("region".to_string(), "o'brien".to_string());
+        let sql = build_query(&export(), &params, None);
+        // Single quotes doubled — no SQL injection through grain values.
+        assert!(sql.contains("region = 'o''brien'"), "got: {sql}");
+    }
+
+    #[test]
+    fn non_grain_params_are_ignored_in_where() {
+        let mut params = HashMap::new();
+        params.insert("revenue".to_string(), "999".to_string()); // declared but not grain
+        params.insert("evil".to_string(), "1; DROP TABLE x".to_string());
+        let sql = build_query(&export(), &params, None);
+        assert!(!sql.contains("WHERE"), "got: {sql}");
+        assert!(!sql.contains("DROP TABLE"), "got: {sql}");
+    }
+
+    #[test]
+    fn limit_is_capped_and_offset_passed_through() {
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), "999999".to_string());
+        params.insert("offset".to_string(), "50".to_string());
+        let sql = build_query(&export(), &params, None);
+        assert!(
+            sql.contains(&format!("LIMIT {MAX_LIMIT} OFFSET 50")),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn invalid_limit_falls_back_to_default() {
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), "not-a-number".to_string());
+        let sql = build_query(&export(), &params, None);
+        assert!(
+            sql.contains(&format!("LIMIT {DEFAULT_LIMIT}")),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn snapshot_pins_a_version() {
+        let sql = build_query(&export(), &HashMap::new(), Some(42));
+        assert!(
+            sql.contains("orders_daily AT (VERSION => 42)"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn no_snapshot_means_no_version_clause() {
+        let sql = build_query(&export(), &HashMap::new(), None);
+        assert!(!sql.contains("VERSION =>"), "got: {sql}");
+    }
 }

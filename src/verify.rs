@@ -99,3 +99,56 @@ fn type_compatible(declared: &str, actual: &str) -> bool {
         other => a.to_lowercase() == other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::type_compatible;
+
+    #[test]
+    fn string_aliases_match_varchar() {
+        assert!(type_compatible("string", "VARCHAR"));
+        assert!(type_compatible("varchar", "VARCHAR(255)"));
+        assert!(type_compatible("text", "TEXT"));
+        assert!(!type_compatible("string", "INTEGER"));
+    }
+
+    #[test]
+    fn integer_widths_are_distinguished() {
+        assert!(type_compatible("int", "INTEGER"));
+        assert!(type_compatible("integer", "INT32"));
+        assert!(type_compatible("bigint", "BIGINT"));
+        assert!(type_compatible("long", "INT64"));
+        // A declared int should not silently match a bigint column.
+        assert!(!type_compatible("int", "BIGINT"));
+    }
+
+    #[test]
+    fn numeric_and_float_families() {
+        assert!(type_compatible("decimal", "DECIMAL(18,2)"));
+        assert!(type_compatible("numeric", "NUMERIC(10,0)"));
+        assert!(type_compatible("double", "DOUBLE"));
+        assert!(type_compatible("float", "REAL"));
+    }
+
+    #[test]
+    fn temporal_and_boolean() {
+        assert!(type_compatible("date", "DATE"));
+        assert!(type_compatible("timestamp", "TIMESTAMP WITH TIME ZONE"));
+        assert!(type_compatible("bool", "BOOLEAN"));
+        assert!(type_compatible("boolean", "BOOLEAN"));
+        assert!(!type_compatible("date", "TIMESTAMP"));
+    }
+
+    #[test]
+    fn declared_type_matching_is_case_insensitive() {
+        assert!(type_compatible("STRING", "varchar"));
+        assert!(type_compatible("Integer", "INTEGER"));
+    }
+
+    #[test]
+    fn unknown_declared_type_falls_back_to_case_insensitive_equality() {
+        assert!(type_compatible("uuid", "UUID"));
+        assert!(type_compatible("uuid", "uuid"));
+        assert!(!type_compatible("uuid", "VARCHAR"));
+    }
+}

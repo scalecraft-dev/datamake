@@ -64,7 +64,10 @@ impl Export {
 
     pub fn major(&self) -> Result<u64> {
         let v = semver::Version::parse(&self.version).with_context(|| {
-            format!("invalid semver '{}' for export '{}'", self.version, self.name)
+            format!(
+                "invalid semver '{}' for export '{}'",
+                self.version, self.name
+            )
         })?;
         Ok(v.major)
     }
@@ -178,5 +181,148 @@ impl Bindings {
         })?;
         serde_yaml::from_str(&raw)
             .with_context(|| format!("parsing binding profile {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn export(name: &str, version: &str, source: Option<&str>) -> Export {
+        Export {
+            name: name.to_string(),
+            version: version.to_string(),
+            source: source.map(str::to_string),
+            grain: vec![],
+            schema: IndexMap::new(),
+            freshness: None,
+            visibility: Visibility::default(),
+            contract: Contract::default(),
+        }
+    }
+
+    #[test]
+    fn source_object_defaults_to_name() {
+        assert_eq!(export("orders", "1.0.0", None).source_object(), "orders");
+        assert_eq!(
+            export("orders", "1.0.0", Some("orders_daily")).source_object(),
+            "orders_daily"
+        );
+    }
+
+    #[test]
+    fn major_extracts_the_major_version() {
+        assert_eq!(export("o", "2.1.0", None).major().unwrap(), 2);
+        assert_eq!(export("o", "0.9.3", None).major().unwrap(), 0);
+    }
+
+    #[test]
+    fn major_rejects_non_semver() {
+        let err = export("o", "v2", None).major().unwrap_err().to_string();
+        assert!(err.contains("invalid semver"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn route_keys_on_major() {
+        assert_eq!(
+            export("orders_daily", "2.1.0", None).route().unwrap(),
+            "orders_daily@2"
+        );
+    }
+
+    #[test]
+    fn defaults_are_experimental_discoverable_and_deny() {
+        assert_eq!(Visibility::default(), Visibility::Discoverable);
+        assert_eq!(Contract::default(), Contract::Experimental);
+        let access = Access::default();
+        assert!(!access.shareable);
+        assert!(access.roles.is_empty());
+    }
+
+    #[test]
+    fn celldef_parses_full_yaml_with_both_source_kinds() {
+        let yaml = r#"
+cell: orders
+sources:
+  raw_orders: s3://acme/orders/*.parquet
+  upstream:
+    cell: other
+    table: customers
+    version: 3
+transforms:
+  - sql/stg.sql
+  - sql/final.sql
+interface:
+  - name: orders_daily
+    version: 2.1.0
+    grain: [order_date, region]
+    schema:
+      order_date: date
+      region: string
+      revenue: decimal
+access:
+  shareable: true
+  roles: [analyst]
+"#;
+        let def: CellDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(def.cell, "orders");
+        assert_eq!(def.transforms, vec!["sql/stg.sql", "sql/final.sql"]);
+
+        match def.sources.get("raw_orders").unwrap() {
+            Source::Raw(uri) => assert_eq!(uri, "s3://acme/orders/*.parquet"),
+            other => panic!("expected raw source, got {other:?}"),
+        }
+        match def.sources.get("upstream").unwrap() {
+            Source::Cell {
+                cell,
+                table,
+                version,
+            } => {
+                assert_eq!(cell, "other");
+                assert_eq!(table, "customers");
+                assert_eq!(*version, Some(3));
+            }
+            other => panic!("expected cell source, got {other:?}"),
+        }
+
+        let exp = &def.interface[0];
+        assert_eq!(exp.route().unwrap(), "orders_daily@2");
+        assert_eq!(exp.grain, vec!["order_date", "region"]);
+        // IndexMap preserves declared column order.
+        let cols: Vec<_> = exp.schema.keys().cloned().collect();
+        assert_eq!(cols, vec!["order_date", "region", "revenue"]);
+        assert!(def.access.shareable);
+        assert_eq!(def.access.roles, vec!["analyst"]);
+        // Unspecified fields fall back to defaults.
+        assert_eq!(exp.visibility, Visibility::Discoverable);
+        assert_eq!(exp.contract, Contract::Experimental);
+    }
+
+    #[test]
+    fn celldef_parses_minimal_yaml_with_defaults() {
+        let def: CellDef = serde_yaml::from_str("cell: bare").unwrap();
+        assert_eq!(def.cell, "bare");
+        assert!(def.sources.is_empty());
+        assert!(def.transforms.is_empty());
+        assert!(def.interface.is_empty());
+        assert!(!def.access.shareable);
+    }
+
+    #[test]
+    fn bindings_parse_from_yaml() {
+        let yaml = r#"
+catalog: ./.cell/catalog.ducklake
+storage: ./.cell/data
+cells:
+  other:
+    catalog: /lake/other.ducklake
+    storage: /lake/other/data
+"#;
+        let b: Bindings = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(b.catalog, "./.cell/catalog.ducklake");
+        assert_eq!(b.storage, "./.cell/data");
+        assert!(b.s3.is_none());
+        let loc = b.cells.get("other").unwrap();
+        assert_eq!(loc.catalog, "/lake/other.ducklake");
     }
 }
