@@ -1,0 +1,5 @@
+# Generated, derived state: local catalog, Parquet data, publish manifest.
+.cell/
+# Binding profiles carry environment config / secrets — keep only `local`.
+profiles/*
+!profiles/local.yaml
