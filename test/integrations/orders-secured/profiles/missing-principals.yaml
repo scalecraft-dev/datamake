@@ -1,0 +1,5 @@
+# `principals:` is set but points at a nonexistent file. Drives the §8 companion
+# hardening test: serve must FAIL LOUD here, not silently start an all-deny server.
+catalog: ./.cell/catalog.ducklake
+storage: ./.cell/data
+principals: ./does-not-exist.json

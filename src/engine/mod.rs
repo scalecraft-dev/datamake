@@ -3,7 +3,7 @@ use duckdb::Connection;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Bindings, CellDef, ResolvedBindings, ResolvedS3, ResolvedSource};
+use crate::config::{CellDef, ResolvedBindings, ResolvedS3, ResolvedSource};
 
 /// An opened cell: parsed definition + a live DuckDB connection with DuckLake
 /// attached as the schema `lake`.
@@ -20,23 +20,18 @@ pub struct Cell {
 }
 
 pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
-    let def = CellDef::load(file)?;
-    let dir = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let profile_path = dir.join("profiles").join(format!("{profile}.yaml"));
-    let raw_bindings = Bindings::load(&profile_path)?;
-    let bindings = crate::config::resolve(&def, &raw_bindings)?;
+    // The pure parse+resolve prefix lives in `config::load` (no DB); `open` is
+    // that plus a connection. `deploy` uses `config::load` directly to inspect a
+    // cell without ever opening a database.
+    let loaded = crate::config::load(file, profile)?;
     let conn = Connection::open_in_memory().context("opening DuckDB")?;
-    setup(&conn, &bindings, &dir, read_only)?;
+    setup(&conn, &loaded.bindings, &loaded.dir, read_only)?;
     Ok(Cell {
-        def,
+        def: loaded.def,
         conn,
-        dir,
-        sources: bindings.sources,
-        principals: bindings.principals,
+        dir: loaded.dir,
+        sources: loaded.bindings.sources,
+        principals: loaded.bindings.principals,
     })
 }
 
@@ -48,8 +43,9 @@ fn setup(conn: &Connection, b: &ResolvedBindings, dir: &Path, read_only: bool) -
     let storage = resolve_storage(&b.storage, dir)?;
 
     // Object storage needs httpfs; S3 also needs a secret (default: AWS credential chain).
-    let uses_remote =
-        is_remote(&storage) || b.sources.values().any(|s| s.is_remote()) || b.s3.is_some();
+    let uses_remote = crate::config::is_remote(&storage)
+        || b.sources.values().any(|s| s.is_remote())
+        || b.s3.is_some();
     if uses_remote {
         conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
             .context("loading httpfs extension")?;
@@ -201,7 +197,7 @@ fn bind_source(
 /// Local relative source paths resolve against the cell directory (like transforms);
 /// remote URIs and absolute paths pass through. Globs are preserved.
 fn resolve_source_uri(uri: &str, dir: &Path) -> String {
-    if is_remote(uri) {
+    if crate::config::is_remote(uri) {
         return uri.to_string();
     }
     let p = uri.strip_prefix("file://").unwrap_or(uri);
@@ -211,10 +207,6 @@ fn resolve_source_uri(uri: &str, dir: &Path) -> String {
     } else {
         dir.join(path).to_string_lossy().into_owned()
     }
-}
-
-fn is_remote(uri: &str) -> bool {
-    uri.starts_with("s3://") || uri.starts_with("gs://") || uri.starts_with("gcs://")
 }
 
 fn esc(s: &str) -> String {
@@ -236,7 +228,7 @@ fn resolve_storage(s: &str, dir: &Path) -> Result<String> {
 /// Resolve the catalog binding. `sqlite:`/`postgres:` DSNs pass through; anything
 /// else is treated as a local catalog file path.
 fn resolve_catalog(s: &str, dir: &Path) -> Result<String> {
-    if s.starts_with("sqlite:") || s.starts_with("postgres:") {
+    if crate::config::is_metadata_db_catalog(s) {
         return Ok(s.to_string());
     }
     let p = s.strip_prefix("file://").unwrap_or(s);
@@ -274,16 +266,6 @@ fn resolve_local(p: &str, dir: &Path, is_dir: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_remote_detects_object_storage_schemes() {
-        assert!(is_remote("s3://bucket/key"));
-        assert!(is_remote("gs://bucket/key"));
-        assert!(is_remote("gcs://bucket/key"));
-        assert!(!is_remote("/local/path"));
-        assert!(!is_remote("./relative.parquet"));
-        assert!(!is_remote("file:///abs"));
-    }
 
     #[test]
     fn esc_doubles_single_quotes() {

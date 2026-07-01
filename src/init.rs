@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::InitArgs;
 
-/// Scaffold a new cell — an implementation project. The tree written here is
-/// identical to `examples/orders/`.
+/// Scaffold a new cell — an implementation project: the contract (`cell.yaml`), a
+/// runnable local profile, a deployable `prod` profile + tracked deploy overlay,
+/// and the SQL.
 pub fn run(args: InitArgs) -> Result<()> {
     let dir = args.path.unwrap_or_else(|| PathBuf::from(&args.name));
     if dir.exists() {
@@ -12,18 +13,24 @@ pub fn run(args: InitArgs) -> Result<()> {
     }
     std::fs::create_dir_all(dir.join("sql"))?;
     std::fs::create_dir_all(dir.join("profiles"))?;
+    std::fs::create_dir_all(dir.join("deploy"))?;
 
     write(&dir.join("cell.yaml"), &cell_yaml(&args.name))?;
     write(&dir.join("profiles/local.yaml"), PROFILE_LOCAL)?;
+    write(&dir.join("profiles/prod.yaml"), &profile_prod(&args.name))?;
+    write(&dir.join("deploy/prod.yaml"), DEPLOY_PROD)?;
     write(&dir.join("sql/stg_orders.sql"), STG_ORDERS_SQL)?;
     write(&dir.join("sql/orders_daily.sql"), ORDERS_DAILY_SQL)?;
     write(&dir.join(".gitignore"), GITIGNORE)?;
     write(&dir.join("README.md"), &readme(&args.name))?;
 
-    println!("Created cell '{}' in {}", args.name, dir.display());
+    let d = dir.display();
+    println!("Created cell '{}' in {d}", args.name);
     println!("Next:");
-    println!("  datamk run   -f {}/cell.yaml", dir.display());
-    println!("  datamk serve -f {}/cell.yaml", dir.display());
+    println!("  datamk run    -f {d}/cell.yaml   # build a snapshot, then auto-verify");
+    println!("  datamk serve  -f {d}/cell.yaml   # serve the interface at http://localhost:8080");
+    println!("Ship it (edit profiles/prod.yaml + deploy/prod.yaml first):");
+    println!("  datamk deploy -f {d}/cell.yaml -p prod --dry-run");
     Ok(())
 }
 
@@ -54,7 +61,7 @@ interface:                        # the export list - the public surface, single
       revenue: decimal
     freshness: daily
     visibility: discoverable      # private | discoverable
-    contract: experimental        # experimental | supported  (publish promotes this)
+    contract: experimental        # experimental | supported  (a reviewed edit; `release` then pins it)
 
 access:                           # default-deny: the serving plane exposes data only when shareable
   shareable: true
@@ -81,6 +88,43 @@ storage: ./.cell/data                # file:// -> s3:// -> gs://
 #   # secret: ${AWS_SECRET_ACCESS_KEY}
 "#;
 
+/// A deployable `prod` profile (gitignored). Defaults to a metadata-DB catalog +
+/// shared object store, the shape `datamk deploy` requires — fill in real values.
+fn profile_prod(name: &str) -> String {
+    format!(
+        r#"# Binding profile: prod. Gitignored — carries the catalog DSN, s3 creds, and
+# (when access.roles is set) the principals path. A DEPLOYABLE profile: a
+# metadata-DB catalog + a shared object store, which `datamk deploy` requires.
+catalog: ${{DATAMK_CATALOG}}                # sqlite:… (single replica) or postgres:… (multi-replica)
+storage: s3://your-bucket/cells/{name}      # shared object store, not ./.cell
+# principals: /etc/datamk/principals.json   # token -> roles; set when access.roles is used (secret mount)
+s3:
+  region: ${{AWS_REGION:-us-east-1}}        # omit key_id/secret to use the AWS credential chain
+  # key_id: ${{AWS_ACCESS_KEY_ID}}
+  # secret: ${{AWS_SECRET_ACCESS_KEY}}
+"#
+    )
+}
+
+/// The tracked, secret-free deploy overlay for `prod`.
+const DEPLOY_PROD: &str = r#"# deploy/prod.yaml — deploy topology for the `prod` profile.
+# TRACKED and PR-reviewed: this is HOW/WHERE the workload runs. It has NO secret
+# fields by design — credentials live in profiles/prod.yaml (gitignored). Keeping
+# topology in a separate tracked file keeps secrets out of a reviewed file.
+target: kubernetes              # the orchestrator (only `kubernetes` implemented)
+
+# allow_anonymous: false        # TOP-LEVEL. true => deploy a deliberately open,
+                                # unauthenticated endpoint (cell shareable, no roles).
+
+# Target-specific topology is defined by the target's ADR — see ADR 0002 for the
+# Kubernetes schema. Sketch:
+#   namespace: data
+#   schedule: "0 * * * *"       # Builder cron (datamk run)
+#   serve:
+#     replicas: 2               # >1 requires a `postgres:` catalog
+#   image: ghcr.io/scalecraft/datamk   # tag defaults to the running datamk version
+"#;
+
 const STG_ORDERS_SQL: &str = r#"-- Private internal. In a real cell this reads source tables from the lake;
 -- here we synthesize rows so `datamk run` works with zero external setup.
 CREATE OR REPLACE TABLE stg_orders AS
@@ -105,11 +149,12 @@ GROUP BY order_date, region;
 "#;
 
 const GITIGNORE: &str = "\
-# Generated, derived state: local catalog, Parquet data, publish manifest.
+# Generated, derived state: local catalog, Parquet data, release manifest.
 .cell/
 # Binding profiles carry environment config / secrets — keep only `local`.
 profiles/*
 !profiles/local.yaml
+# deploy/ is tracked on purpose: topology is PR-reviewed and secret-free. Do not ignore it.
 ";
 
 fn readme(name: &str) -> String {
@@ -119,15 +164,21 @@ fn readme(name: &str) -> String {
 A [datamk](https://github.com/scalecraft/datamk) cell.
 
 ```
-datamk run   -f cell.yaml   # execute the pipeline -> snapshot -> verify
-datamk serve -f cell.yaml   # GET /orders_daily@2 , /openapi.json , /interface
-datamk publish -f cell.yaml # pin the current snapshot as the supported contract
+datamk run     -f cell.yaml          # execute the pipeline -> snapshot -> verify
+datamk serve   -f cell.yaml          # GET /orders_daily@2 , /openapi.json , /interface
+datamk release -f cell.yaml          # pin the current snapshot as the supported contract
+datamk deploy  -f cell.yaml -p prod  # run the Builder + Server on an orchestrator
 ```
 
 - `cell.yaml` — the contract: sources, transforms, interface, access. No environment.
 - `profiles/<name>.yaml` — environment bindings (catalog/storage/s3/principals). Pick with `--profile`.
+- `deploy/<name>.yaml` — deploy topology (target, schedule, replicas). Tracked and PR-reviewed; secret-free.
 - `sql/` — private transform logic.
-- `.cell/` — generated catalog + data + publish manifest (gitignored).
+- `.cell/` — generated catalog + data + release manifest (gitignored).
+
+Promotion is a review, not a command: edit an export to `contract: supported`,
+open a PR, and once it lands `datamk release` pins that snapshot. Deploy with
+`datamk deploy -p prod` once `profiles/prod.yaml` and `deploy/prod.yaml` are filled in.
 "#
     )
 }

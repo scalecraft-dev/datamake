@@ -1,0 +1,3 @@
+# Build artifacts and VCS metadata are not part of the image build context.
+target/
+.git/

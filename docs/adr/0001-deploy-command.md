@@ -170,6 +170,9 @@ my_cell/
 ```yaml
 # deploy/prod.yaml  (tracked, PR-reviewed, secret-free)
 target: kubernetes          # only kubernetes implemented
+# allow_anonymous: false    # top-level (agnostic); true ⇒ a deliberately open,
+                            # unauthenticated endpoint (§8). Read without parsing
+                            # any target's schema.
 # target-specific fields (namespace, schedule, serve.replicas, image, …) are
 # defined by the target's ADR — see ADR 0002 for the Kubernetes schema.
 ```
@@ -226,13 +229,18 @@ that target's ADR.
   does not create or manage secrets by default (keeps plaintext tokens off the
   deploy/CI path). A `deploy --create-principals <local-path>` bootstrap is an
   explicit, opt-in follow-up — never the default.
-- Pre-flight enforces the two failure modes as hard refusals: (a) `roles`
-  non-empty ⇒ the principals material must exist, parse as
-  `HashMap<String, Vec<String>>`, and be wired at the path the profile names; (b)
-  `shareable && roles.is_empty()` (an open endpoint) ⇒ refuse unless
-  `serve.allow_anonymous: true` is explicitly set in the deploy overlay — a
-  recorded, deliberate decision, not a default that ships because `roles:` was
-  left empty.
+- Pre-flight enforces the two failure modes as hard refusals, **split by where
+  each check can actually run**: (a) `roles` non-empty ⇒ the profile must
+  *configure* a `principals:` path. That is the only part verifiable from the
+  deploy host — the file at that path is the in-cluster secret mount, so its
+  existence and `HashMap<String, Vec<String>>` parse are enforced at runtime by
+  the `load_principals` hardening below, and the named secret is verified by the
+  target (Kubernetes: ADR 0002). (b) `shareable && roles.is_empty()` (an open
+  endpoint) ⇒ refuse unless `allow_anonymous: true` is explicitly set at the
+  **top level** of the deploy overlay — a recorded, deliberate decision, not a
+  default that ships because `roles:` was left empty. (`allow_anonymous` is
+  top-level, not nested under a target's `serve:`, so the target-agnostic
+  pre-flight reads it without parsing any target's sub-schema.)
 
 **Companion serve hardening (ships with this work):** `load_principals` currently
 `unwrap_or_default()`s a missing/unreadable/malformed file into an empty (all-deny)

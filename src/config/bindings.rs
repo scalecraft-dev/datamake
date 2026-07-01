@@ -33,8 +33,22 @@ impl ResolvedSource {
             ResolvedSource::Raw(uri) => uri.as_str(),
             ResolvedSource::Cell { storage, .. } => storage.as_str(),
         };
-        loc.starts_with("s3://") || loc.starts_with("gs://") || loc.starts_with("gcs://")
+        is_remote(loc)
     }
+}
+
+/// Whether a URI points at object storage (`s3://`/`gs://`/`gcs://`), and so
+/// needs the httpfs extension + an S3 secret. The inverse — a local/file path —
+/// is what deploy pre-flight refuses for a remote workload.
+pub fn is_remote(uri: &str) -> bool {
+    uri.starts_with("s3://") || uri.starts_with("gs://") || uri.starts_with("gcs://")
+}
+
+/// Whether a catalog DSN is metadata-DB-backed (`sqlite:`/`postgres:`), as opposed
+/// to a DuckDB-file `.ducklake` catalog. A metadata-DB catalog is concurrent-safe
+/// (Server and Builder can attach at once); deploy requires it.
+pub fn is_metadata_db_catalog(catalog: &str) -> bool {
+    catalog.starts_with("sqlite:") || catalog.starts_with("postgres:")
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +363,25 @@ mod tests {
         assert_eq!(s3.region.as_deref(), Some("us-west-2"));
         assert_eq!(s3.endpoint, None); // empty expansion collapses to None
         assert_eq!(s3.use_ssl, Some(true));
+    }
+
+    #[test]
+    fn is_remote_detects_object_storage_schemes() {
+        assert!(is_remote("s3://b/k"));
+        assert!(is_remote("gs://b/k"));
+        assert!(is_remote("gcs://b/k"));
+        assert!(!is_remote("/local/path"));
+        assert!(!is_remote("./rel.parquet"));
+        assert!(!is_remote("file:///abs"));
+    }
+
+    #[test]
+    fn metadata_db_catalog_detection() {
+        assert!(is_metadata_db_catalog("sqlite:cat.db"));
+        assert!(is_metadata_db_catalog("postgres://u@h/db"));
+        // A DuckDB-file `.ducklake` catalog is NOT concurrent-safe.
+        assert!(!is_metadata_db_catalog("./cat.ducklake"));
+        assert!(!is_metadata_db_catalog("/abs/cat.ducklake"));
     }
 
     #[test]

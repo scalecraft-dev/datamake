@@ -1,8 +1,10 @@
 mod cli;
 mod config;
+mod deploy;
 mod engine;
 mod init;
-mod publish;
+mod manifest;
+mod release;
 mod serve;
 mod verify;
 
@@ -22,7 +24,13 @@ async fn main() -> Result<()> {
         Command::Init(a) => init::run(a),
         Command::Run(a) => engine::run(&a.file, &a.profile),
         Command::Verify(a) => verify::run(&a.file, &a.profile),
-        Command::Publish(a) => publish::run(&a.file, &a.profile),
+        Command::Release(a) => release::run(&a.file, &a.profile),
+        Command::Deploy(a) => deploy::run(&a),
         Command::Serve(a) => serve::run(&a.file, &a.profile, a.port).await,
+        Command::Publish(a) => {
+            eprintln!("publish has been renamed to `release` (it pins the supported snapshot).");
+            eprintln!("Run `datamk release` instead.");
+            release::run(&a.file, &a.profile)
+        }
     }
 }

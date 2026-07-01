@@ -1,0 +1,46 @@
+name: Base image
+
+# ADR 0001 §5: build and publish the freely available, versioned, cell-agnostic
+# base image on tagged releases. The tag mirrors the release version, so a given
+# `datamk` deploys the matching `ghcr.io/scalecraft/datamk:<version>`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build and push base image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        # v1.2.3 -> 1.2.3
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/scalecraft/datamk:${{ steps.version.outputs.version }}
+            ghcr.io/scalecraft/datamk:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,21 +1,16 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::Contract;
 use crate::engine;
+use crate::manifest::Published;
 
-/// The publish manifest: pins which snapshot each supported route serves.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Published {
-    pub snapshot_id: i64,
-    /// route (e.g. `orders_daily@2`) -> pinned snapshot id
-    pub routes: BTreeMap<String, i64>,
-}
-
-/// The one deliberate promotion: pin the current snapshot as the supported
-/// contract. `serve` then freezes supported routes at this snapshot.
+/// Pin the current snapshot as the supported contract. `release` reads exports
+/// already marked `contract: supported` and freezes them at the current snapshot
+/// (`.cell/published.json`); `serve` then serves supported routes from this pin.
+/// Promotion to `supported` is a separate, reviewed `cell.yaml` edit — not this
+/// command.
 pub fn run(file: &Path, profile: &str) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
     let snapshot = current_snapshot(&cell.conn)?;
@@ -41,7 +36,7 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("writing {}", path.display()))?;
 
-    tracing::info!(snapshot, path = %path.display(), "published");
+    tracing::info!(snapshot, path = %path.display(), "released");
     Ok(())
 }
 
