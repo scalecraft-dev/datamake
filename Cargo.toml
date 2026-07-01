@@ -9,6 +9,18 @@ license = "Apache-2.0"
 name = "datamk"
 path = "src/main.rs"
 
+[features]
+default = ["kubernetes"]
+# Kubernetes deploy target. ADR 0001 ships a dep-free stub (schema validation +
+# dry-run plan); ADR 0002 adds kube/k8s-openapi to this feature for real apply.
+kubernetes = []
+
+# Integration tests live under test/integrations/ (alongside their fixture cells)
+# rather than the default tests/ dir.
+[[test]]
+name = "integrations"
+path = "test/integrations/cli.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,6 +31,7 @@ anyhow = "1"
 thiserror = "1"
 semver = "1"
 duckdb = { version = "1", features = ["bundled"] }    # compiles DuckDB; heavy first build
+sha2 = "0.10"                                         # content hash of the deploy artifact bundle
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.7"
 tracing = "0.1"

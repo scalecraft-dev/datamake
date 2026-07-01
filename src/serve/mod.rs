@@ -1,6 +1,6 @@
 mod openapi;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -22,7 +22,7 @@ struct AppState {
     conn: Mutex<duckdb::Connection>,
     /// route key (`name@major`) -> export
     routes: HashMap<String, Export>,
-    /// route key -> pinned snapshot id (from the publish manifest)
+    /// route key -> pinned snapshot id (from the release manifest)
     published: BTreeMap<String, i64>,
     openapi: serde_json::Value,
     cell: String,
@@ -65,10 +65,20 @@ fn authorize(s: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 
-fn load_principals(path: Option<&str>) -> HashMap<String, Vec<String>> {
-    path.and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+/// Load the bearer-token -> roles map from the path the profile's `principals:`
+/// names. Fails loud when a path is set but unreadable or malformed: a swallowed
+/// error would silently start an all-deny server (or, worse, look healthy via
+/// `/health` while denying every request). No path = no principals (an open
+/// endpoint, gated upstream by `shareable`/`allow_anonymous`).
+fn load_principals(path: Option<&str>) -> Result<HashMap<String, Vec<String>>> {
+    let Some(p) = path else {
+        return Ok(HashMap::new());
+    };
+    let raw = std::fs::read_to_string(p)
+        .with_context(|| format!("reading principals file {p} (referenced by `principals:`)"))?;
+    serde_json::from_str(&raw).with_context(|| {
+        format!("parsing principals file {p} (expected JSON: {{ \"<token>\": [\"role\"] }})")
+    })
 }
 
 /// Serve the declared interface as REST + OpenAPI (the Server workload).
@@ -83,10 +93,10 @@ pub async fn run(file: &Path, profile: &str, port: u16) -> Result<()> {
         }
     }
 
-    let principals = load_principals(cell.principals.as_deref());
+    let principals = load_principals(cell.principals.as_deref())?;
     if !cell.def.access.roles.is_empty() && principals.is_empty() {
         tracing::warn!(
-            "access.roles set but no principals loaded; all authorized requests will be denied"
+            "access.roles set but principals file is empty; all authorized requests will be denied"
         );
     }
 
@@ -119,7 +129,7 @@ fn load_published(dir: &Path) -> BTreeMap<String, i64> {
     let path = dir.join(".cell").join("published.json");
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<crate::publish::Published>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<crate::manifest::Published>(&raw).ok())
         .map(|p| p.routes)
         .unwrap_or_default()
 }
@@ -350,5 +360,57 @@ mod tests {
     fn no_snapshot_means_no_version_clause() {
         let sql = build_query(&export(), &HashMap::new(), None);
         assert!(!sql.contains("VERSION =>"), "got: {sql}");
+    }
+
+    // §8 companion hardening: load_principals must fail loud, not swallow errors
+    // into an all-deny map.
+
+    #[test]
+    fn load_principals_none_path_is_empty_ok() {
+        // No `principals:` configured = legitimately empty (open endpoint, gated upstream).
+        let map = load_principals(None).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn load_principals_missing_file_errors() {
+        let err = load_principals(Some("/datamk/definitely/missing/principals.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading principals file"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn load_principals_malformed_json_errors() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("datamk_test_bad_principals.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let err = load_principals(Some(path.to_str().unwrap()))
+            .unwrap_err()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("parsing principals file"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn load_principals_valid_file_parses() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("datamk_test_good_principals.json");
+        std::fs::write(&path, r#"{ "tok": ["analyst"] }"#).unwrap();
+        let map = load_principals(Some(path.to_str().unwrap())).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(map.get("tok").unwrap(), &vec!["analyst".to_string()]);
+    }
+
+    // §9: request queries must stay in autocommit. An explicit BEGIN would pin the
+    // catalog attach and block the Builder's commit. Guard the built query string.
+    #[test]
+    fn built_query_never_opens_a_transaction() {
+        let mut params = HashMap::new();
+        params.insert("region".to_string(), "us-east".to_string());
+        let sql = build_query(&export(), &params, Some(7));
+        let upper = sql.to_uppercase();
+        assert!(!upper.contains("BEGIN"), "query must not BEGIN: {sql}");
+        assert!(!upper.contains("COMMIT"), "query must not COMMIT: {sql}");
     }
 }

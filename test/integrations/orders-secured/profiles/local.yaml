@@ -1,0 +1,5 @@
+# Local profile with auth wired: principals resolves relative to the cell dir
+# (tests run the binary with the cell dir as cwd). `test-token-analyst` is allowed.
+catalog: ./.cell/catalog.ducklake
+storage: ./.cell/data
+principals: ./principals.json

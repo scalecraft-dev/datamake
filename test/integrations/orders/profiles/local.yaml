@@ -1,0 +1,4 @@
+# Local profile: ./.cell paths, zero secrets. Used by run/verify/release/serve.
+# Also the input to the deploy "local-storage refusal" pre-flight test.
+catalog: ./.cell/catalog.ducklake
+storage: ./.cell/data

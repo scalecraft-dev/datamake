@@ -1,0 +1,8 @@
+# Prod profile (committed for the fixture; placeholder values, no real secrets).
+# Deployable shape: metadata-DB catalog + shared object store, so deploy pre-flight
+# passes the remote-storage and concurrent-safe-catalog checks. Defaults let it
+# resolve offline with no env set.
+catalog: ${DATAMK_TEST_CATALOG:-postgres://datamk:datamk@db.example/orders}
+storage: ${DATAMK_TEST_STORAGE:-s3://datamk-test/cells/orders}
+s3:
+  region: ${AWS_REGION:-us-east-1}

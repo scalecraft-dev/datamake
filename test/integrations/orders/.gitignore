@@ -1,0 +1,3 @@
+# Generated build state. The prod profile + deploy overlay ARE tracked here
+# (fixture placeholders, no secrets), unlike a real cell.
+.cell/
