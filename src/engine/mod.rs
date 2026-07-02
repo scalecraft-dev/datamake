@@ -1,3 +1,5 @@
+mod connectors;
+
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use indexmap::IndexMap;
@@ -135,6 +137,7 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
 
     // Sources are session-local TEMP VIEWs: visible to transforms, never committed
     // to the catalog.
+    connectors::prepare(&cell.sources, &cell.dir)?;
     for (i, (name, src)) in cell.sources.iter().enumerate() {
         bind_source(&cell.conn, i, name, src, &cell.dir)?;
     }
@@ -212,6 +215,27 @@ fn bind_source(
             ))
             .with_context(|| format!("binding cell source '{name}' -> {table}"))?;
             tracing::info!(source = %name, table = %table, version = ?version, "bound cell source");
+        }
+        ResolvedSource::Connection {
+            connection,
+            config,
+            table,
+        } => {
+            let ty = config.type_name();
+            // Alias keyed on the connection name + ATTACH IF NOT EXISTS: a
+            // connection shared by several sources attaches once. Qualify first:
+            // it's pure validation, and INSTALL/ATTACH may hit the network.
+            let alias = format!("__conn_{connection}");
+            let qualified = config.qualify(&alias, table)?;
+            conn.execute_batch(config.install_load_sql())
+                .with_context(|| format!("loading DuckDB '{ty}' extension"))?;
+            conn.execute_batch(&config.attach_sql(&alias))
+                .with_context(|| format!("attaching connection '{connection}' ({ty})"))?;
+            conn.execute_batch(&format!(
+                "CREATE OR REPLACE TEMP VIEW \"{view}\" AS SELECT * FROM {qualified};"
+            ))
+            .with_context(|| format!("binding connection source '{name}' -> {table}"))?;
+            tracing::info!(source = %name, connection = %connection, table = %table, "bound connection source");
         }
     }
     Ok(())

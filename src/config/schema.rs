@@ -96,8 +96,9 @@ pub enum Contract {
     Supported,
 }
 
-/// An external input. Either a raw file path/URI (`s3://…`, local) read directly,
-/// or another cell's managed DuckLake table read by name (versioned, governed).
+/// An external input. A raw file path/URI (`s3://…`, local) read directly,
+/// another cell's managed DuckLake table read by name (versioned, governed), or
+/// a warehouse table read through a named connection (ADR 0003).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Source {
@@ -113,6 +114,11 @@ pub enum Source {
         #[serde(default)]
         version: Option<u64>,
     },
+    /// A warehouse table. Which table is contract (here); which project/account
+    /// and credentials is environment, resolved via the profile's `connections`
+    /// map. The table path's shape is validated per connector (BigQuery:
+    /// `dataset.table`).
+    Connection { connection: String, table: String },
 }
 
 /// The location of an upstream cell, supplied per environment by a profile.
@@ -140,6 +146,35 @@ pub struct Bindings {
     /// Locations of upstream cell dependencies (referenced by name from `sources`).
     #[serde(default)]
     pub cells: IndexMap<String, CellLocation>,
+    /// Named warehouse connections (referenced by name from `connection` sources).
+    /// Environment config: the same cell reads a sandbox project in dev and the
+    /// real one in prod.
+    #[serde(default)]
+    pub connections: IndexMap<String, Connection>,
+}
+
+/// One named warehouse connection, tagged by `type`. A closed enum: an unknown
+/// type is a parse error naming the valid types. Every field is env-expandable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Connection {
+    Bigquery(BigQueryConnection),
+}
+
+/// BigQuery connection settings. Auth is Google Application Default Credentials;
+/// `credentials` optionally points ADC at a service-account key file (a path,
+/// like `principals` — never a literal token). One connection ≡ one project;
+/// cross-project reads are a second connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BigQueryConnection {
+    /// The GCP project whose datasets are read.
+    pub project: String,
+    /// Where query/read costs land. Defaults to `project`.
+    #[serde(default)]
+    pub billing_project: Option<String>,
+    /// Path to a service-account key file. Omitted = the ambient ADC chain.
+    #[serde(default)]
+    pub credentials: Option<String>,
 }
 
 /// S3 connection settings. Each field is env-expandable. With no key/secret,
@@ -296,6 +331,60 @@ access:
         // Unspecified fields fall back to defaults.
         assert_eq!(exp.visibility, Visibility::Discoverable);
         assert_eq!(exp.contract, Contract::Experimental);
+    }
+
+    #[test]
+    fn celldef_parses_a_connection_source() {
+        let yaml = r#"
+cell: orders
+sources:
+  crm_accounts:
+    connection: crm
+    table: sales.accounts
+"#;
+        let def: CellDef = serde_yaml::from_str(yaml).unwrap();
+        match def.sources.get("crm_accounts").unwrap() {
+            Source::Connection { connection, table } => {
+                assert_eq!(connection, "crm");
+                assert_eq!(table, "sales.accounts");
+            }
+            other => panic!("expected connection source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bindings_parse_a_bigquery_connection() {
+        let yaml = r#"
+catalog: ./.cell/catalog.ducklake
+storage: ./.cell/data
+connections:
+  crm:
+    type: bigquery
+    project: acme-prod-crm
+    billing_project: acme-billing
+    credentials: /etc/datamk/bq-key.json
+"#;
+        let b: Bindings = serde_yaml::from_str(yaml).unwrap();
+        let Connection::Bigquery(bq) = b.connections.get("crm").unwrap();
+        assert_eq!(bq.project, "acme-prod-crm");
+        assert_eq!(bq.billing_project.as_deref(), Some("acme-billing"));
+        assert_eq!(bq.credentials.as_deref(), Some("/etc/datamk/bq-key.json"));
+    }
+
+    #[test]
+    fn bindings_reject_an_unknown_connection_type() {
+        let yaml = r#"
+catalog: c
+storage: s
+connections:
+  crm:
+    type: snowflake
+    project: p
+"#;
+        let err = serde_yaml::from_str::<Bindings>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("snowflake"), "unexpected error: {err}");
     }
 
     #[test]
