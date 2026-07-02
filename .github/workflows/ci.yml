@@ -5,9 +5,22 @@ on:
     branches: [main]
   pull_request:
 
+# A superseded run is dead weight — cancel it instead of letting two full
+# builds race (and don't make a human cancel one mid-build, which loses its
+# cache save).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # CI builds are one-shot: incremental artifacts only bloat the cache.
+  CARGO_INCREMENTAL: "0"
+  # Debuginfo is the single biggest compile-time + cache-size cost across the
+  # duckdb/kube dependency tree, and CI never attaches a debugger. Backtraces
+  # keep function names, just not line numbers.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   lint:
@@ -19,6 +32,13 @@ jobs:
         # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+        with:
+          # One dependency cache shared across jobs and branches, instead of
+          # each job compiling (and storing) the world separately.
+          shared-key: ci
+          # A red run's compiled deps are still good — save them so the fix-up
+          # push doesn't start cold.
+          cache-on-failure: true
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -32,6 +52,9 @@ jobs:
       - name: Install toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          cache-on-failure: true
       - name: Build
         run: cargo build --all-targets --locked
       - name: Test
