@@ -21,6 +21,11 @@ pub struct ArtifactFile {
 /// `collect` is pure I/O: no DuckDB, no `resolve`. It never opens a database.
 #[derive(Debug, Clone)]
 pub struct CellArtifact {
+    /// Source directory this artifact was collected from. Not read by pure
+    /// rendering (ADR 0002 step 2 keeps local paths out of manifests), kept for
+    /// diagnostics and possible future targets (e.g. the deferred init-container
+    /// pull model, ADR 0002 "Alternatives considered").
+    #[allow(dead_code)]
     pub dir: PathBuf,
     pub cell_yaml: ArtifactFile,
     pub sql: Vec<ArtifactFile>,

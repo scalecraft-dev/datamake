@@ -58,6 +58,14 @@ pub struct DeployArgs {
     /// Render the target's manifests to stdout without applying
     #[arg(long)]
     pub dry_run: bool,
+    /// Skip the deploy-time init build. By default `deploy` runs `datamk run`
+    /// once and waits for it, so the Server never starts against an
+    /// uninitialized catalog; pass this if you drive the Builder yourself.
+    #[arg(long)]
+    pub skip_init: bool,
+    /// Seconds to wait for the init build to complete before failing the deploy.
+    #[arg(long, default_value_t = 300)]
+    pub init_timeout: u64,
 }
 
 #[derive(Args)]

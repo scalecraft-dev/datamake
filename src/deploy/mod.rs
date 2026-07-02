@@ -20,7 +20,7 @@ use artifact::CellArtifact;
 use preflight::PreflightInput;
 use target::{DeployContext, DeployTarget};
 
-pub fn run(args: &DeployArgs) -> Result<()> {
+pub async fn run(args: &DeployArgs) -> Result<()> {
     // `local` is the run/serve profile (./.cell paths); there is intentionally no
     // deploy/local.yaml. Refuse early with the real reason, not "create the overlay".
     if args.profile == "local" {
@@ -61,13 +61,17 @@ pub fn run(args: &DeployArgs) -> Result<()> {
         .unwrap_or("cell.yaml");
     let artifact = CellArtifact::collect(&loaded.dir, cell_yaml_rel, &loaded.def)?;
 
-    let report = target.deploy(&DeployContext {
+    let ctx = DeployContext {
         def: &loaded.def,
         artifact: &artifact,
         bindings: &loaded.bindings,
         cfg: &cfg,
+        profile: &args.profile,
         dry_run: args.dry_run,
-    })?;
+        skip_init: args.skip_init,
+        init_timeout_secs: args.init_timeout,
+    };
+    let report = target.deploy(&ctx).await?;
     report.print(&loaded.def.cell, &args.profile);
     Ok(())
 }

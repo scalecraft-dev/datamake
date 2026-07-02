@@ -31,6 +31,21 @@ A Kubernetes `deploy` realizes the cell's two workloads (ADR 0001 §3) as:
 If `schedule` is omitted, only the Server is deployed (serve-only, no CronJob).
 Kubernetes supports **both** workloads, so `Kubernetes::supports()` returns `Both`.
 
+Additionally, a `deploy` renders a one-shot **init Job** running `datamk run`, and
+applies + **waits for it to complete before the Server** (order: ConfigMap → init
+Job → Service/Deployment/CronJob). This closes a real bootstrap gap found by the
+`kind` e2e harness: `serve` opens DuckLake `READ_ONLY`, and DuckLake refuses to
+auto-create a catalog under `READ_ONLY`, so against a fresh metadata-DB catalog the
+Server would crash-loop until the first Builder run initialized it. Running the
+Builder as part of deploy means the catalog (and first snapshot) exist before the
+Server starts, and it upgrades the deploy's success signal: a broken transform or
+an unreachable catalog/store now fails the deploy **with the build pod's logs**,
+not as a silent crash-loop discovered later. The init Job is content-addressed
+(`<cell>-init-<hash>`, so re-deploying identical content is an idempotent no-op) with
+`ttlSecondsAfterFinished` cleanup. `--skip-init` opts out (operator drives the
+Builder themselves); `--init-timeout` bounds the wait (default 300s). `--dry-run`
+renders the init Job like everything else but applies/waits nothing.
+
 ### 2. Apply mechanism: the `kube` crate, behind the `kubernetes` feature
 
 Apply uses the **`kube` crate**, not a `kubectl` shell-out, gated behind a
@@ -57,10 +72,13 @@ The `target: kubernetes` overlay (`deploy/<name>.yaml`, ADR 0001 §6) carries:
 target: kubernetes
 namespace: data-prod
 schedule: "0 * * * *"       # cron for the run CronJob; omit ⇒ serve-only, no CronJob
+# allow_anonymous: true     # top-level (agnostic, ADR 0001 §6/§8): required to deploy
+                            # a shareable cell with empty roles. NOT nested under `serve:` —
+                            # the target-agnostic pre-flight reads it without parsing this
+                            # target's sub-schema.
 serve:
   port: 8080
   replicas: 2
-  # allow_anonymous: true   # required to deploy a shareable cell with empty roles (§6)
 # image:                    # omit ⇒ default to this binary's version (ADR 0001 §5)
 # imagePullSecret: regcred  # a k8s Secret *name*, never the secret itself
 ```
@@ -122,8 +140,9 @@ Realizes ADR 0001 §7–§8 against the cluster, as **hard failures that block a
   and match the profile's `principals:` path. (Source JSON is validated even when
   operator-created, because `load_principals` swallows malformed JSON into an
   all-deny map.)
-- `access.shareable: true` with empty `roles` ⇒ refuse unless `serve.allow_anonymous:
-  true` is set in the overlay.
+- `access.shareable: true` with empty `roles` ⇒ refuse unless top-level
+  `allow_anonymous: true` is set in the overlay. (Enforced by the agnostic pre-flight,
+  ADR 0001 §8 — the Kubernetes target does not re-check it.)
 - `imagePullSecret` / referenced Secrets must exist before apply.
 
 ### 7. Service exposure

@@ -1,3 +1,11 @@
-# Build artifacts and VCS metadata are not part of the image build context.
+# The image build only needs Cargo.toml, Cargo.lock, and src/ (it runs
+# `cargo build --release --bin datamk`). Everything else is excluded so edits to
+# tests/docs/config don't invalidate the `COPY . .` layer or bloat the context —
+# notably the kind e2e harness under test/, which changes often but never affects
+# the binary.
 target/
 .git/
+test/
+docs/
+.claude/
+*.md

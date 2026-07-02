@@ -128,9 +128,10 @@ fn serve_fails_loud_on_missing_principals() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `deploy --dry-run -p prod` runs the full agnostic pre-flight and renders a plan
-/// with NO database and NO cluster. The prod profile points at a Postgres catalog
-/// and S3 bucket that don't exist, so success is itself proof no DB was opened.
+/// `deploy --dry-run -p prod` runs the full agnostic pre-flight and renders real
+/// Kubernetes manifests with NO database and NO cluster. The prod profile points
+/// at a Postgres catalog and S3 bucket that don't exist, so success is itself
+/// proof no DB was opened.
 #[test]
 fn deploy_dry_run_passes_preflight_without_a_db() {
     let dir = fixture("orders", "deploydry");
@@ -147,12 +148,12 @@ fn deploy_dry_run_passes_preflight_without_a_db() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stderr.contains("preflight  ok"), "stderr: {stderr}");
     assert!(stderr.contains("dry run"), "stderr: {stderr}");
-    // Rendered plan goes to stdout (pipeable), carrying the remote catalog/storage.
-    assert!(
-        stdout.contains("kubernetes deploy plan"),
-        "stdout: {stdout}"
-    );
-    assert!(stdout.contains("postgres://"), "stdout: {stdout}");
+    // Rendered manifests go to stdout (pipeable into `kubectl apply -f -`).
+    assert!(stdout.contains("kind: ConfigMap"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: Deployment"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: Service"), "stdout: {stdout}");
+    // The profile/DSN is secret-grade and must never reach a rendered manifest.
+    assert!(!stdout.contains("postgres://"), "stdout: {stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -215,17 +216,57 @@ fn init_scaffolds_deploy_overlay_and_runnable_cell() {
     let _ = std::fs::remove_dir_all(&target);
 }
 
-/// A real apply is refused in ADR 0001, pointing at ADR 0002. `--dry-run` is the
-/// supported path.
+/// A real apply (no `--dry-run`) now goes all the way to `kube::Client::try_default`
+/// (ADR 0002 step 3) — this CI environment has no reachable cluster, so it must
+/// still fail, but for a *cluster-connection* reason, never the old "not yet
+/// implemented" stub. `KUBECONFIG` is pinned to a nonexistent path so the
+/// failure mode is deterministic regardless of the runner's ambient kubeconfig
+/// (which may itself be a valid-looking, merely-unreachable context).
 #[test]
-fn deploy_apply_is_refused_pending_adr_0002() {
+fn deploy_apply_attempts_cluster_without_a_dry_run() {
     let dir = fixture("orders", "deployapply");
-    let out = run(&dir, &["deploy", "-f", "cell.yaml", "-p", "prod"]);
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["deploy", "-f", "cell.yaml", "-p", "prod"])
+        .env("KUBECONFIG", "/nonexistent/kubeconfig")
+        .output()
+        .expect("spawning datamk deploy");
     assert!(
         !out.status.success(),
-        "real apply should be refused in 0001"
+        "real apply should fail with no reachable cluster"
     );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("ADR 0002"), "stderr: {err}");
+    assert!(
+        !err.contains("not yet implemented"),
+        "the old ADR 0002 stub message must be gone: {err}"
+    );
+    assert!(
+        err.contains("Kubernetes cluster"),
+        "expected the `try_default` connection context, stderr: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--dry-run` never constructs a `kube::Client` (ADR 0002 §2): with an
+/// unreachable/nonexistent `KUBECONFIG`, a dry-run deploy must still succeed
+/// and print manifests, proving it never tried to connect.
+#[test]
+fn deploy_dry_run_never_contacts_a_cluster() {
+    let dir = fixture("orders", "deploydryoffline");
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["deploy", "-f", "cell.yaml", "-p", "prod", "--dry-run"])
+        .env("KUBECONFIG", "/nonexistent/kubeconfig")
+        .output()
+        .expect("spawning datamk deploy --dry-run");
+    assert!(
+        out.status.success(),
+        "dry-run must succeed with no reachable cluster: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("kind: ConfigMap"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: Deployment"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: Service"), "stdout: {stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -76,9 +76,17 @@ fn load_principals(path: Option<&str>) -> Result<HashMap<String, Vec<String>>> {
     };
     let raw = std::fs::read_to_string(p)
         .with_context(|| format!("reading principals file {p} (referenced by `principals:`)"))?;
-    serde_json::from_str(&raw).with_context(|| {
-        format!("parsing principals file {p} (expected JSON: {{ \"<token>\": [\"role\"] }})")
-    })
+    parse_principals(&raw).with_context(|| format!("parsing principals file {p}"))
+}
+
+/// The JSON-parse core of `load_principals`, split out so the Kubernetes
+/// deploy pre-flight (ADR 0002 §6) can validate the *same* bytes — straight off
+/// a live Secret, no temp file — with the exact same rules `serve` itself
+/// applies. A deploy that passes this check can't yield a pod that starts up
+/// and silently denies every request on malformed JSON (ADR 0002 §6).
+pub(crate) fn parse_principals(raw: &str) -> Result<HashMap<String, Vec<String>>> {
+    serde_json::from_str(raw)
+        .with_context(|| "parsing principals file (expected JSON: { \"<token>\": [\"role\"] })")
 }
 
 /// Serve the declared interface as REST + OpenAPI (the Server workload).

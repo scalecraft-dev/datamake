@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
         Command::Run(a) => engine::run(&a.file, &a.profile),
         Command::Verify(a) => verify::run(&a.file, &a.profile),
         Command::Release(a) => release::run(&a.file, &a.profile),
-        Command::Deploy(a) => deploy::run(&a),
+        Command::Deploy(a) => deploy::run(&a).await,
         Command::Serve(a) => serve::run(&a.file, &a.profile, a.port).await,
         Command::Publish(a) => {
             eprintln!("publish has been renamed to `release` (it pins the supported snapshot).");

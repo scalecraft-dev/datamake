@@ -1,0 +1,59 @@
+# Postgres: the shared metadata-DB catalog DuckLake attaches to (ADR 0002
+# Consequences: "deployed cells require a Postgres catalog"). Applied with
+# `kubectl apply -n <namespace> -f postgres.yaml` by run.sh's `infra` phase --
+# namespace is NOT set here so the same file works whatever NAMESPACE is
+# configured to.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              value: datamk
+            - name: POSTGRES_PASSWORD
+              value: datamk
+            - name: POSTGRES_DB
+              value: orders
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "datamk", "-d", "orders"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "datamk", "-d", "orders"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP

@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::config::{CellDef, DeployConfig, ResolvedBindings, Target};
 use crate::deploy::artifact::CellArtifact;
@@ -46,9 +48,25 @@ impl Workloads {
 pub struct DeployContext<'a> {
     pub def: &'a CellDef,
     pub artifact: &'a CellArtifact,
+    /// Resolved env config. Deliberately **not** consumed by pure rendering
+    /// (ADR 0002 step 2) — the catalog DSN/S3 creds must never reach a rendered
+    /// manifest. Kept on the context for a future target/cross-check that needs
+    /// it (e.g. a step-3 pre-flight comparing the profile's `principals:` path
+    /// against the rendered mount).
+    #[allow(dead_code)]
     pub bindings: &'a ResolvedBindings,
     pub cfg: &'a DeployConfig,
+    /// The `--profile` name (e.g. `prod`). Not part of `bindings` — a target
+    /// needs the **name** itself (to build the profile Secret's name and the
+    /// rendered `--profile` arg), never the resolved catalog/storage/DSN it
+    /// points at.
+    pub profile: &'a str,
     pub dry_run: bool,
+    /// Skip the deploy-time init build (`--skip-init`); only consulted on a real
+    /// apply. See `kubernetes::apply::apply_all`.
+    pub skip_init: bool,
+    /// Seconds to wait for the init build Job before failing (`--init-timeout`).
+    pub init_timeout_secs: u64,
 }
 
 /// One rendered document (e.g. a Kubernetes manifest in ADR 0002). In ADR 0001
@@ -112,8 +130,23 @@ impl DeployReport {
                 eprintln!("  applied    {} {}", a.kind, a.name);
             }
         }
-        for d in &self.rendered {
-            println!("{}", d.body);
+        // Full manifest bodies go to stdout only for a dry run — pipeable into
+        // `kubectl apply -f -`, and multi-doc-YAML-joined with `---` so more
+        // than one rendered document is valid input to that pipe. A real apply
+        // (ADR 0002 step 3) already touched the cluster; dumping the same YAML
+        // again to stdout there would just be noise.
+        if self.dry_run {
+            let mut out = String::new();
+            for (i, d) in self.rendered.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("---\n");
+                }
+                out.push_str(&d.body);
+                if !d.body.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            print!("{out}");
         }
     }
 }
@@ -131,5 +164,13 @@ pub trait DeployTarget {
     fn supports(&self) -> Workloads;
 
     /// Render + (unless `ctx.dry_run`) apply whatever runs the cell here.
-    fn deploy(&self, ctx: &DeployContext) -> Result<DeployReport>;
+    ///
+    /// Returns a boxed future rather than a plain `Result` because a real apply
+    /// (Kubernetes: the `kube` client) is async, and `main` already runs on a
+    /// Tokio runtime — the deploy path awaits this directly instead of blocking a
+    /// nested runtime. Sync-only targets just wrap their body in `Box::pin(async …)`.
+    fn deploy<'a>(
+        &'a self,
+        ctx: &'a DeployContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<DeployReport>> + 'a>>;
 }
