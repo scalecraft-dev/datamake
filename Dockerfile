@@ -3,11 +3,12 @@
 # users do NOT build a per-cell image. The image tag is meant to track the binary
 # version, so a given `datamk` deploys the matching base image.
 #
-# NOTE: DuckDB extensions (ducklake, httpfs, json) are fetched at first run
-# (engine::setup INSTALLs them), so a running container needs network egress to
-# the extension registry. Baking the extensions into the image — and a no-INSTALL
+# NOTE: DuckDB extensions (ducklake, httpfs, json, and connector extensions such
+# as `bigquery` from the community registry — ADR 0003) are fetched at first run
+# (engine INSTALLs them), so a running container needs network egress to the
+# extension registries. Baking the extensions into the image — and a no-INSTALL
 # runtime path for egress-less environments — is a deliberate follow-up (ADR 0001
-# §5, deferred); revisit when such an environment is encountered.
+# §5 / ADR 0003 §4, deferred); revisit when such an environment is encountered.
 
 # ---- builder ----
 # buildpack-deps base (via the official rust image) carries the C/C++ toolchain

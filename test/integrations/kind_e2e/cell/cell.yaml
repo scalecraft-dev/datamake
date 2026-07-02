@@ -1,0 +1,25 @@
+cell: orders
+
+# Synthesized inside the transforms (see sql/), so `datamk run` needs no external
+# inputs — the fixture builds offline.
+
+transforms:
+  - sql/stg_orders.sql
+  - sql/orders_daily.sql
+
+interface:
+  - name: orders_daily
+    version: 2.1.0
+    source: orders_daily
+    grain: [order_date, region]
+    schema:
+      order_date: date
+      region: string
+      revenue: decimal
+    freshness: daily
+    visibility: discoverable
+    contract: supported          # supported -> `release` pins its snapshot; serve freezes it
+
+access:
+  shareable: true
+  # roles: empty -> open endpoint. deploy/prod.yaml must set allow_anonymous: true.

@@ -1,4 +1,4 @@
-use super::schema::{Bindings, CellDef, Source};
+use super::schema::{Bindings, CellDef, Connection, Source};
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
 
@@ -24,14 +24,34 @@ pub enum ResolvedSource {
         table: String,
         version: Option<u64>,
     },
+    /// A warehouse table with its connection config inlined (as `Cell` inlines
+    /// its location). `connection` keeps the reference name for the engine's
+    /// attach alias, shared by every source on the same connection.
+    Connection {
+        connection: String,
+        config: ResolvedConnection,
+        table: String,
+    },
+}
+
+/// A warehouse connection with env references expanded.
+#[derive(Debug, Clone)]
+pub enum ResolvedConnection {
+    Bigquery {
+        project: String,
+        billing_project: Option<String>,
+        credentials: Option<String>,
+    },
 }
 
 impl ResolvedSource {
     /// Whether this source reads from object storage (needs httpfs/S3 secret).
+    /// Connection sources read through a scanner extension, not httpfs.
     pub fn is_remote(&self) -> bool {
         let loc = match self {
             ResolvedSource::Raw(uri) => uri.as_str(),
             ResolvedSource::Cell { storage, .. } => storage.as_str(),
+            ResolvedSource::Connection { .. } => return false,
         };
         is_remote(loc)
     }
@@ -98,6 +118,19 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
                     version: *version,
                 }
             }
+            Source::Connection { connection, table } => {
+                let conn = b.connections.get(connection).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "source '{name}' uses connection '{connection}', but the profile has no \
+                         `connections.{connection}` entry"
+                    )
+                })?;
+                ResolvedSource::Connection {
+                    connection: connection.clone(),
+                    config: resolve_connection(conn)?,
+                    table: expand(table)?,
+                }
+            }
         };
         sources.insert(name.clone(), resolved);
     }
@@ -110,6 +143,16 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
         s3,
         sources,
         principals,
+    })
+}
+
+fn resolve_connection(c: &Connection) -> Result<ResolvedConnection> {
+    Ok(match c {
+        Connection::Bigquery(bq) => ResolvedConnection::Bigquery {
+            project: expand(&bq.project)?,
+            billing_project: expand_opt(&bq.billing_project)?,
+            credentials: expand_opt(&bq.credentials)?,
+        },
     })
 }
 
@@ -156,7 +199,7 @@ pub fn expand(input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::schema::{Bindings, CellLocation, Export, S3Binding};
+    use super::super::schema::{BigQueryConnection, Bindings, CellLocation, Export, S3Binding};
     use super::*;
 
     #[test]
@@ -247,6 +290,7 @@ mod tests {
             s3: None,
             principals: None,
             cells,
+            connections: IndexMap::new(),
         }
     }
 
@@ -271,6 +315,7 @@ mod tests {
             s3: None,
             principals: None,
             cells: IndexMap::new(),
+            connections: IndexMap::new(),
         };
         let r = resolve(&def, &b).unwrap();
         match r.sources.get("raw").unwrap() {
@@ -329,9 +374,77 @@ mod tests {
             s3: None,
             principals: None,
             cells: IndexMap::new(),
+            connections: IndexMap::new(),
         };
         let err = resolve(&def, &b).unwrap_err().to_string();
         assert!(err.contains("missing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_links_a_connection_source_via_the_profile() {
+        std::env::set_var("DATAMK_TEST_BQ_PROJECT", "acme-prod-crm");
+        let def = cell_with_source(
+            "crm_accounts",
+            Source::Connection {
+                connection: "crm".to_string(),
+                table: "sales.accounts".to_string(),
+            },
+        );
+        let mut connections = IndexMap::new();
+        connections.insert(
+            "crm".to_string(),
+            Connection::Bigquery(BigQueryConnection {
+                project: "${DATAMK_TEST_BQ_PROJECT}".to_string(),
+                billing_project: None,
+                credentials: None,
+            }),
+        );
+        let b = Bindings {
+            catalog: "c".into(),
+            storage: "s".into(),
+            s3: None,
+            principals: None,
+            cells: IndexMap::new(),
+            connections,
+        };
+        let r = resolve(&def, &b).unwrap();
+        let src = r.sources.get("crm_accounts").unwrap();
+        // A connection source reads through a scanner extension, not httpfs.
+        assert!(!src.is_remote());
+        match src {
+            ResolvedSource::Connection {
+                connection,
+                config: ResolvedConnection::Bigquery { project, .. },
+                table,
+            } => {
+                assert_eq!(connection, "crm");
+                assert_eq!(project, "acme-prod-crm");
+                assert_eq!(table, "sales.accounts");
+            }
+            other => panic!("expected connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_errors_when_connection_is_missing() {
+        let def = cell_with_source(
+            "crm_accounts",
+            Source::Connection {
+                connection: "crm".to_string(),
+                table: "sales.accounts".to_string(),
+            },
+        );
+        let b = Bindings {
+            catalog: "c".into(),
+            storage: "s".into(),
+            s3: None,
+            principals: None,
+            cells: IndexMap::new(),
+            connections: IndexMap::new(),
+        };
+        let err = resolve(&def, &b).unwrap_err().to_string();
+        assert!(err.contains("connections.crm"), "unexpected error: {err}");
+        assert!(err.contains("crm_accounts"), "unexpected error: {err}");
     }
 
     #[test]
@@ -357,6 +470,7 @@ mod tests {
             }),
             principals: None,
             cells: IndexMap::new(),
+            connections: IndexMap::new(),
         };
         let r = resolve(&def, &b).unwrap();
         let s3 = r.s3.unwrap();

@@ -11,9 +11,13 @@ path = "src/main.rs"
 
 [features]
 default = ["kubernetes"]
-# Kubernetes deploy target. ADR 0001 ships a dep-free stub (schema validation +
-# dry-run plan); ADR 0002 adds kube/k8s-openapi to this feature for real apply.
-kubernetes = []
+# Kubernetes deploy target. Pulls in kube/k8s-openapi (ADR 0002) for real
+# server-side apply; `--no-default-features` gets the lean run/serve build with
+# neither compiled.
+# `tokio/time` is only needed by the init-Job wait loop (apply.rs's
+# `apply_and_wait_init`) -- gated here, not on the base `tokio` line, so
+# `--no-default-features` doesn't pull in a timer driver it never uses.
+kubernetes = ["dep:kube", "dep:k8s-openapi", "tokio/time"]
 
 # Integration tests live under test/integrations/ (alongside their fixture cells)
 # rather than the default tests/ dir.
@@ -36,3 +40,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Kubernetes deploy target (feature = "kubernetes"). rustls/ring restated
+# explicitly so a security-relevant TLS backend can't silently change on a minor
+# bump; pure-Rust TLS needs no system libs (no Dockerfile change). Pinned to the
+# 3.x line + explicit v1_33 API so `cargo update` can't drift the k8s surface.
+kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
+k8s-openapi = { version = "0.27", features = ["v1_33"], optional = true }

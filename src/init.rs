@@ -44,7 +44,10 @@ fn cell_yaml(name: &str) -> String {
 
 # sources:                        # external inputs, bound as TEMP VIEWs before transforms.
 #   raw_orders: ${{ORDERS_PATH:-s3://acme-lake/orders/*.parquet}}   # DuckDB auto-detects format
-                                  # transforms then read `raw_orders` by name.
+#   crm_accounts:                 # a warehouse table via a named connection
+#     connection: crm             # -> profiles/<name>.yaml `connections.crm`
+#     table: sales.accounts       # which table is contract; which project is environment
+                                  # transforms then read sources by name.
 
 transforms:                       # private; run in listed order, atomically -> one snapshot
   - sql/stg_orders.sql
@@ -102,6 +105,12 @@ s3:
   region: ${{AWS_REGION:-us-east-1}}        # omit key_id/secret to use the AWS credential chain
   # key_id: ${{AWS_ACCESS_KEY_ID}}
   # secret: ${{AWS_SECRET_ACCESS_KEY}}
+# connections:                              # named warehouse connections (`connection` sources)
+#   crm:
+#     type: bigquery
+#     project: ${{GCP_PROJECT}}             # the project whose datasets are read
+#     # billing_project: ${{GCP_BILLING_PROJECT}}   # defaults to `project`
+#     # credentials: /etc/datamk/bq-key.json        # SA key file (secret mount); omit to use ADC
 "#
     )
 }

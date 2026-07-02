@@ -1,3 +1,5 @@
+mod connectors;
+
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use indexmap::IndexMap;
@@ -53,11 +55,34 @@ fn setup(conn: &Connection, b: &ResolvedBindings, dir: &Path, read_only: bool) -
     }
 
     let catalog = resolve_catalog(&b.catalog, dir)?;
+    load_catalog_extension(conn, &catalog)?;
     let ro = if read_only { ", READ_ONLY" } else { "" };
     conn.execute_batch(&format!(
         "ATTACH 'ducklake:{catalog}' AS lake (DATA_PATH '{storage}'{ro}); USE lake;"
     ))
     .with_context(|| format!("attaching DuckLake (catalog={catalog}, storage={storage})"))?;
+    Ok(())
+}
+
+/// DuckLake attaches a metadata-DB catalog (`postgres:`/`sqlite:`) through
+/// DuckDB's own scanner extension for that database, not something DuckLake
+/// bundles itself: without `INSTALL postgres`/`INSTALL sqlite` first, DuckDB
+/// doesn't recognize the `postgres://...`/`sqlite:...` DSN as a database at
+/// all and instead tries to open it as a literal local file path (the error is
+/// exactly that confusing: "Cannot open file
+/// .../postgres:/user:pass@host/db: No such file or directory"). A `.ducklake`
+/// file catalog needs neither extension, so this only runs for the metadata-DB
+/// case.
+fn load_catalog_extension(conn: &Connection, catalog: &str) -> Result<()> {
+    let ext = if catalog.starts_with("postgres:") {
+        "postgres"
+    } else if catalog.starts_with("sqlite:") {
+        "sqlite"
+    } else {
+        return Ok(());
+    };
+    conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
+        .with_context(|| format!("loading DuckDB '{ext}' extension for catalog '{catalog}'"))?;
     Ok(())
 }
 
@@ -112,6 +137,7 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
 
     // Sources are session-local TEMP VIEWs: visible to transforms, never committed
     // to the catalog.
+    connectors::prepare(&cell.sources, &cell.dir)?;
     for (i, (name, src)) in cell.sources.iter().enumerate() {
         bind_source(&cell.conn, i, name, src, &cell.dir)?;
     }
@@ -190,6 +216,27 @@ fn bind_source(
             .with_context(|| format!("binding cell source '{name}' -> {table}"))?;
             tracing::info!(source = %name, table = %table, version = ?version, "bound cell source");
         }
+        ResolvedSource::Connection {
+            connection,
+            config,
+            table,
+        } => {
+            let ty = config.type_name();
+            // Alias keyed on the connection name + ATTACH IF NOT EXISTS: a
+            // connection shared by several sources attaches once. Qualify first:
+            // it's pure validation, and INSTALL/ATTACH may hit the network.
+            let alias = format!("__conn_{connection}");
+            let qualified = config.qualify(&alias, table)?;
+            conn.execute_batch(config.install_load_sql())
+                .with_context(|| format!("loading DuckDB '{ty}' extension"))?;
+            conn.execute_batch(&config.attach_sql(&alias))
+                .with_context(|| format!("attaching connection '{connection}' ({ty})"))?;
+            conn.execute_batch(&format!(
+                "CREATE OR REPLACE TEMP VIEW \"{view}\" AS SELECT * FROM {qualified};"
+            ))
+            .with_context(|| format!("binding connection source '{name}' -> {table}"))?;
+            tracing::info!(source = %name, connection = %connection, table = %table, "bound connection source");
+        }
     }
     Ok(())
 }
@@ -225,14 +272,72 @@ fn resolve_storage(s: &str, dir: &Path) -> Result<String> {
     resolve_local(s, dir, true)
 }
 
-/// Resolve the catalog binding. `sqlite:`/`postgres:` DSNs pass through; anything
-/// else is treated as a local catalog file path.
+/// Resolve the catalog binding. `sqlite:` DSNs pass through as-is; `postgres://`
+/// DSNs are translated to the libpq keyword string DuckLake actually expects
+/// (see `postgres_url_to_ducklake`); anything else is a local catalog file path.
 fn resolve_catalog(s: &str, dir: &Path) -> Result<String> {
+    if s.starts_with("postgres://") {
+        return postgres_url_to_ducklake(s);
+    }
     if crate::config::is_metadata_db_catalog(s) {
         return Ok(s.to_string());
     }
     let p = s.strip_prefix("file://").unwrap_or(s);
     resolve_local(p, dir, /* is_dir */ false)
+}
+
+/// Translate `postgres://[user[:password]@]host[:port]/dbname` (the DSN form
+/// `cell.yaml`/`profiles/*.yaml` document and every profile in this repo uses)
+/// into `postgres:dbname=... host=... [port=...] [user=...] [password=...]` —
+/// the libpq keyword/value connect string DuckLake's postgres catalog backend
+/// actually parses after `ducklake:`.
+///
+/// Passing the URL form straight through (what this code did before it was
+/// caught by the `kind` e2e harness, test/integrations/kind_e2e/README.md)
+/// does NOT fail to parse — it fails silently *differently*: DuckDB doesn't
+/// recognize `postgres://...` as a connection string at all and instead tries
+/// to open a local file literally named `postgres:/user:pass@host/db`, "no
+/// such file or directory". Translating at this boundary keeps the familiar
+/// URL form in the contract without pushing DuckLake's connection-string
+/// dialect into `cell.yaml`/profiles.
+fn postgres_url_to_ducklake(url: &str) -> Result<String> {
+    let rest = url
+        .strip_prefix("postgres://")
+        .ok_or_else(|| anyhow::anyhow!("not a postgres:// DSN: {url}"))?;
+
+    let (userinfo, hostpart) = match rest.split_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, rest),
+    };
+    let (hostport, dbpart) = hostpart
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("postgres catalog DSN '{url}' has no `/<database>` path"))?;
+    let dbname = dbpart.split('?').next().unwrap_or(dbpart);
+    if dbname.is_empty() {
+        anyhow::bail!("postgres catalog DSN '{url}' has an empty database name");
+    }
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (hostport, None),
+    };
+    if host.is_empty() {
+        anyhow::bail!("postgres catalog DSN '{url}' has no host");
+    }
+
+    let mut parts = vec![format!("dbname={dbname}"), format!("host={host}")];
+    if let Some(p) = port {
+        parts.push(format!("port={p}"));
+    }
+    if let Some(u) = userinfo {
+        match u.split_once(':') {
+            Some((user, pass)) => {
+                parts.push(format!("user={user}"));
+                parts.push(format!("password={pass}"));
+            }
+            None => parts.push(format!("user={u}")),
+        }
+    }
+    Ok(format!("postgres:{}", parts.join(" ")))
 }
 
 fn resolve_local(p: &str, dir: &Path, is_dir: bool) -> Result<String> {
@@ -272,6 +377,70 @@ mod tests {
         assert_eq!(esc("plain"), "plain");
         assert_eq!(esc("o'brien"), "o''brien");
         assert_eq!(esc("a'b'c"), "a''b''c");
+    }
+
+    // Found running the `kind` e2e harness (test/integrations/kind_e2e/):
+    // DuckLake's postgres catalog backend takes a libpq keyword/value connect
+    // string after `ducklake:postgres:`, not the `postgres://` URL every
+    // profile in this repo (and the docs) use. `resolve_catalog` translates at
+    // the boundary; these pin the translation down without a live Postgres.
+
+    #[test]
+    fn postgres_url_translates_user_password_host_port_db() {
+        assert_eq!(
+            postgres_url_to_ducklake("postgres://datamk:datamk@db.example:5432/orders").unwrap(),
+            "postgres:dbname=orders host=db.example port=5432 user=datamk password=datamk"
+        );
+    }
+
+    #[test]
+    fn postgres_url_handles_missing_port_and_password() {
+        assert_eq!(
+            postgres_url_to_ducklake("postgres://u@h/db").unwrap(),
+            "postgres:dbname=db host=h user=u"
+        );
+    }
+
+    #[test]
+    fn postgres_url_handles_no_userinfo_at_all() {
+        assert_eq!(
+            postgres_url_to_ducklake("postgres://db.example:5432/orders").unwrap(),
+            "postgres:dbname=orders host=db.example port=5432"
+        );
+    }
+
+    #[test]
+    fn postgres_url_rejects_a_missing_database() {
+        let err = postgres_url_to_ducklake("postgres://h/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty database name"), "got: {err}");
+    }
+
+    #[test]
+    fn postgres_url_rejects_a_missing_database_path() {
+        let err = postgres_url_to_ducklake("postgres://h")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no `/<database>` path"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_catalog_translates_postgres_urls() {
+        let dir = Path::new("/cell");
+        assert_eq!(
+            resolve_catalog("postgres://datamk:datamk@db:5432/orders", dir).unwrap(),
+            "postgres:dbname=orders host=db port=5432 user=datamk password=datamk"
+        );
+    }
+
+    #[test]
+    fn resolve_catalog_passes_sqlite_dsns_through_untranslated() {
+        let dir = Path::new("/cell");
+        assert_eq!(
+            resolve_catalog("sqlite:/data/catalog.db", dir).unwrap(),
+            "sqlite:/data/catalog.db"
+        );
     }
 
     #[test]

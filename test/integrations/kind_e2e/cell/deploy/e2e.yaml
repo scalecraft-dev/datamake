@@ -1,0 +1,34 @@
+# Deploy topology for the `e2e` profile (ADR 0002 §3). Tracked, secret-free,
+# mirrors test/integrations/orders/deploy/prod.yaml but points at the local
+# `kind` cluster the harness in ../run.sh stands up.
+target: kubernetes
+namespace: datamk-e2e
+
+# orders is shareable with empty `access.roles` (open endpoint) -- the
+# deliberate, reviewed acknowledgement the open-endpoint pre-flight (ADR 0001
+# §8f) requires.
+allow_anonymous: true
+
+# A schedule that (deliberately) never fires during a normal e2e run: the
+# harness needs full control over exactly when the Builder runs (it triggers
+# one-off Jobs from this CronJob via `kubectl create job --from=cronjob/orders`
+# instead). A tight schedule like "*/5 * * * *" races with the harness's own
+# manual trigger -- caught by actually running this: the CronJob fired on its
+# own schedule mid-validation, before the harness could observe the
+# not-yet-built state, and by the time `validate` looked, the Server had
+# already been through several crash-loop restarts (see README.md's "bugs hit"
+# section for why the Server crash-loops until the first Builder run ever
+# completes). "0 3 1 1 *" is a valid 5-field cron expression (passes
+# KubernetesConfig::validate) that only fires at 03:00 on Jan 1st.
+schedule: "0 3 1 1 *"
+
+serve:
+  port: 8080
+  replicas: 1
+
+# `kind load docker-image` puts this tag directly on every node's containerd
+# store, so the default `IfNotPresent` pull policy uses it without ever
+# reaching a registry (there isn't one). Do NOT use `:latest` here -- some
+# clusters default `:latest` to `imagePullPolicy: Always`, which would send the
+# kubelet to a registry that doesn't have this image and crashloop the pods.
+image: datamk:e2e

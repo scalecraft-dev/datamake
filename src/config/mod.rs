@@ -6,7 +6,8 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub use bindings::{
-    is_metadata_db_catalog, is_remote, resolve, ResolvedBindings, ResolvedS3, ResolvedSource,
+    is_metadata_db_catalog, is_remote, resolve, ResolvedBindings, ResolvedConnection, ResolvedS3,
+    ResolvedSource,
 };
 pub use deploy::{DeployConfig, Target};
 pub use schema::{Bindings, CellDef, Contract, Export, Visibility};
