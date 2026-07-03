@@ -25,6 +25,7 @@ schedule: "0 3 1 1 *"
 serve:
   port: 8080
   replicas: 1
+  poll_interval: 5   # tight so the freshness capstone observes the swap fast (ADR 0004)
 
 # `kind load docker-image` puts this tag directly on every node's containerd
 # store, so the default `IfNotPresent` pull policy uses it without ever

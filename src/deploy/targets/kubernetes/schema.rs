@@ -16,6 +16,10 @@ pub(crate) struct KubernetesConfig {
     /// Builder cron. Absent ⇒ serve-only, no CronJob (ADR 0002 §1).
     #[serde(default)]
     pub(crate) schedule: Option<String>,
+    /// Compaction window in days for the Builder (ADR 0004 §10); rendered as
+    /// `--retention-days` on the init Job and CronJob. 0 disables compaction.
+    #[serde(default)]
+    pub(crate) retention_days: Option<u64>,
     #[serde(default)]
     pub(crate) serve: ServeTopology,
     #[serde(default)]
@@ -30,6 +34,11 @@ pub(crate) struct ServeTopology {
     pub(crate) port: Option<u16>,
     #[serde(default)]
     pub(crate) replicas: Option<u32>,
+    /// Seconds between the Server's LATEST-pointer checks — the staleness
+    /// bound for experimental "latest" routes (ADR 0004 §6). Ops tuning, so it
+    /// lives here in the tracked overlay, not the secret-bearing profile.
+    #[serde(default)]
+    pub(crate) poll_interval: Option<u64>,
 }
 
 impl KubernetesConfig {
@@ -48,6 +57,16 @@ impl KubernetesConfig {
 
     pub(crate) fn replicas(&self) -> u32 {
         self.serve.replicas.unwrap_or(1)
+    }
+
+    /// Mirrors `serve`'s own CLI default (`cli.rs`).
+    pub(crate) fn poll_interval(&self) -> u64 {
+        self.serve.poll_interval.unwrap_or(15)
+    }
+
+    /// Mirrors `run`'s own CLI default (`cli.rs`).
+    pub(crate) fn retention_days(&self) -> u64 {
+        self.retention_days.unwrap_or(30)
     }
 
     /// The image to run. Defaults to this binary's own version — the base image
@@ -88,6 +107,10 @@ impl KubernetesConfig {
 
         if self.serve.port == Some(0) {
             bail!("kubernetes overlay `serve.port` must be non-zero");
+        }
+
+        if self.serve.poll_interval == Some(0) {
+            bail!("kubernetes overlay `serve.poll_interval` must be non-zero (seconds)");
         }
 
         if let Some(secret) = &self.image_pull_secret {
@@ -209,6 +232,7 @@ namespace: data-prod
             serve: ServeTopology {
                 port: Some(0),
                 replicas: None,
+                poll_interval: None,
             },
             ..Default::default()
         };

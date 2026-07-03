@@ -18,7 +18,7 @@ pub enum Command {
     /// Scaffold a new cell (an implementation project)
     Init(InitArgs),
     /// Execute the transform pipeline, commit a snapshot, auto-verify (the Builder workload)
-    Run(FileArgs),
+    Run(RunArgs),
     /// Machine-verify actual output against the declared interface
     Verify(FileArgs),
     /// Pin the current snapshot as the supported contract
@@ -27,10 +27,44 @@ pub enum Command {
     Deploy(DeployArgs),
     /// Serve the declared interface as REST + OpenAPI (the Server workload)
     Serve(ServeArgs),
+    /// Show the published executions and the LATEST pointer (published-artifact profiles)
+    Status(FileArgs),
+    /// Roll back the served DATA to an earlier execution by repointing LATEST.
+    /// (To roll back a version/code change, use your orchestrator's rollout undo.)
+    Rollback(RollbackArgs),
 
     /// Deprecated alias for `release`; kept for one release.
     #[command(hide = true)]
     Publish(FileArgs),
+}
+
+#[derive(Args)]
+pub struct RollbackArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml)
+    #[arg(short, long)]
+    pub profile: String,
+    /// Execution number to roll back to (default: the one before LATEST)
+    #[arg(long)]
+    pub execution: Option<u64>,
+}
+
+#[derive(Args)]
+pub struct RunArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml)
+    #[arg(short, long, default_value = "local")]
+    pub profile: String,
+    /// Published-mode compaction window in days (ADR 0004 §10): expire
+    /// snapshots older than this (never pinned ones), delete data files
+    /// unreferenced for at least this long, and GC superseded catalog
+    /// artifacts. 0 disables compaction. Ignored in direct-attach mode.
+    #[arg(long, default_value_t = 30)]
+    pub retention_days: u64,
 }
 
 #[derive(Args)]
@@ -88,4 +122,9 @@ pub struct ServeArgs {
     /// Port to bind
     #[arg(short, long, default_value_t = 8080)]
     pub port: u16,
+    /// Seconds between LATEST-pointer checks in published-artifact mode — the
+    /// staleness bound for experimental "latest" routes (ADR 0004). Ignored in
+    /// direct-attach (local catalog) mode.
+    #[arg(long, default_value_t = 15)]
+    pub poll_interval: u64,
 }

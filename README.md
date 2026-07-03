@@ -49,7 +49,7 @@ orders/
   sql/*.sql        # private logic; runs in order → one atomic snapshot   [tracked]
   profiles/
     local.yaml     # laptop bindings (./.cell paths, no secrets)          [tracked]
-    prod.yaml      # catalog DSN, S3 creds.                               [gitignored]
+    prod.yaml      # storage + S3 creds (no catalog — ADR 0004)           [gitignored]
   deploy/
     prod.yaml      # where/how the workloads run in prod                  [tracked]
 ```

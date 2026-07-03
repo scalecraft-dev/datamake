@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use crate::config::{is_metadata_db_catalog, is_remote, CellDef, ResolvedBindings};
+use crate::config::{is_remote, CellDef, ResolvedBindings};
 use crate::deploy::target::Workloads;
 
 /// Inputs for the target-agnostic pre-flight. All resolved without a database:
@@ -18,7 +18,7 @@ pub struct PreflightInput<'a> {
 /// on the target hosting the long-lived workload.
 pub fn check(i: &PreflightInput) -> Result<()> {
     check_remote_storage(i)?;
-    check_catalog_concurrency(i)?;
+    check_no_catalog(i)?;
     if i.supports.long_lived() {
         check_servable(i)?;
         check_auth(i)?;
@@ -39,16 +39,19 @@ fn check_remote_storage(i: &PreflightInput) -> Result<()> {
     Ok(())
 }
 
-/// §7: a DuckDB-file `.ducklake` catalog holds an exclusive file lock, so a
-/// running Server blocks the Builder's commit (and vice versa).
-fn check_catalog_concurrency(i: &PreflightInput) -> Result<()> {
-    if !is_metadata_db_catalog(&i.bindings.catalog) {
+/// ADR 0004 §11: a deployed cell has no separate catalog — it derives from
+/// `storage` and publishes an immutable artifact per execution. *Any*
+/// `catalog:` value is rejected (a DSN is the superseded shared-live model; a
+/// file path is unreachable from a pod).
+fn check_no_catalog(i: &PreflightInput) -> Result<()> {
+    if let Some(c) = &i.bindings.catalog {
         bail!(
-            "profile '{p}' catalog `{c}` is a DuckDB-file .ducklake: it holds an exclusive file \
-             lock, so a running Server blocks the Builder from committing (and vice versa).\n\
-             Use a metadata-DB catalog: `sqlite:` for a single replica, `postgres:` for multi-replica.",
+            "deploy: profiles/{p}.yaml sets `catalog:` ({c}), but a deployed cell derives its \
+             catalog from `storage` and publishes an immutable catalog artifact per execution — \
+             it has no separate catalog DSN.\n\
+             Remove the `catalog:` line; `storage` is a deployed cell's only external dependency. \
+             See ADR 0004.",
             p = i.profile,
-            c = i.bindings.catalog,
         );
     }
     Ok(())

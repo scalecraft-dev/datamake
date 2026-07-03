@@ -216,19 +216,27 @@ fn init_scaffolds_deploy_overlay_and_runnable_cell() {
     let _ = std::fs::remove_dir_all(&target);
 }
 
-/// A real apply (no `--dry-run`) now goes all the way to `kube::Client::try_default`
+/// A real apply (no `--dry-run`) goes all the way to `kube::Client::try_default`
 /// (ADR 0002 step 3) — this CI environment has no reachable cluster, so it must
 /// still fail, but for a *cluster-connection* reason, never the old "not yet
-/// implemented" stub. `KUBECONFIG` is pinned to a nonexistent path so the
-/// failure mode is deterministic regardless of the runner's ambient kubeconfig
-/// (which may itself be a valid-looking, merely-unreachable context).
+/// implemented" stub. Along the way, the ADR 0004 §3 host-side conditional-PUT
+/// probe must NOT hard-fail the deploy just because the fixture's bucket is
+/// unreachable from this host — unreachability defers to the in-pod probe
+/// (`engine::run` runs it; the init Job surfaces failures with build logs).
+/// `KUBECONFIG` is pinned to a nonexistent path so the failure mode is
+/// deterministic regardless of the runner's ambient kubeconfig.
 #[test]
-fn deploy_apply_attempts_cluster_without_a_dry_run() {
+fn deploy_apply_attempts_cluster_and_defers_unreachable_probe() {
     let dir = fixture("orders", "deployapply");
     let out = Command::new(bin())
         .current_dir(&dir)
         .args(["deploy", "-f", "cell.yaml", "-p", "prod"])
         .env("KUBECONFIG", "/nonexistent/kubeconfig")
+        // Pin the AWS env so the probe fails deterministically on credentials/
+        // reachability regardless of the runner's ambient identity.
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_PROFILE")
         .output()
         .expect("spawning datamk deploy");
     assert!(
@@ -242,7 +250,8 @@ fn deploy_apply_attempts_cluster_without_a_dry_run() {
     );
     assert!(
         err.contains("Kubernetes cluster"),
-        "expected the `try_default` connection context, stderr: {err}"
+        "expected the `try_default` connection context (probe unreachability must \
+         defer, not fail): {err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

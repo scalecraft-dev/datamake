@@ -5,7 +5,8 @@ use indexmap::IndexMap;
 /// A cell's environment config with all `${VAR}` references expanded.
 #[derive(Debug, Clone)]
 pub struct ResolvedBindings {
-    pub catalog: String,
+    /// `Some` ⇒ direct attach; `None` ⇒ published-artifact mode (ADR 0004 §11).
+    pub catalog: Option<String>,
     pub storage: String,
     pub s3: Option<ResolvedS3>,
     /// Source name -> resolved source.
@@ -19,7 +20,9 @@ pub struct ResolvedBindings {
 pub enum ResolvedSource {
     Raw(String),
     Cell {
-        catalog: String,
+        /// `Some` ⇒ attach the upstream catalog directly; `None` ⇒ published
+        /// mode against the upstream's storage prefix (ADR 0004 §12).
+        catalog: Option<String>,
         storage: String,
         table: String,
         version: Option<u64>,
@@ -112,7 +115,7 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
                     )
                 })?;
                 ResolvedSource::Cell {
-                    catalog: expand(&loc.catalog)?,
+                    catalog: expand_opt(&loc.catalog)?,
                     storage: expand(&loc.storage)?,
                     table: expand(table)?,
                     version: *version,
@@ -138,7 +141,7 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
     let principals = expand_opt(&b.principals)?;
 
     Ok(ResolvedBindings {
-        catalog: expand(&b.catalog)?,
+        catalog: expand_opt(&b.catalog)?,
         storage: expand(&b.storage)?,
         s3,
         sources,
@@ -285,7 +288,7 @@ mod tests {
         let mut cells = IndexMap::new();
         cells.insert(cell.to_string(), loc);
         Bindings {
-            catalog: "./cat.ducklake".to_string(),
+            catalog: Some("./cat.ducklake".to_string()),
             storage: "./data".to_string(),
             s3: None,
             principals: None,
@@ -310,7 +313,7 @@ mod tests {
     fn resolve_passes_through_a_raw_source() {
         let def = cell_with_source("raw", Source::Raw("s3://bucket/x.parquet".to_string()));
         let b = Bindings {
-            catalog: "c".into(),
+            catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
             principals: None,
@@ -337,7 +340,7 @@ mod tests {
         let b = bindings_with_cell(
             "other",
             CellLocation {
-                catalog: "/lake/other.ducklake".to_string(),
+                catalog: Some("/lake/other.ducklake".to_string()),
                 storage: "/lake/other/data".to_string(),
             },
         );
@@ -349,7 +352,7 @@ mod tests {
                 table,
                 version,
             } => {
-                assert_eq!(catalog, "/lake/other.ducklake");
+                assert_eq!(catalog.as_deref(), Some("/lake/other.ducklake"));
                 assert_eq!(storage, "/lake/other/data");
                 assert_eq!(table, "orders");
                 assert_eq!(*version, Some(7));
@@ -369,7 +372,7 @@ mod tests {
             },
         );
         let b = Bindings {
-            catalog: "c".into(),
+            catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
             principals: None,
@@ -400,7 +403,7 @@ mod tests {
             }),
         );
         let b = Bindings {
-            catalog: "c".into(),
+            catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
             principals: None,
@@ -435,7 +438,7 @@ mod tests {
             },
         );
         let b = Bindings {
-            catalog: "c".into(),
+            catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
             principals: None,
@@ -458,7 +461,7 @@ mod tests {
             access: Default::default(),
         };
         let b = Bindings {
-            catalog: "c".into(),
+            catalog: Some("c".into()),
             storage: "s".into(),
             s3: Some(S3Binding {
                 region: Some("${DATAMK_TEST_REGION}".to_string()),
@@ -505,14 +508,14 @@ mod tests {
         assert!(ResolvedSource::Raw("gcs://b/x".into()).is_remote());
         assert!(!ResolvedSource::Raw("./local.parquet".into()).is_remote());
         assert!(ResolvedSource::Cell {
-            catalog: "c".into(),
+            catalog: Some("c".into()),
             storage: "s3://b/d".into(),
             table: "t".into(),
             version: None,
         }
         .is_remote());
         assert!(!ResolvedSource::Cell {
-            catalog: "c".into(),
+            catalog: Some("c".into()),
             storage: "/local/d".into(),
             table: "t".into(),
             version: None,

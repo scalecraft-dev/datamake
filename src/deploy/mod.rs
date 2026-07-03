@@ -26,7 +26,7 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
     if args.profile == "local" {
         bail!(
             "profile 'local' is not deployable: it uses ./.cell paths for run/serve.\n\
-             Deploy a profile backed by a shared object store + metadata-DB catalog (e.g. -p prod)."
+             Deploy a profile backed by a shared object store (e.g. -p prod)."
         );
     }
 
@@ -52,6 +52,40 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
         profile: &args.profile,
     })
     .with_context(|| format!("deploy pre-flight failed (profile '{}')", args.profile))?;
+
+    // ADR 0004 §3: the single-writer guard is the store's conditional PUT.
+    // The host-side probe is best-effort: the deploy host may legitimately be
+    // unable to reach storage that pods can (in-cluster MinIO, private
+    // endpoints), so unreachability DEFERS to the authoritative in-pod probe
+    // (`engine::run` runs it first thing; the init Job surfaces a failure
+    // with the build pod's logs). Only a store that *answers* and proves
+    // non-enforcement fails the deploy here. Skipped on --dry-run.
+    if !args.dry_run {
+        let probe = crate::store::Store::for_storage(
+            &loaded.bindings.storage,
+            loaded.bindings.s3.as_ref(),
+        )
+        .and_then(|store| store.probe_conditional_put());
+        match probe {
+            Ok(crate::store::ProbeOutcome::Enforced) => {
+                tracing::info!("conditional-PUT capability probe passed");
+            }
+            Ok(crate::store::ProbeOutcome::NotEnforced) => {
+                bail!(
+                    "deploy pre-flight failed (profile '{}'): {}",
+                    args.profile,
+                    crate::store::NOT_ENFORCED_MSG
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "storage not probeable from the deploy host; the conditional-PUT probe \
+                     runs in-cluster during the init build instead"
+                );
+            }
+        }
+    }
 
     // Gather deliverable content (pure I/O; profile excluded — it's secret-grade).
     let cell_yaml_rel = args

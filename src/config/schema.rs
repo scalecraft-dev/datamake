@@ -122,9 +122,13 @@ pub enum Source {
 }
 
 /// The location of an upstream cell, supplied per environment by a profile.
+/// Mode by presence (ADR 0004 §11): `catalog` present ⇒ attach the upstream's
+/// catalog directly (local dev, self-managed); absent ⇒ published mode — the
+/// upstream's catalog artifacts live under `<storage>/catalog/`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CellLocation {
-    pub catalog: String,
+    #[serde(default)]
+    pub catalog: Option<String>,
     pub storage: String,
 }
 
@@ -133,7 +137,13 @@ pub struct CellLocation {
 /// runs everywhere; only the profile differs. Values may use `${VAR}` for secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bindings {
-    pub catalog: String,
+    /// Mode by presence (ADR 0004 §11). Present ⇒ direct attach: a local
+    /// `.ducklake` file path or a self-managed `sqlite:`/`postgres:` DSN —
+    /// today's behavior, kept for local dev. Absent ⇒ **published-artifact
+    /// mode**: the catalog derives from `storage` (`<storage>/catalog/`),
+    /// which must be an object store. Deployed profiles omit this field.
+    #[serde(default)]
+    pub catalog: Option<String>,
     pub storage: String,
     /// Optional S3 connection. Required only when `storage` or a source is `s3://`
     /// and the AWS default credential chain is not sufficient.
@@ -408,10 +418,10 @@ cells:
     storage: /lake/other/data
 "#;
         let b: Bindings = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(b.catalog, "./.cell/catalog.ducklake");
+        assert_eq!(b.catalog.as_deref(), Some("./.cell/catalog.ducklake"));
         assert_eq!(b.storage, "./.cell/data");
         assert!(b.s3.is_none());
         let loc = b.cells.get("other").unwrap();
-        assert_eq!(loc.catalog, "/lake/other.ducklake");
+        assert_eq!(loc.catalog.as_deref(), Some("/lake/other.ducklake"));
     }
 }

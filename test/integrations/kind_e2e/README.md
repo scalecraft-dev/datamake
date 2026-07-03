@@ -3,7 +3,10 @@
 Deploys the `orders` cell to a real, local `kind` cluster and validates it end
 to end -- the render/apply/pre-flight unit tests in `src/deploy/targets/kubernetes/`
 prove the manifests are *correct*; this proves they actually *work* against a
-real API server, a real Postgres catalog, and a real S3-compatible store.
+real API server and a real S3-compatible store (MinIO). Under ADR 0004 the
+object store is the deployed cell's ONLY external dependency -- there is no
+Postgres in this harness anymore; the catalog is a published artifact in the
+bucket.
 
 **This is LOCAL-ONLY. It is never run in CI** (nothing under `.github/workflows/`
 touches it). It shells out to `docker`/`kind`/`kubectl`, builds a full release
@@ -34,7 +37,7 @@ time, drive individual phases directly:
 ./test/integrations/kind_e2e/run.sh preflight   # tool + Docker daemon check
 ./test/integrations/kind_e2e/run.sh up          # kind cluster + namespace
 ./test/integrations/kind_e2e/run.sh build       # docker build + kind load + host cargo build
-./test/integrations/kind_e2e/run.sh infra       # Postgres + MinIO + bucket
+./test/integrations/kind_e2e/run.sh infra       # MinIO + bucket
 ./test/integrations/kind_e2e/run.sh secrets     # profile Secret
 ./test/integrations/kind_e2e/run.sh deploy      # datamk deploy (host binary -> kind apiserver)
 ./test/integrations/kind_e2e/run.sh validate    # the assertions
@@ -60,8 +63,8 @@ This exercises the full ADR 0002 acceptance path against a real cluster:
    keys, restored paths via `items[].path`).
 3. **Profile secret wiring** (ADR 0002 §5): the profile Secret
    (`orders-e2e`), mounted at `/cell/profiles`, really carries the catalog DSN
-   and S3 creds the container needs to attach DuckLake against Postgres +
-   MinIO.
+   and S3 creds the container needs to publish and fetch catalog artifacts
+   against MinIO (ADR 0004).
 4. **Deploy-time init build**: `datamk deploy` renders + applies, in order,
    ConfigMap -> **init Job (`<cell>-init-<hash>`, runs `datamk run`, applied
    and waited-to-completion)** -> Service -> Deployment -> CronJob
@@ -82,26 +85,27 @@ This exercises the full ADR 0002 acceptance path against a real cluster:
      --from=cronjob/orders` bootstrap step before the init Job existed; see
      "bugs hit" below for the crash-loop this closed.)
    - **Steady state (no restart)**: `orders_daily` is `contract: supported`,
-     pinned forever to `snapshot_id: 1`, so a *second* Builder commit can't
-     move what's served -- that's the point of pinning. What it proves
-     instead is the literal ADR §9 claim: once the Server has attached
-     successfully, a later Builder commit through the shared Postgres
-     catalog must not require restarting it. The harness runs the Builder a
-     second time (via `kubectl create job --from=cronjob/orders`, or the
-     CronJob itself) and asserts the Server pod's name and container
-     `restartCount` are unchanged, and the export still serves correctly.
+     pinned forever to `snapshot_id: 1`, so a *second* execution can't move
+     what's served -- that's the point of pinning. What it proves instead is
+     the ADR 0004 §6 claim: a second Builder run publishes execution 2 to
+     the bucket, and the ALREADY-RUNNING Server picks it up through its
+     LATEST poll (fetch-and-swap). The harness watches `/` until the
+     reported `execution` advances 1 -> 2, then asserts the Server pod's
+     name and container `restartCount` are unchanged and the export still
+     serves correctly. Executions are not versions: pods restart only on
+     version deploys.
 
 ## Layout
 
 - `run.sh` -- the harness. All the complexity lives here; the Makefile targets
   are a thin dispatch to `run.sh <phase>`.
-- `manifests/postgres.yaml`, `manifests/minio.yaml` -- the catalog + object
-  store this cell's `e2e` profile points at. Applied with `-n <namespace>` by
+- `manifests/minio.yaml` -- the object store this cell's `e2e` profile points
+  at (its catalog is a published artifact inside the bucket, ADR 0004). Applied with `-n <namespace>` by
   `run.sh infra` (no namespace baked into the files).
 - `cell/` -- a **self-contained** copy of `test/integrations/orders/`
   (`cell.yaml`, `sql/`, `.cell/published.json`), plus an `e2e` profile
   (`cell/profiles/e2e.yaml`) and deploy overlay (`cell/deploy/e2e.yaml`) that
-  point at this harness's in-cluster Postgres/MinIO. Kept separate from
+  point at this harness's in-cluster MinIO. Kept separate from
   `test/integrations/orders/` on purpose -- that fixture is driven by
   `cargo test` and must not grow a dependency on a `kind` cluster existing.
 
