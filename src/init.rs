@@ -80,7 +80,8 @@ access:                           # default-deny: the serving plane exposes data
 /// Other profiles (prod, staging) carry secrets and are gitignored.
 const PROFILE_LOCAL: &str = r#"# Binding profile: local. Selected by default (`datamk run`).
 # Environment-specific; values may reference ${VARS} for secrets.
-catalog: ./.cell/catalog.ducklake    # file -> sqlite: -> postgres:
+catalog: ./.cell/catalog.ducklake    # local-dev catalog file; deployed profiles OMIT
+                                     # catalog: entirely (derived from storage, ADR 0004)
 storage: ./.cell/data                # file:// -> s3:// -> gs://
 # principals: ./.cell/principals.json   # token -> roles (only when access.roles is set)
 # s3:                                # only when storage/sources are s3://
@@ -91,14 +92,15 @@ storage: ./.cell/data                # file:// -> s3:// -> gs://
 #   # secret: ${AWS_SECRET_ACCESS_KEY}
 "#;
 
-/// A deployable `prod` profile (gitignored). Defaults to a metadata-DB catalog +
-/// shared object store, the shape `datamk deploy` requires — fill in real values.
+/// A deployable `prod` profile (gitignored). Storage only — a deployed cell's
+/// sole external dependency (ADR 0004) — fill in real values.
 fn profile_prod(name: &str) -> String {
     format!(
-        r#"# Binding profile: prod. Gitignored — carries the catalog DSN, s3 creds, and
-# (when access.roles is set) the principals path. A DEPLOYABLE profile: a
-# metadata-DB catalog + a shared object store, which `datamk deploy` requires.
-catalog: ${{DATAMK_CATALOG}}                # sqlite:… (single replica) or postgres:… (multi-replica)
+        r#"# Binding profile: prod. Gitignored — carries s3 creds and (when access.roles
+# is set) the principals path. A DEPLOYABLE profile: a shared object store and
+# NO catalog: — a deployed cell derives its catalog from storage and publishes
+# an immutable catalog artifact per execution (ADR 0004). catalog: is
+# local-dev only; deploy pre-flight rejects it here.
 storage: s3://your-bucket/cells/{name}      # shared object store, not ./.cell
 # principals: /etc/datamk/principals.json   # token -> roles; set when access.roles is used (secret mount)
 s3:
@@ -128,9 +130,11 @@ target: kubernetes              # the orchestrator (only `kubernetes` implemente
 # Target-specific topology is defined by the target's ADR — see ADR 0002 for the
 # Kubernetes schema. Sketch:
 #   namespace: data
-#   schedule: "0 * * * *"       # Builder cron (datamk run)
+#   schedule: "0 * * * *"       # Builder cron — each run publishes an execution (ADR 0004)
+#   retention_days: 30          # compaction window; also the rollback horizon (ADR 0004 §10)
 #   serve:
-#     replicas: 2               # >1 requires a `postgres:` catalog
+#     replicas: 2               # each replica holds its own catalog copy (ADR 0004)
+#     poll_interval: 15         # seconds between LATEST checks = staleness bound
 #   image: ghcr.io/scalecraft/datamk   # tag defaults to the running datamk version
 "#;
 
@@ -180,7 +184,7 @@ datamk deploy  -f cell.yaml -p prod  # run the Builder + Server on an orchestrat
 ```
 
 - `cell.yaml` — the contract: sources, transforms, interface, access. No environment.
-- `profiles/<name>.yaml` — environment bindings (catalog/storage/s3/principals). Pick with `--profile`.
+- `profiles/<name>.yaml` — environment bindings (storage/s3/principals; `catalog:` is local-dev only). Pick with `--profile`.
 - `deploy/<name>.yaml` — deploy topology (target, schedule, replicas). Tracked and PR-reviewed; secret-free.
 - `sql/` — private transform logic.
 - `.cell/` — generated catalog + data + release manifest (gitignored).

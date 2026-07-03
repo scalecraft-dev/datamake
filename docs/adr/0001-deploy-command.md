@@ -4,6 +4,9 @@
 - **Date:** 2026-06-29
 - **Deciders:** Datamake team
 - **Author:** @scottypate
+- **Superseded in part by ADR 0004:** §7's metadata-DB catalog requirement and
+  §9's live-catalog freshness model are replaced by published, immutable
+  catalog artifacts (versions deploy; executions publish).
 
 ## Scope
 

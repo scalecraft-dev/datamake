@@ -19,18 +19,42 @@ const MAX_LIMIT: usize = 1000;
 const DEFAULT_LIMIT: usize = 100;
 
 struct AppState {
-    conn: Mutex<duckdb::Connection>,
+    /// The opened cell (connection + published-mode state). Behind a Mutex so
+    /// the poller can swap in a freshly fetched execution (ADR 0004 §6): the
+    /// swap is an assignment under the lock, an in-flight request finishes on
+    /// the cell it started with, and dropping the old cell reclaims its local
+    /// scratch (artifact file) — resident generations are bounded at two.
+    cell: Mutex<engine::Cell>,
     /// route key (`name@major`) -> export
     routes: HashMap<String, Export>,
     /// route key -> pinned snapshot id (from the release manifest)
     published: BTreeMap<String, i64>,
     openapi: serde_json::Value,
-    cell: String,
+    cell_name: String,
     /// Authorization policy (default-deny).
     shareable: bool,
     allowed_roles: Vec<String>,
     /// bearer token -> roles
     principals: HashMap<String, Vec<String>>,
+    /// Currently served execution number (published mode; 0 = direct mode).
+    execution: std::sync::atomic::AtomicU64,
+    /// Poll telemetry — what makes bounded staleness visible (ADR 0004 §6).
+    freshness: Mutex<Freshness>,
+}
+
+#[derive(Default, Clone)]
+struct Freshness {
+    /// Newest execution the poller has seen `LATEST` name.
+    latest_seen: u64,
+    /// Unix seconds of the last successful `LATEST` poll.
+    last_ok_poll_unix: Option<u64>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Result of an authorization check: an error response, or pass.
@@ -90,7 +114,7 @@ pub(crate) fn parse_principals(raw: &str) -> Result<HashMap<String, Vec<String>>
 }
 
 /// Serve the declared interface as REST + OpenAPI (the Server workload).
-pub async fn run(file: &Path, profile: &str, port: u16) -> Result<()> {
+pub async fn run(file: &Path, profile: &str, port: u16, poll_interval: u64) -> Result<()> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
     let published = load_published(&cell.dir);
 
@@ -108,16 +132,40 @@ pub async fn run(file: &Path, profile: &str, port: u16) -> Result<()> {
         );
     }
 
+    // Published mode (ADR 0004 §6): keep an independent handle to the store so
+    // the poller never holds the cell lock across a network call.
+    let store = cell.published.as_ref().map(|p| p.store.clone());
+    let execution = cell
+        .published
+        .as_ref()
+        .and_then(|p| p.execution)
+        .unwrap_or(0);
+
     let state = Arc::new(AppState {
         openapi: openapi::generate(&cell.def),
-        cell: cell.def.cell.clone(),
-        conn: Mutex::new(cell.conn),
+        cell_name: cell.def.cell.clone(),
         routes,
         published,
         shareable: cell.def.access.shareable,
         allowed_roles: cell.def.access.roles.clone(),
         principals,
+        execution: std::sync::atomic::AtomicU64::new(execution),
+        freshness: Mutex::new(Freshness {
+            latest_seen: execution,
+            last_ok_poll_unix: store.as_ref().map(|_| unix_now()),
+        }),
+        cell: Mutex::new(cell),
     });
+
+    if let Some(store) = store {
+        spawn_poller(
+            state.clone(),
+            store,
+            file.to_path_buf(),
+            profile.to_string(),
+            poll_interval.max(1),
+        );
+    }
 
     let app = Router::new()
         .route("/", get(health))
@@ -133,6 +181,73 @@ pub async fn run(file: &Path, profile: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// The fetch-and-swap poller (ADR 0004 §6): re-read `LATEST` every interval;
+/// on a new execution, open a fresh cell (which downloads the artifact and
+/// attaches a private local copy) and swap it in under the lock. A plain OS
+/// thread: the store's surface is sync, and the swap is an assignment.
+///
+/// A wedged poll (store unreachable) keeps serving last-good data; the
+/// freshness telemetry on `/interface` is what stops that from being
+/// invisible.
+fn spawn_poller(
+    state: Arc<AppState>,
+    store: Arc<crate::store::Store>,
+    file: std::path::PathBuf,
+    profile: String,
+    interval_secs: u64,
+) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+
+        let latest = match store.latest() {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                tracing::warn!("LATEST pointer disappeared; keeping last-good catalog");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "polling LATEST failed; keeping last-good catalog");
+                continue;
+            }
+        };
+
+        {
+            let mut f = state.freshness.lock().expect("freshness mutex poisoned");
+            f.latest_seen = latest;
+            f.last_ok_poll_unix = Some(unix_now());
+        }
+
+        let served = state.execution.load(std::sync::atomic::Ordering::Relaxed);
+        if latest == served {
+            continue;
+        }
+
+        // A rollback (§9) moves LATEST backwards; advance or retreat alike,
+        // serve what the pointer names.
+        match engine::open(&file, &profile, /* read_only */ true) {
+            Ok(new_cell) => {
+                let n = new_cell
+                    .published
+                    .as_ref()
+                    .and_then(|p| p.execution)
+                    .unwrap_or(0);
+                // Swap under the lock: in-flight requests finish on the old
+                // cell first (they hold the lock for the query's duration);
+                // dropping it reclaims its scratch artifact.
+                *state.cell.lock().expect("cell mutex poisoned") = new_cell;
+                state
+                    .execution
+                    .store(n, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(execution = n, "swapped to newly published execution");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, execution = latest,
+                    "failed to open newly published execution; keeping last-good catalog");
+            }
+        }
+    });
+}
+
 fn load_published(dir: &Path) -> BTreeMap<String, i64> {
     let path = dir.join(".cell").join("published.json");
     std::fs::read_to_string(path)
@@ -142,8 +257,16 @@ fn load_published(dir: &Path) -> BTreeMap<String, i64> {
         .unwrap_or_default()
 }
 
+/// Pre-authorize liveness route (`/`). Carries the served execution number —
+/// a low-sensitivity monotonic counter that lets a smoke test confirm a swap
+/// happened (ADR 0004 §6). Full freshness detail stays behind auth.
 async fn health(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "cell": s.cell, "status": "ok" }))
+    let mut body = serde_json::json!({ "cell": s.cell_name, "status": "ok" });
+    let execution = s.execution.load(std::sync::atomic::Ordering::Relaxed);
+    if execution > 0 {
+        body["execution"] = execution.into();
+    }
+    Json(body)
 }
 
 async fn interface(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -152,7 +275,22 @@ async fn interface(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     }
     let mut exports: Vec<_> = s.routes.keys().cloned().collect();
     exports.sort();
-    Json(serde_json::json!({ "cell": s.cell, "exports": exports })).into_response()
+    let mut body = serde_json::json!({ "cell": s.cell_name, "exports": exports });
+    let execution = s.execution.load(std::sync::atomic::Ordering::Relaxed);
+    if execution > 0 {
+        let f = s
+            .freshness
+            .lock()
+            .expect("freshness mutex poisoned")
+            .clone();
+        body["freshness"] = serde_json::json!({
+            "serving_execution": execution,
+            "latest_seen": f.latest_seen,
+            "last_successful_poll_age_seconds":
+                f.last_ok_poll_unix.map(|t| unix_now().saturating_sub(t)),
+        });
+    }
+    Json(body).into_response()
 }
 
 async fn openapi_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -187,8 +325,10 @@ async fn serve_export(
 
     let s2 = s.clone();
     let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-        let conn = s2.conn.lock().expect("connection mutex poisoned");
-        run_json_query(&conn, &sql)
+        // Holding the cell lock for the query's duration is what guarantees a
+        // request never spans two catalogs across a poller swap (ADR 0004 §6).
+        let cell = s2.cell.lock().expect("cell mutex poisoned");
+        run_json_query(&cell.conn, &sql)
     })
     .await;
 

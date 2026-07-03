@@ -4,8 +4,10 @@ mod deploy;
 mod engine;
 mod init;
 mod manifest;
+mod ops;
 mod release;
 mod serve;
+mod store;
 mod verify;
 
 use anyhow::Result;
@@ -22,11 +24,24 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Init(a) => init::run(a),
-        Command::Run(a) => engine::run(&a.file, &a.profile),
+        Command::Run(a) => {
+            // Hidden test hook: DATAMK_RETENTION_SECONDS lets harnesses
+            // exercise compaction without waiting out day-granularity windows.
+            let retention_secs = std::env::var("DATAMK_RETENTION_SECONDS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .or(match a.retention_days {
+                    0 => None,
+                    d => Some(d * 86_400),
+                });
+            engine::run(&a.file, &a.profile, retention_secs)
+        }
         Command::Verify(a) => verify::run(&a.file, &a.profile),
         Command::Release(a) => release::run(&a.file, &a.profile),
         Command::Deploy(a) => deploy::run(&a).await,
-        Command::Serve(a) => serve::run(&a.file, &a.profile, a.port).await,
+        Command::Serve(a) => serve::run(&a.file, &a.profile, a.port, a.poll_interval).await,
+        Command::Status(a) => ops::status(&a.file, &a.profile),
+        Command::Rollback(a) => ops::rollback(&a.file, &a.profile, a.execution),
         Command::Publish(a) => {
             eprintln!("publish has been renamed to `release` (it pins the supported snapshot).");
             eprintln!("Run `datamk release` instead.");

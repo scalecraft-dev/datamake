@@ -47,9 +47,10 @@ mod tests {
     fn load_resolves_a_cell_without_a_db() {
         let loaded = load(Path::new("test/integrations/orders/cell.yaml"), "local").unwrap();
         assert_eq!(loaded.def.cell, "orders");
-        assert_eq!(loaded.bindings.catalog, "./.cell/catalog.ducklake");
-        // local profile -> file-backed catalog, local storage.
-        assert!(!is_metadata_db_catalog(&loaded.bindings.catalog));
+        // local profile -> direct-attach mode: file-backed catalog, local storage.
+        let catalog = loaded.bindings.catalog.as_deref().unwrap();
+        assert_eq!(catalog, "./.cell/catalog.ducklake");
+        assert!(!is_metadata_db_catalog(catalog));
         assert!(!is_remote(&loaded.bindings.storage));
     }
 
@@ -57,7 +58,8 @@ mod tests {
     fn load_resolves_a_deployable_prod_profile_offline() {
         // prod.yaml uses ${VAR:-default}, so it resolves with no env set.
         let loaded = load(Path::new("test/integrations/orders/cell.yaml"), "prod").unwrap();
-        assert!(is_metadata_db_catalog(&loaded.bindings.catalog));
+        // Deployable shape (ADR 0004): NO catalog — published-artifact mode.
+        assert!(loaded.bindings.catalog.is_none());
         assert!(is_remote(&loaded.bindings.storage));
     }
 }

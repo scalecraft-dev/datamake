@@ -36,6 +36,11 @@ thiserror = "1"
 semver = "1"
 duckdb = { version = "1", features = ["bundled"] }    # compiles DuckDB; heavy first build
 sha2 = "0.10"                                         # content hash of the deploy artifact bundle
+# Native object-store client (ADR 0004 §3): plain GET/PUT/LIST + conditional PUT
+# for published catalog artifacts. DuckDB's httpfs is the *query* engine's S3
+# path; this is the publisher's. PutMode::Create works across S3/GCS/local.
+object_store = { version = "0.12", features = ["aws", "gcp"] }
+futures = "0.3"                                       # drive object_store's list streams
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.7"
 tracing = "0.1"

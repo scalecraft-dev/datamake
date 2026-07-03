@@ -1,12 +1,12 @@
-# e2e profile: shared Postgres catalog + in-cluster MinIO storage, so this cell
-# is deployable (ADR 0001 §7 / ADR 0002 §6) against the local `kind` cluster the
-# harness stands up. Committed here (not gitignored) because it carries no real
+# e2e profile: in-cluster MinIO storage and NO `catalog:` — published-artifact
+# mode (ADR 0004): the catalog derives from `storage`, executions publish
+# immutable artifacts, and the object store is the cell's ONLY external
+# dependency. Committed here (not gitignored) because it carries no real
 # secrets — MinIO's dev-mode creds default to `minioadmin`/`minioadmin` and are
 # only ever reachable from inside the `datamk-e2e` namespace.
 #
 # `orders` is anonymous (no `access.roles`), so there's no `principals:` here —
 # see cell.yaml.
-catalog: postgres://datamk:datamk@postgres.datamk-e2e.svc.cluster.local:5432/orders
 storage: s3://datamk-e2e/cells/orders
 s3:
   region: us-east-1

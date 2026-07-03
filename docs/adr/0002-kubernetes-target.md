@@ -7,6 +7,9 @@
 - **Depends on:** ADR 0001 — `datamk deploy` (defines the command, the
   `DeployTarget` trait, the deploy overlay, base images, and the agnostic
   invariants this ADR realizes)
+- **Superseded in part by ADR 0004:** the Postgres-catalog pre-flight and the
+  live-catalog freshness validation are replaced by the published-catalog
+  serving model (fetch-and-swap serve, publish-per-execution Builder).
 
 ## Context
 

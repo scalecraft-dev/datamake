@@ -59,7 +59,7 @@ Phases (each re-runnable on its own):
   preflight   Check required tools + a live Docker daemon.
   up          Create the kind cluster + namespace.
   build       Build the datamk:e2e image, load it into kind, build the host binary.
-  infra       Apply Postgres + MinIO, wait for readiness, create the S3 bucket.
+  infra       Apply MinIO, wait for readiness, create the S3 bucket.
   secrets     Create/refresh the profile Secret ($PROFILE_SECRET) in-cluster.
   deploy      Run the HOST datamk against the kind cluster (datamk deploy).
   validate    Assert the deployed cell actually works (see README.md).
@@ -143,10 +143,8 @@ wait_rollout() {
 }
 
 phase_infra() {
-  log "infra: applying Postgres + MinIO"
-  k apply -f "$HERE/manifests/postgres.yaml"
+  log "infra: applying MinIO (ADR 0004: the object store is the cell's ONLY external dependency)"
   k apply -f "$HERE/manifests/minio.yaml"
-  wait_rollout deployment/postgres
   wait_rollout deployment/minio
 
   log "infra: creating S3 bucket '$BUCKET' in MinIO (idempotent mc job)"
@@ -382,10 +380,13 @@ phase_validate() {
     die "could not reach the Server through port-forward"
   }
 
-  log "validate: GET / (health)"
+  log "validate: GET / (health; published mode reports the served execution)"
   local health
   health="$(curl -fsS "$base/")" || die "GET / failed"
   echo "$health" | jq -e '.status == "ok"' >/dev/null || die "health response was not ok: $health"
+  # The init build published execution 1 and the Server fetched it (ADR 0004 §6).
+  echo "$health" | jq -e '.execution == 1' >/dev/null \
+    || die "expected the Server to report execution 1 after the init build, got: $health"
 
   log "validate: GET /openapi.json, discovering the export route"
   local openapi route
@@ -411,25 +412,37 @@ phase_validate() {
   [ "$dates" = "2" ] || die "expected 2 distinct order_date values, got $dates (body: $post_body)"
   log "row content OK (regions=$regions, distinct dates=$dates)"
 
-  # --- steady-state freshness capstone (ADR 0002 §9) ------------------------
-  # `orders_daily` is `contract: supported`, pinned forever to `snapshot_id: 1`
-  # (the committed .cell/published.json) -- so a *second* Builder commit can't
-  # move what's served (that's the whole point of pinning). What it CAN prove
-  # is the actual ADR §9 claim: once the Server is up and has attached once,
-  # a subsequent Builder commit through the shared Postgres catalog must NOT
-  # require restarting it. Run the Builder again and assert nothing changes
-  # about the Server pod.
-  log "validate: freshness capstone -- run the Builder again, same Server pod, no restart"
+  # --- steady-state freshness capstone (ADR 0004 §6) ------------------------
+  # An execution is not a version: a second Builder run publishes execution 2
+  # to the object store, and the ALREADY-RUNNING Server must pick it up
+  # through its LATEST poll (fetch-and-swap) -- same pod, no restart, no
+  # rollout. `orders_daily` is `contract: supported`, pinned to snapshot 1, so
+  # what it *serves* must not move (that's the point of pinning); what must
+  # move is the reported execution number on `/`.
+  log "validate: freshness capstone -- publish execution 2, same Server pod picks it up, no restart"
   run_builder_once >/dev/null
-  log "second builder run completed"
+  log "second builder run completed (execution 2 published)"
+
+  # The overlay sets serve.poll_interval: 5 -- the swap should land within a
+  # couple of poll cycles.
+  local waited=0 served_exec=""
+  while [ "$waited" -lt 60 ]; do
+    served_exec="$(curl -fsS "$base/" 2>/dev/null | jq -r '.execution // empty' || true)"
+    [ "$served_exec" = "2" ] && break
+    sleep 3
+    waited=$((waited + 3))
+  done
+  [ "$served_exec" = "2" ] \
+    || die "Server never advanced to execution 2 via its LATEST poll (still: '${served_exec:-none}')"
+  log "Server advanced to execution 2 via fetch-and-swap (no restart required)"
 
   local pod_after restarts_after
   pod_after="$(server_pod)"
   restarts_after="$(server_restarts "$pod_after")"
   [ "$pod_after" = "$pod_before" ] \
-    || die "Server pod changed ($pod_before -> $pod_after) across a routine Builder commit -- ADR 0002 §9 requires it NOT restart"
+    || die "Server pod changed ($pod_before -> $pod_after) across a routine execution -- ADR 0004 requires it NOT restart"
   [ "$restarts_after" = "$restarts_before" ] \
-    || die "Server pod restartCount changed ($restarts_before -> $restarts_after) across a routine Builder commit"
+    || die "Server pod restartCount changed ($restarts_before -> $restarts_after) across a routine execution"
 
   local reroute_status reroute_body reroute_rows
   reroute_status="$(curl -s -o /tmp/datamk-e2e-reroute.json -w '%{http_code}' "$base$route")"
@@ -454,12 +467,14 @@ phase_validate() {
   immediate serve:    status=200 rows=4 (regions=$regions, dates=$dates), no
                        manual bootstrap Builder run required.
   server pod:         $pod_before (restartCount=$restarts_before, stable)
-  2nd builder run:    same pod ($pod_after), same restartCount ($restarts_after),
+  2nd execution:      same pod ($pod_after), same restartCount ($restarts_after),
+                       served execution advanced 1 -> 2 via the LATEST poll,
                        still status=200 rows=4 after re-querying $route
 
-  The already-running Server picked up a second Builder commit through the
-  shared Postgres catalog WITHOUT a restart -- ADR 0002 §9 / Consequences
-  acceptance criterion, verified against a real cluster.
+  The already-running Server picked up a second published execution from the
+  object store via fetch-and-swap, WITHOUT a restart and WITHOUT any shared
+  database -- the ADR 0004 acceptance criterion, verified against a real
+  cluster. The cell's only external dependency is the MinIO bucket.
 
   Deploy's init Job (src/deploy/targets/kubernetes/apply.rs::apply_and_wait_init)
   closes the READ_ONLY bootstrap gap this harness previously worked around by

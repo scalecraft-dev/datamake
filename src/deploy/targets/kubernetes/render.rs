@@ -321,13 +321,7 @@ fn render_init_job(input: &RenderInput) -> Job {
         name: "init".to_string(),
         image: Some(input.k8s.image_ref()),
         command: Some(vec!["datamk".to_string()]),
-        args: Some(vec![
-            "run".to_string(),
-            "--file".to_string(),
-            cell_yaml_path(),
-            "--profile".to_string(),
-            input.profile.to_string(),
-        ]),
+        args: Some(builder_args(input)),
         volume_mounts: Some(volume_mounts(input)),
         ..Default::default()
     };
@@ -447,10 +441,21 @@ fn principals_volume(input: &RenderInput) -> Volume {
     }
 }
 
-/// `cell` + `profile` always; `principals` only when `access.roles` is set
-/// (ADR 0002 §5) — an open cell has no token->roles secret to mount.
+/// `cell` + `profile` + `scratch` always; `principals` only when
+/// `access.roles` is set (ADR 0002 §5) — an open cell has no token->roles
+/// secret to mount. `scratch` is the emptyDir behind `/tmp`, where downloaded
+/// catalog artifacts land (ADR 0004 §6) — explicit so the pods stay correct
+/// under a future `readOnlyRootFilesystem` hardening.
 fn volumes(input: &RenderInput) -> Vec<Volume> {
-    let mut v = vec![cell_volume(input), profile_volume(input)];
+    let mut v = vec![
+        cell_volume(input),
+        profile_volume(input),
+        Volume {
+            name: "scratch".to_string(),
+            empty_dir: Some(Default::default()),
+            ..Default::default()
+        },
+    ];
     if input.has_roles {
         v.push(principals_volume(input));
     }
@@ -469,6 +474,11 @@ fn volume_mounts(input: &RenderInput) -> Vec<VolumeMount> {
             name: "profile".to_string(),
             mount_path: PROFILE_MOUNT.to_string(),
             read_only: Some(true),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "scratch".to_string(),
+            mount_path: "/tmp".to_string(),
             ..Default::default()
         },
     ];
@@ -493,6 +503,20 @@ fn image_pull_secrets(input: &RenderInput) -> Option<Vec<LocalObjectReference>> 
 
 fn cell_yaml_path() -> String {
     format!("{CELL_MOUNT}/cell.yaml")
+}
+
+/// `datamk run` args, shared by the init Job and the CronJob builder so their
+/// compaction behavior (ADR 0004 §10) can't drift apart.
+fn builder_args(input: &RenderInput) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--file".to_string(),
+        cell_yaml_path(),
+        "--profile".to_string(),
+        input.profile.to_string(),
+        "--retention-days".to_string(),
+        input.k8s.retention_days().to_string(),
+    ]
 }
 
 fn http_probe(port: u16) -> Probe {
@@ -535,6 +559,8 @@ fn render_deployment(input: &RenderInput) -> Deployment {
             input.profile.to_string(),
             "--port".to_string(),
             input.k8s.port().to_string(),
+            "--poll-interval".to_string(),
+            input.k8s.poll_interval().to_string(),
         ]),
         ports: Some(vec![ContainerPort {
             container_port: input.k8s.port().into(),
@@ -590,13 +616,7 @@ fn render_cronjob(input: &RenderInput) -> Option<CronJob> {
         name: "builder".to_string(),
         image: Some(input.k8s.image_ref()),
         command: Some(vec!["datamk".to_string()]),
-        args: Some(vec![
-            "run".to_string(),
-            "--file".to_string(),
-            cell_yaml_path(),
-            "--profile".to_string(),
-            input.profile.to_string(),
-        ]),
+        args: Some(builder_args(input)),
         volume_mounts: Some(volume_mounts(input)),
         ..Default::default()
     };
@@ -611,6 +631,9 @@ fn render_cronjob(input: &RenderInput) -> Option<CronJob> {
         spec: Some(CronJobSpec {
             schedule,
             concurrency_policy: Some("Forbid".to_string()),
+            // Without a deadline, 100 missed starts (long builds under Forbid)
+            // make the controller stop scheduling permanently (ADR 0004 §5).
+            starting_deadline_seconds: Some(300),
             job_template: JobTemplateSpec {
                 metadata: None,
                 spec: Some(JobSpec {
@@ -904,6 +927,8 @@ mod tests {
                 "prod".to_string(),
                 "--port".to_string(),
                 "8080".to_string(),
+                "--poll-interval".to_string(),
+                "15".to_string(),
             ]
         );
     }
@@ -934,6 +959,8 @@ mod tests {
                 "/cell/cell.yaml".to_string(),
                 "--profile".to_string(),
                 "prod".to_string(),
+                "--retention-days".to_string(),
+                "30".to_string(),
             ]
         );
     }
@@ -963,6 +990,8 @@ mod tests {
                 "/cell/cell.yaml".to_string(),
                 "--profile".to_string(),
                 "prod".to_string(),
+                "--retention-days".to_string(),
+                "30".to_string(),
             ]
         );
     }

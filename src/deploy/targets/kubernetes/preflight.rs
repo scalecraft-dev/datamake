@@ -31,7 +31,6 @@ pub(crate) async fn check(
     k8s: &KubernetesConfig,
     has_roles: bool,
 ) -> Result<Option<String>> {
-    check_replica_catalog(ctx.bindings, k8s)?;
     check_principals_mount_path(ctx.bindings, has_roles)?;
 
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
@@ -67,27 +66,9 @@ pub(crate) async fn check(
 
 // --- pure checks (no cluster) -----------------------------------------------
 
-/// A Deployment with `serve.replicas > 1` spreads the Server across multiple
-/// pods (and, in general, multiple nodes); only a real metadata-DB server
-/// (Postgres) is safe to attach concurrently from separate processes on
-/// separate nodes. A SQLite-file catalog is a single local file — never
-/// enforced until deploy actually asks for more than one replica, hence this
-/// lives in the Kubernetes pre-flight rather than the agnostic one (ADR 0001
-/// §7's consequence, realized here).
-fn check_replica_catalog(bindings: &ResolvedBindings, k8s: &KubernetesConfig) -> Result<()> {
-    let replicas = k8s.replicas();
-    if replicas > 1 && !bindings.catalog.starts_with("postgres") {
-        bail!(
-            "kubernetes overlay requests {replicas} replicas, but the profile's catalog \
-             `{catalog}` isn't Postgres: a SQLite file isn't reliable shared across multiple \
-             pods/nodes.\n\
-             Either set `serve.replicas: 1` in the deploy overlay, or point the profile's \
-             `catalog:` at `postgres://…`.",
-            catalog = bindings.catalog,
-        );
-    }
-    Ok(())
-}
+// NOTE: the former `check_replica_catalog` (replicas > 1 ⇒ Postgres) is gone —
+// under ADR 0004 every replica holds its own private local catalog copy, so
+// replica count no longer constrains the catalog at all.
 
 /// When `access.roles` is set, the profile's `principals:` must equal the path
 /// the principals Secret is actually mounted at in-cluster (ADR 0002 §5) — the
@@ -184,33 +165,6 @@ mod tests {
 
     fn orders(profile: &str) -> crate::config::LoadedCell {
         crate::config::load(Path::new("test/integrations/orders/cell.yaml"), profile).unwrap()
-    }
-
-    #[test]
-    fn multiple_replicas_with_a_non_postgres_catalog_is_refused() {
-        // profiles/local.yaml points `catalog:` at a DuckDB-file `.ducklake`.
-        let l = orders("local");
-        let k8s: KubernetesConfig = serde_yaml::from_str("serve:\n  replicas: 3\n").unwrap();
-        let err = check_replica_catalog(&l.bindings, &k8s)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("isn't Postgres"), "got: {err}");
-        assert!(err.contains("3 replicas"), "got: {err}");
-    }
-
-    #[test]
-    fn multiple_replicas_with_a_postgres_catalog_passes() {
-        let l = orders("prod"); // profiles/prod.yaml resolves to postgres://... by default
-        let k8s: KubernetesConfig = serde_yaml::from_str("serve:\n  replicas: 3\n").unwrap();
-        check_replica_catalog(&l.bindings, &k8s).unwrap();
-    }
-
-    #[test]
-    fn a_single_replica_never_checks_the_catalog() {
-        // Default replicas (1) never trips this, whatever the catalog is.
-        let l = orders("local");
-        let k8s = KubernetesConfig::default();
-        check_replica_catalog(&l.bindings, &k8s).unwrap();
     }
 
     #[test]
