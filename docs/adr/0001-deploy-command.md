@@ -136,7 +136,7 @@ feature — ADR 0002).
 
 CI builds and publishes freely available, versioned base images (the `datamk`
 binary + runtime, cell-agnostic) to a public registry, e.g.
-`ghcr.io/scalecraft-dev/datamk:<version>`. Users do **not** build per-cell images;
+`ghcr.io/scalecraft-dev/datamk:vX.Y.Z`. Users do **not** build per-cell images;
 the cell's content is delivered to the base image at deploy time. The image tag
 defaults to the running binary's version, so a given `datamk` deploys the
 matching base image. This image-supply story is shared by every container-based

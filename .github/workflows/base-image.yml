@@ -1,11 +1,16 @@
 name: Base image
 
 # ADR 0001 §5: build and publish the freely available, versioned, cell-agnostic
-# base image on tagged releases. The tag mirrors the release version, so a given
-# `datamk` deploys the matching `ghcr.io/scalecraft-dev/datamk:<version>`.
+# base image on tagged releases. The image tag mirrors the git tag verbatim
+# (v-prefixed), so a given `datamk` deploys the matching
+# `ghcr.io/scalecraft-dev/datamk:vX.Y.Z` (see KubernetesConfig::image_ref).
 on:
   push:
     tags: ["v*"]
+  # Manual run: builds and refreshes the :buildcache layer WITHOUT publishing a
+  # version — use it to pre-warm the dependency cache so the next `make release`
+  # is minutes, not a from-scratch DuckDB compile.
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -18,21 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Derive version from tag
-        id: version
-        # v1.2.3 -> 1.2.3
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
       - name: Verify tag matches Cargo.toml
-        # The binary in this image reports CARGO_PKG_VERSION, and the
-        # Kubernetes target's default image is
-        # ghcr.io/scalecraft-dev/datamk:<that version> (ADR 0001 §5) — a tag that
-        # doesn't match the stamped Cargo.toml would publish an image whose
-        # own binary points deploys at a different image. `make release`
+        if: startsWith(github.ref, 'refs/tags/')
+        # The binary in this image reports CARGO_PKG_VERSION (bare semver), and
+        # the Kubernetes target's default image is
+        # ghcr.io/scalecraft-dev/datamk:v<that version> (ADR 0001 §5) — a tag
+        # that doesn't match the stamped Cargo.toml would publish an image
+        # whose own binary points deploys at a different image. `make release`
         # stamps this correctly; this guards hand-pushed tags.
         run: |
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          if [ "$cargo_version" != "${{ steps.version.outputs.version }}" ]; then
+          if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}." >&2
             echo "Cut releases with: make release VERSION=${GITHUB_REF_NAME}" >&2
             exit 1
@@ -53,9 +54,17 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          # Publish only on tag runs; a workflow_dispatch run still builds and
+          # refreshes :buildcache (cache-to below) without releasing anything.
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          # The image tag IS the git tag (v-prefixed). On a workflow_dispatch
+          # run ref_name is a branch name; harmless — nothing is pushed.
           tags: |
-            ghcr.io/scalecraft-dev/datamk:${{ steps.version.outputs.version }}
+            ghcr.io/scalecraft-dev/datamk:${{ github.ref_name }}
             ghcr.io/scalecraft-dev/datamk:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Registry-backed BuildKit cache: the cargo-chef dependency layer
+          # (the bundled DuckDB build) persists here across releases. The gha
+          # cache backend can't hold it — this layer alone is multiple GB and
+          # would thrash the 10GB Actions pool CI's rust-cache also lives in.
+          cache-from: type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache
+          cache-to: type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache,mode=max

@@ -2,7 +2,7 @@
 # Cut a release: stamp Cargo.toml to the given version, run the full local
 # gate, commit, tag, and push. CI's base-image workflow
 # (.github/workflows/base-image.yml, `on: push: tags: v*`) then builds and
-# publishes ghcr.io/scalecraft-dev/datamk:<version> (+ :latest) from the tag.
+# publishes ghcr.io/scalecraft-dev/datamk:vX.Y.Z (+ :latest) from the tag.
 #
 # The version stamp is load-bearing, not cosmetic: the Kubernetes target's
 # default image is ghcr.io/scalecraft-dev/datamk:<CARGO_PKG_VERSION>
@@ -57,7 +57,7 @@ git push origin main "$VERSION"
 cat <<EOF
 
 Release $VERSION pushed. CI is now building and publishing:
-  ghcr.io/scalecraft-dev/datamk:$SEMVER
+  ghcr.io/scalecraft-dev/datamk:$VERSION
   ghcr.io/scalecraft-dev/datamk:latest
 Watch it: gh run watch --repo scalecraft-dev/datamk \$(gh run list --repo scalecraft-dev/datamk --workflow base-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')
 EOF

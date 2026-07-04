@@ -3,6 +3,12 @@
 # users do NOT build a per-cell image. The image tag is meant to track the binary
 # version, so a given `datamk` deploys the matching base image.
 #
+# Build layout: cargo-chef splits dependency compilation (including the bundled
+# DuckDB C++ build, by far the dominant cost) into a layer keyed on the recipe
+# (≈ Cargo.lock), so it caches across releases — CI persists it in the GHCR
+# registry (`:buildcache`, see .github/workflows/base-image.yml) and a release
+# that doesn't change dependencies only compiles the datamk crate itself.
+#
 # NOTE: DuckDB extensions (ducklake, httpfs, json, and connector extensions such
 # as `bigquery` from the community registry — ADR 0003) are fetched at first run
 # (engine INSTALLs them), so a running container needs network egress to the
@@ -10,13 +16,28 @@
 # runtime path for egress-less environments — is a deliberate follow-up (ADR 0001
 # §5 / ADR 0003 §4, deferred); revisit when such an environment is encountered.
 
-# ---- builder ----
+# ---- chef ----
 # buildpack-deps base (via the official rust image) carries the C/C++ toolchain
 # the bundled DuckDB build needs.
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /src
+
+# ---- planner ----
+# Distills the workspace into a dependency recipe. Source edits change the
+# recipe only if they change dependency structure, keeping the cook layer warm.
+FROM chef AS planner
 COPY . .
-# Release build with default features (includes the kubernetes deploy target).
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- builder ----
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+# The expensive, cacheable layer: compiles every dependency (bundled DuckDB
+# included) with no datamk source present.
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+# Only the datamk crate compiles here on a warm cache.
 RUN cargo build --release --locked --bin datamk
 
 # ---- runtime ----
