@@ -25,7 +25,7 @@ check: fmt-check lint test
 
 # Cut a release: stamps Cargo.toml to VERSION, runs the full gate, commits,
 # tags, and pushes. CI (.github/workflows/base-image.yml) then builds and
-# publishes ghcr.io/scalecraft-dev/datamk:<version>. Usage:
+# publishes ghcr.io/scalecraft-dev/datamk:vX.Y.Z. Usage:
 #   make release VERSION=v0.1.0
 release:
 	./scripts/release.sh $(VERSION)

@@ -71,10 +71,12 @@ impl KubernetesConfig {
 
     /// The image to run. Defaults to this binary's own version — the base image
     /// (ADR 0001 §5) is cell-agnostic and versioned alongside datamk itself.
+    /// Image tags mirror the git tag (`v` prefix); CARGO_PKG_VERSION is bare
+    /// semver, so the prefix is added here.
     pub(crate) fn image_ref(&self) -> String {
         self.image.clone().unwrap_or_else(|| {
             format!(
-                "ghcr.io/scalecraft-dev/datamk:{}",
+                "ghcr.io/scalecraft-dev/datamk:v{}",
                 env!("CARGO_PKG_VERSION")
             )
         })
@@ -187,9 +189,10 @@ imagePullSecret: regcred
         assert_eq!(k8s.namespace(), "default");
         assert_eq!(k8s.port(), 8080);
         assert_eq!(k8s.replicas(), 1);
+        // Image tags mirror the git tag: v-prefixed semver.
         assert!(k8s
             .image_ref()
-            .starts_with("ghcr.io/scalecraft-dev/datamk:"));
+            .starts_with("ghcr.io/scalecraft-dev/datamk:v"));
     }
 
     #[test]
