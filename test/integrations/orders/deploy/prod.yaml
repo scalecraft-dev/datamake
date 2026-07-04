@@ -10,4 +10,4 @@ allow_anonymous: true
 # schedule: "0 * * * *"
 # serve:
 #   replicas: 1
-# image: ghcr.io/scalecraft/datamk
+# image: ghcr.io/scalecraft-dev/datamk

@@ -72,9 +72,12 @@ impl KubernetesConfig {
     /// The image to run. Defaults to this binary's own version — the base image
     /// (ADR 0001 §5) is cell-agnostic and versioned alongside datamk itself.
     pub(crate) fn image_ref(&self) -> String {
-        self.image
-            .clone()
-            .unwrap_or_else(|| format!("ghcr.io/scalecraft/datamk:{}", env!("CARGO_PKG_VERSION")))
+        self.image.clone().unwrap_or_else(|| {
+            format!(
+                "ghcr.io/scalecraft-dev/datamk:{}",
+                env!("CARGO_PKG_VERSION")
+            )
+        })
     }
 
     /// Shape-validate the overlay. Pure: no bindings, no cluster access — a typo'd
@@ -184,7 +187,9 @@ imagePullSecret: regcred
         assert_eq!(k8s.namespace(), "default");
         assert_eq!(k8s.port(), 8080);
         assert_eq!(k8s.replicas(), 1);
-        assert!(k8s.image_ref().starts_with("ghcr.io/scalecraft/datamk:"));
+        assert!(k8s
+            .image_ref()
+            .starts_with("ghcr.io/scalecraft-dev/datamk:"));
     }
 
     #[test]

@@ -2,7 +2,7 @@ name: Base image
 
 # ADR 0001 §5: build and publish the freely available, versioned, cell-agnostic
 # base image on tagged releases. The tag mirrors the release version, so a given
-# `datamk` deploys the matching `ghcr.io/scalecraft/datamk:<version>`.
+# `datamk` deploys the matching `ghcr.io/scalecraft-dev/datamk:<version>`.
 on:
   push:
     tags: ["v*"]
@@ -23,6 +23,21 @@ jobs:
         # v1.2.3 -> 1.2.3
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify tag matches Cargo.toml
+        # The binary in this image reports CARGO_PKG_VERSION, and the
+        # Kubernetes target's default image is
+        # ghcr.io/scalecraft-dev/datamk:<that version> (ADR 0001 §5) — a tag that
+        # doesn't match the stamped Cargo.toml would publish an image whose
+        # own binary points deploys at a different image. `make release`
+        # stamps this correctly; this guards hand-pushed tags.
+        run: |
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$cargo_version" != "${{ steps.version.outputs.version }}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}." >&2
+            echo "Cut releases with: make release VERSION=${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -40,7 +55,7 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ghcr.io/scalecraft/datamk:${{ steps.version.outputs.version }}
-            ghcr.io/scalecraft/datamk:latest
+            ghcr.io/scalecraft-dev/datamk:${{ steps.version.outputs.version }}
+            ghcr.io/scalecraft-dev/datamk:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

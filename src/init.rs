@@ -135,7 +135,7 @@ target: kubernetes              # the orchestrator (only `kubernetes` implemente
 #   serve:
 #     replicas: 2               # each replica holds its own catalog copy (ADR 0004)
 #     poll_interval: 15         # seconds between LATEST checks = staleness bound
-#   image: ghcr.io/scalecraft/datamk   # tag defaults to the running datamk version
+#   image: ghcr.io/scalecraft-dev/datamk   # tag defaults to the running datamk version
 "#;
 
 const STG_ORDERS_SQL: &str = r#"-- Private internal. In a real cell this reads source tables from the lake;

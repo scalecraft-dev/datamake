@@ -1,5 +1,5 @@
 # Developer convenience targets. CI runs the same checks (see .github/workflows/ci.yml).
-.PHONY: all fmt fmt-check lint test check e2e e2e-up e2e-deploy e2e-validate e2e-down
+.PHONY: all fmt fmt-check lint test check release e2e e2e-up e2e-deploy e2e-validate e2e-down
 
 # Run the full local gate: format, lint, test.
 all: fmt lint test
@@ -22,6 +22,13 @@ test:
 
 # Mirror CI exactly: fmt check + clippy + tests.
 check: fmt-check lint test
+
+# Cut a release: stamps Cargo.toml to VERSION, runs the full gate, commits,
+# tags, and pushes. CI (.github/workflows/base-image.yml) then builds and
+# publishes ghcr.io/scalecraft-dev/datamk:<version>. Usage:
+#   make release VERSION=v0.1.0
+release:
+	./scripts/release.sh $(VERSION)
 
 # ---------------------------------------------------------------------------
 # ADR 0002 (Kubernetes deploy target) end-to-end harness against a real `kind`
