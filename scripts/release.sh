@@ -16,6 +16,10 @@ set -euo pipefail
 
 die() { echo "release: $*" >&2; exit 1; }
 
+# Non-interactive shells (CI, make from an IDE) often lack the rustup PATH.
+command -v cargo >/dev/null 2>&1 || export PATH="$HOME/.cargo/bin:$PATH"
+command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH (or in ~/.cargo/bin)"
+
 VERSION="${1:-}"
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
   || die "usage: make release VERSION=vX.Y.Z (got: '${VERSION:-<empty>}')"
