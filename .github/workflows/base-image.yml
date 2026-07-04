@@ -4,22 +4,51 @@ name: Base image
 # base image on tagged releases. The image tag mirrors the git tag verbatim
 # (v-prefixed), so a given `datamk` deploys the matching
 # `ghcr.io/scalecraft-dev/datamk:vX.Y.Z` (see KubernetesConfig::image_ref).
+#
+# Multi-arch: each platform builds NATIVELY on its own runner (no QEMU — the
+# bundled DuckDB compile under emulation takes hours), pushed by digest; the
+# `merge` job stitches the digests into one manifest per tag. Each platform
+# keeps its own registry build cache, so post-seed releases are minutes.
+#
+# NOTE: `ubuntu-24.04-arm` hosted runners are free for PUBLIC repos. For a
+# private repo, either configure a paid arm64 larger runner in the org
+# settings and put its label below, or drop the arm64 matrix entry to ship
+# amd64-only.
 on:
   push:
     tags: ["v*"]
-  # Manual run: builds and refreshes the :buildcache layer WITHOUT publishing a
-  # version — use it to pre-warm the dependency cache so the next `make release`
-  # is minutes, not a from-scratch DuckDB compile.
+  # Manual run: builds and refreshes the per-arch :buildcache-* layers WITHOUT
+  # publishing a version — use it to pre-warm the dependency caches so the next
+  # `make release` is minutes, not a from-scratch DuckDB compile.
   workflow_dispatch: {}
 
 permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE: ghcr.io/scalecraft-dev/datamk
+
 jobs:
-  build-and-push:
-    name: Build and push base image
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            # amd64 reads the pre-split ":buildcache" seed once, then lives at
+            # its own suffix. Cheap to keep both after migration.
+            cache_from: |
+              type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache-amd64
+              type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache
+            cache_to: type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache-amd64,mode=max
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm # PRIVATE repo? see NOTE above
+            cache_from: type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache-arm64
+            cache_to: type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache-arm64,mode=max
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +59,8 @@ jobs:
         # ghcr.io/scalecraft-dev/datamk:v<that version> (ADR 0001 §5) — a tag
         # that doesn't match the stamped Cargo.toml would publish an image
         # whose own binary points deploys at a different image. `make release`
-        # stamps this correctly; this guards hand-pushed tags.
+        # stamps this correctly; this guards hand-pushed tags. Checked here,
+        # per-platform, so a bad tag fails before an hour of compiling.
         run: |
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
           if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
@@ -49,22 +79,65 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      - name: Build (push by digest on tag runs)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          # Publish only on tag runs; a workflow_dispatch run still builds and
-          # refreshes :buildcache (cache-to below) without releasing anything.
-          push: ${{ startsWith(github.ref, 'refs/tags/') }}
-          # The image tag IS the git tag (v-prefixed). On a workflow_dispatch
-          # run ref_name is a branch name; harmless — nothing is pushed.
-          tags: |
-            ghcr.io/scalecraft-dev/datamk:${{ github.ref_name }}
-            ghcr.io/scalecraft-dev/datamk:latest
-          # Registry-backed BuildKit cache: the cargo-chef dependency layer
-          # (the bundled DuckDB build) persists here across releases. The gha
-          # cache backend can't hold it — this layer alone is multiple GB and
-          # would thrash the 10GB Actions pool CI's rust-cache also lives in.
-          cache-from: type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache
-          cache-to: type=registry,ref=ghcr.io/scalecraft-dev/datamk:buildcache,mode=max
+          platforms: ${{ matrix.platform }}
+          # Tag runs push an untagged image by digest for the merge job; a
+          # workflow_dispatch run only builds + refreshes the build cache.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ startsWith(github.ref, 'refs/tags/') }}
+          cache-from: ${{ matrix.cache_from }}
+          cache-to: ${{ matrix.cache_to }}
+
+      - name: Export digest
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch manifest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push the manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:${GITHUB_REF_NAME}" \
+            -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "$IMAGE:${GITHUB_REF_NAME}"
