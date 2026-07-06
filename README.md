@@ -9,34 +9,19 @@ breaking the people who depend on it.
 
 ---
 
-## What's a composable data product?
+## What's a composable data product (CDP)?
 
-A *data pipeline* moves and transforms data. It's plumbing, valuable, but it
-has no edges. Where does it start? Where does it end? What does it promise? Who
-is allowed to use it? Usually those answers live in someone's head, a wiki, and
-three Slack threads.
+Why should I care about CDPs if I already have the typical 
+data stack of warehouse + dbt/sqlmesh + airflow/dagster? Great question, start here...
 
-A **composable data product** draws the edges. It bundles four things that
-normally drift apart:
-
-| | Pipeline | Composable data product (a *cell*) |
-|---|---|---|
-| **Logic** | SQL/code, somewhere | versioned transforms inside the cell |
-| **Output** | a table you hope is right | a snapshot, machine-verified against a declared shape |
-| **Contract** | tribal knowledge | an explicit `interface` — names, types, grain, version |
-| **Access** | "ask the data team" | a default-deny policy the cell enforces |
-
-Because the contract is explicit and versioned, cells **compose**: one cell can
-consume another cell's published output by name and version — the same way code
-libraries depend on each other — without reaching into its internals. You get a
-graph of data products, each with a stable public surface and private guts.
+[WTF is a Composable Data Product?](./docs/concepts/composable-data-products.md)
 
 ---
 
 ## What is a cell?
 
-A cell is a small project directory. It represents the basic unit of value.
-Developing a cell follows a traditional gitops SDLC.
+A cell is a small project directory. It represents the basic unit of function in datamk, and follows
+a gitops SDLC.
 
 ```bash
 # Create a cell called `orders`
@@ -142,7 +127,7 @@ sources:
 
 Delivery is **at-least-once** — a transform reading an incremental source
 must be replay-safe (an anti-join or `MERGE`, never `CREATE OR REPLACE`). See
-[Incremental source loading](docs/incremental.md) for the full guide,
+[Incremental source loading](docs/guides/incremental.md) for the full guide,
 `--full-refresh`/`--verify-replay`, and the edge cases.
 
 ---
@@ -174,7 +159,7 @@ datamk deploy -f cell.yaml -p prod             # apply
 
 ### Deployment Targets
 
-- **[Kubernetes deployment guide](docs/kubernetes.md)**
+- **[Kubernetes deployment guide](docs/guides/kubernetes.md)**
 
 ---
 
@@ -189,3 +174,7 @@ cargo build --release
 ```
 
 ---
+
+## Licensing
+
+This project is freely available under the Apache License 2.0. datamk is free and will always be free. There are no gated features, or paid subscription plans.
