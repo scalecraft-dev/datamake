@@ -1,4 +1,4 @@
-# datamk docs
+# Datamake docs
 
 - **[Concepts](concepts/)** — what a composable data product is and why it
   exists. Start with [Why composable data products?](concepts/composable-data-products.md)

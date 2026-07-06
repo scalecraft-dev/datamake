@@ -20,7 +20,7 @@ data stack of warehouse + dbt/sqlmesh + airflow/dagster? Great question, start h
 
 ## What is a cell?
 
-A cell is a small project directory. It represents the basic unit of function in datamk, and follows
+A cell is a small project directory. It represents the basic unit of function in Datamake, and follows
 a gitops SDLC.
 
 ```bash
@@ -177,4 +177,4 @@ cargo build --release
 
 ## Licensing
 
-This project is freely available under the Apache License 2.0. datamk is free and will always be free. There are no gated features, or paid subscription plans.
+This project is freely available under the Apache License 2.0. Datamake is free and will always be free. There are no gated features, or paid subscription plans.

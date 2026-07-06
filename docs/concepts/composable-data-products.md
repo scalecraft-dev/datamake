@@ -5,7 +5,7 @@ warehouse + dbt + Airflow, what does a CDP framework do for you?
 
 Short version: not every use case belongs in the central warehouse, but
 in most orgs it's the only paved road. Every new data product means a
-ticket, a queue, and a shared bill. datamk is the release valve. It gives you
+ticket, a queue, and a shared bill. Datamake is the release valve. It gives you
 a framework to deploy exactly what is needed for a particular data product with or without
 the massive data monolithic stack.
 
@@ -51,7 +51,9 @@ flowchart TB
 
 A composable data product draws the boundary precisely. Everything inside the
 cell is private; the only way in is through the declared, versioned interface —
-and the warehouse doesn't disappear, it just becomes one input among others:
+and the warehouse doesn't disappear, it just becomes one input among others.
+The interface is served two ways: applications hit the REST API, while other
+cells build on the same exports straight from the lake, in open formats:
 
 ```mermaid
 flowchart LR
@@ -69,25 +71,26 @@ flowchart LR
     CUST["customers cell — exports only"] --> enr
     exp -->|"REST, default-deny"| dash[Sales dashboard]
     exp -->|"REST, default-deny"| ml[ML feature job]
+    exp -->|"lake — Parquet + catalog"| down["finance cell — builds on the export"]
     classDef privateTbl fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
     classDef export fill:#bbf7d0,stroke:#16a34a,color:#14532d
     classDef input fill:#fef3c7,stroke:#b45309,color:#78350f
     classDef consumer fill:#e5e7eb,stroke:#4b5563,color:#111827
     class stg,enr privateTbl
-    class exp,CUST export
+    class exp,CUST,down export
     class WH,LAKE input
     class dash,ml consumer
     style CELL fill:transparent,stroke:#16a34a,color:#14532d
     style PRIV fill:#eff6ff,stroke:#3b82f6,stroke-dasharray:6 6,color:#1e3a8a
     style IFACE fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,color:#14532d
-    linkStyle 4,5,6 stroke:#16a34a,color:#16a34a
+    linkStyle 4,5,6,7 stroke:#16a34a,color:#16a34a
 ```
 
 Same dashboards, same jobs. The difference is that every arrow on the right is
 declared, versioned, and enforced — and every arrow on the left is a Slack
 thread waiting to happen.
 
-### Specific failre modes of the monolith
+### Specific failure modes of the monolith
 
 **It serves no particular use case explicitly.** The monolith serves the
 organization in aggregate. No table in it can tell you which use case it
@@ -114,7 +117,7 @@ The first person to build it moves fast; everyone after them pays.
 
 ## What a composable data product is
 
-A **composable data product** — datamk calls the unit a **cell** — draws the
+A **composable data product** — datamake calls the unit a **cell** — draws the
 edges. It bundles four things that normally drift apart into one versioned,
 deployable directory:
 
@@ -133,7 +136,7 @@ deployable directory:
   API.
 
 If you use dbt: yes, it has model contracts, tests, and versions. The
-difference isn't that datamk checks a contract — it's *where the contract
+difference isn't that datamake checks a contract — it's *where the contract
 lives*. dbt materializes back into the warehouse, where every table is still
 reachable and verification is a test someone can forget to run. A cell's
 contract is the **serving boundary**: non-exported tables have no route, and
@@ -156,7 +159,7 @@ You get a graph of small products — each with a stable public surface, private
 guts, and an owner — instead of one warehouse where everything depends on
 everything and nobody knows how.
 
-datamk can do this because the data lake already decoupled the pieces: data as
+Datamake can do this because the data lake already decoupled the pieces: data as
 Parquet on object storage, metadata in a SQL catalog. A cell fragments the
 **control plane, not the data** — one logical lake, many small independent
 operators, each with its own embedded engine (DuckDB) and its own catalog
@@ -164,7 +167,7 @@ binding. No cluster to stand up, no warehouse bill to justify, no ticket to
 file. `datamk init` → `datamk run` → `datamk serve`, on your laptop, in
 minutes.
 
-## What you get by using datamk
+## What you get by using Datamake
 
 - **A contract that doesn't lie** — the interface is verified against actual
   output on every build, including grain uniqueness.
