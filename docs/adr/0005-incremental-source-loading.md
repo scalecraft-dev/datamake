@@ -3,8 +3,9 @@
 - **Status:** Proposed — revised 2026-07-04 after team review (architecture,
   engineering, product, DX). §2's boundary, previously left as an open
   question, is now argued from principle and proposed for adoption; the
-  review's required guardrails are folded into §§1–2 and 4.
-- **Date:** 2026-07-04 (revised 2026-07-04)
+  review's required guardrails are folded into §§1–2 and 4. Revised
+  2026-07-05 during implementation (see §§1–2 for the two corrections).
+- **Date:** 2026-07-04 (revised 2026-07-05)
 - **Deciders:** Datamake team
 - **Author:** @scottypate
 - **Depends on:** ADR 0003 (connection sources), ADR 0004 (versions,
@@ -166,19 +167,28 @@ sources:
   error messages are part of work item 1.
 - The block is valid only on `connection` sources in this ADR. Raw and Cell
   sources are deferred (see Alternatives) — the cost problem lives in
-  warehouse scans, and `Source` stays `#[serde(untagged)]` with the variants
-  still disjoint by key.
+  warehouse scans. `Source`'s variants stay disjoint by key, but the enum
+  drops `#[serde(untagged)]` for a manual key-dispatch deserializer — the
+  hardening note below explains why untagged cannot deliver this section's
+  error-text requirement.
 
-**Schema hardening (required).** The untagged `Source` enum does not deny
+**Schema hardening (required).** An untagged `Source` enum does not deny
 unknown fields, so a typo'd key (`incremenetal:`) would deserialize cleanly
 as a plain connection source — **silently running full scans forever while
-the author believes the cell is incremental**. The `incremental:` block is
-therefore deserialized through an inner struct with
-`#[serde(deny_unknown_fields)]`, and work item 1's tests assert the *error
-text* a user sees on a malformed block (missing `cursor`, unknown key,
-unparseable `lookback`), not merely that the happy path parses. Untagged-
-enum "stability" means error-message quality here, not variant
-disambiguation.
+the author believes the cell is incremental**. Closing that with
+`deny_unknown_fields` inside `#[serde(untagged)]` does not work: untagged
+deserialization discards inner-variant errors and reports only "data did
+not match any variant", so the typo hazard and readable error text are
+unsatisfiable together under untagged. `Source` therefore deserializes
+through a manual impl that dispatches on key presence (string ⇒ raw;
+`cell` ⇒ cell; `connection` ⇒ connection; both or neither ⇒ a named
+error), with `deny_unknown_fields` helper structs per mapping variant so
+field-level errors surface verbatim — a deliberate leniency tightening:
+stray keys on cell/connection sources that previously parsed silently now
+error. Work item 1's tests assert the *error text* a user sees on a
+malformed block (missing `cursor`, unknown key, unparseable `lookback`),
+not merely that the happy path parses — error-message quality is the
+point; variant disambiguation was never the hard part.
 
 **Validation and errors.** Validation splits across two phases, and the ADR
 states the split so authors know what `verify` can and cannot catch offline:
@@ -386,42 +396,63 @@ than the one the original draft named:
   the exact shape the `init` scaffold teaches as house style for
   full-rebuild cells — silently **replaces the whole table with just the
   delta**. Data loss, not duplication, and the grain backstop cannot see it
-  (a delta is perfectly unique on grain).
+  (a delta is perfectly unique on grain). **Neither can `--verify-replay`**:
+  a destructive rebuild is idempotent — the real run already replaced the
+  table with the delta, and the replay produces the identical delta-only
+  table — so a pass-vs-pass comparison passes while history is already
+  gone. Truncation is therefore *warned*, not gated (enforcement item 2).
 
 The enforcement, all behavioral, none of it query-parsing:
 
-1. **`datamk run --verify-replay`** — the primary guard. After transforms
-   succeed, the engine re-executes the transform sequence against the
-   **identical staged delta** (the watermark has not advanced) and fails
-   the execution before publish if any output table's row count or
-   order-independent content hash changed between passes. A replay-unsafe
-   transform — duplicating or truncating — fails loudly on the author's
-   laptop instead of silently in production. Cost is one extra *local*
-   transform pass; the warehouse is not re-read (the delta is already
-   staged), which is why this is cheap enough to run by default in CI and
-   in the e2e suite. Failure message names the invariant and the fix:
+1. **`datamk run --verify-replay`** — the primary guard **for duplication**
+   (and any other non-idempotent replay effect). After transforms succeed
+   and the snapshot commits, the engine re-executes the transform sequence
+   against the **identical staged delta** inside a transaction it then
+   rolls back — DuckLake rolls back DDL and data cleanly with no residual
+   snapshot, pinned by `ducklake_rollback_restores_committed_state_and_
+   snapshots` in `src/engine/mod.rs` — and fails the execution before
+   publish if any output table's contents changed between passes (exact
+   order-independent multiset comparison, not a hash). A duplicating
+   transform — a plain `INSERT ... SELECT` — fails loudly on the author's
+   laptop instead of silently in production. Truncation it structurally
+   cannot see (idempotent, per the failure shapes above); item 2 covers it.
+   Cost is one extra *local* transform pass; the warehouse is not re-read
+   (the delta is already staged), which is why this is cheap enough to run
+   by default in CI and in the e2e suite. Attribution is per-table (the
+   engine does not parse transforms, so it cannot name the offending file);
+   the failure message names the invariant and the fix:
    ```
-   transform 02_fct_events.sql is not replay-safe: re-delivering the same
-   delta changed fct_events (12,340 -> 15,540 rows). Incremental sources
-   deliver at-least-once; use an anti-join or MERGE (see docs: incremental).
+   replay-unsafe transform: re-running the pipeline against the same staged
+   delta changed table 'fct_events' (12,340 -> 15,540 rows). Incremental
+   sources deliver at-least-once; use an anti-join or MERGE, never
+   `CREATE OR REPLACE` (see docs: incremental).
    ```
-2. **Resolve-time warning when the backstop is off**: an `incremental:`
+2. **The shrink warning** — the truncation detector. When the cell has an
+   incremental source, `run` records each existing lake table's row count
+   before transforms and, after commit, warns if any table shrank, naming
+   both counts and the likely cause (a `CREATE OR REPLACE` over an
+   incremental source view). A warning rather than a gate: legitimate
+   transforms shrink tables (dedup, rollups rebuilt from non-incremental
+   sources), and attributing tables to sources would require parsing SQL,
+   which this ADR refuses. It converts the worst silent failure into a
+   per-run, named signal.
+3. **Resolve-time warning when the backstop is off**: an `incremental:`
    source in a cell where no export declares a grain warns on every run —
    ```
    warning: source 'events' is incremental but no export declares a grain;
    `verify` cannot backstop replay-safety here. Declare `grain:` on the
    exported table so duplicate deltas are caught before publish.
    ```
-3. **Row counts as a standing detector**: `run` prints each incremental
+4. **Row counts as a standing detector**: `run` prints each incremental
    source's staged row count (free — the delta is a local table), and
    `status` shows the last delta per source (§4). Duplication makes output
    counts climb run-over-run; truncation collapses them to delta size. A
    number the operator sees every run beats a doc paragraph read once.
-4. **The grain-violation error names the likely cause** when the violating
+5. **The grain-violation error names the likely cause** when the violating
    table is downstream of an incremental source: "…grain uniqueness
    violated — if this table consumes an incremental source, the transform
    is likely not replay-safe (see docs: incremental)."
-5. **The scaffold ships the safe pattern as live SQL, not a comment.** When
+6. **The scaffold ships the safe pattern as live SQL, not a comment.** When
    `init` scaffolds (or docs describe) an incremental source, the paired
    transform *is* a working anti-join the author edits — the path of least
    resistance is the safe path — with the MERGE variant and this warning
@@ -442,8 +473,11 @@ counts: the answer to accumulated boilerplate is better scaffolds, and the
 answer to replay bugs is the verification above — both of which observe
 behavior without owning the query. Materialization is reopened only by
 evidence that **behavioral verification cannot hold the invariant in
-principle** (a class of replay unsafety `--verify-replay` structurally
-cannot detect), not by incident counts — which would mean collecting
+principle** — a class of replay unsafety that no behavioral check, gate or
+warning, can surface. (Truncation is a known instance of what the replay
+comparison alone cannot see; it is covered behaviorally by the shrink
+warning, so it does not trip this condition.) Not by incident counts —
+which would mean collecting
 evidence from already-burned users — and not by boilerplate volume. The
 watermark layer beneath is identical either way, which is why §1 does not
 wait on any future revisiting.
@@ -494,8 +528,8 @@ the next run will pick up — with the bootstrap state explicit:
 ```
 LATEST -> 7   (pointer written 2026-07-04T12:00:03Z)
 watermarks (at LATEST):
-  events   cursor=updated_at   2026-07-04T11:58:00Z   (+3,200 rows last run)
-  signups  cursor=id           absent — next run bootstraps a full scan
+  events    cursor=updated_at   mark=2026-07-04T11:58:00Z   (+3,200 rows last run)
+  signups   cursor=id           absent — next run bootstraps a full scan
 ```
 
 **`rollback`** surfaces the watermark move it is about to cause — otherwise
@@ -503,9 +537,9 @@ watermarks (at LATEST):
 sees:
 
 ```
-rollback: LATEST 7 -> 5
-  events watermark rewinds 2026-07-04T11:58Z -> 2026-07-04T09:58Z;
-  next run re-ingests rows where updated_at > 2026-07-04T09:58Z
+LATEST 7 -> 5
+  events   watermark rewinds updated_at 2026-07-04T11:58:00Z -> 2026-07-04T09:58:00Z;
+           next run re-ingests rows where updated_at > 2026-07-04T09:58:00Z
 ```
 
 ### 5. What does not change
@@ -577,8 +611,9 @@ rollback: LATEST 7 -> 5
      + `greatest`-advance upsert with the explicit empty-delta skip (unit
      test pinning the NULL-`greatest` edge); spill configuration
      (`temp_directory`, memory limit); `--full-refresh` through `cli.rs`
-     into `run` with the announce line; `--verify-replay` (second local
-     transform pass + per-table count/hash comparison); the `__datamk_%`
+     into `run` with the announce line; `--verify-replay` (post-commit
+     replay in a rolled-back transaction + exact per-table multiset
+     comparison); the pre/post-transform shrink warning; the `__datamk_%`
      prefix check in `verify`; the no-grain resolve-time warning; staged
      row counts in `run` output.
   3. `datamk status` watermark block and the `rollback` rewind printout
@@ -592,7 +627,8 @@ rollback: LATEST 7 -> 5
   5. e2e: two-execution kind/MinIO run asserting the second execution's
      staged delta excludes the first's rows, that rollback-then-run
      re-delivers them, that `--verify-replay` passes on the scaffolded
-     transform and fails on a deliberately unsafe one, and that
+     transform and fails on a deliberately duplicating one, that a
+     truncating transform trips the shrink warning, and that
      expire/cleanup behaves over a watermark-bearing lineage. Plus a
      credential-gated warehouse integration test — **new infrastructure,
      preceded by a research spike**: establish how to observe

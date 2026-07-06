@@ -6,11 +6,11 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub use bindings::{
-    is_metadata_db_catalog, is_remote, resolve, ResolvedBindings, ResolvedConnection, ResolvedS3,
-    ResolvedSource,
+    is_metadata_db_catalog, is_remote, resolve, ResolvedBindings, ResolvedConnection,
+    ResolvedIncremental, ResolvedS3, ResolvedSource,
 };
 pub use deploy::{DeployConfig, Target};
-pub use schema::{Bindings, CellDef, Contract, Export, Visibility};
+pub use schema::{Bindings, CellDef, Contract, Export, Source, Visibility};
 
 /// A cell parsed and resolved against a profile — **without a database
 /// connection**. This is the pure prefix of `engine::open`: `deploy` inspects a

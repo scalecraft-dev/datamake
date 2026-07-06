@@ -1,4 +1,4 @@
-use super::schema::{Bindings, CellDef, Connection, Source};
+use super::schema::{parse_duration, Bindings, CellDef, Connection, Incremental, Source};
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
 
@@ -34,7 +34,21 @@ pub enum ResolvedSource {
         connection: String,
         config: ResolvedConnection,
         table: String,
+        /// Watermarked-read config (ADR 0005), resolved: cursor expanded and
+        /// identifier-validated, lookback parsed to a `Duration`. Consumed by
+        /// the engine's incremental bind path (ADR 0005 Stage 2).
+        incremental: Option<ResolvedIncremental>,
     },
+}
+
+/// A resolved `incremental:` block (ADR 0005). Cursor existence/type/
+/// nullability against the live warehouse column is bind-time only — this
+/// resolve-time validation covers identifier shape and duration parsing, the
+/// two things checkable offline.
+#[derive(Debug, Clone)]
+pub struct ResolvedIncremental {
+    pub cursor: String,
+    pub lookback: Option<std::time::Duration>,
 }
 
 /// A warehouse connection with env references expanded.
@@ -121,17 +135,26 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
                     version: *version,
                 }
             }
-            Source::Connection { connection, table } => {
+            Source::Connection {
+                connection,
+                table,
+                incremental,
+            } => {
                 let conn = b.connections.get(connection).ok_or_else(|| {
                     anyhow::anyhow!(
                         "source '{name}' uses connection '{connection}', but the profile has no \
                          `connections.{connection}` entry"
                     )
                 })?;
+                let incremental = incremental
+                    .as_ref()
+                    .map(|inc| resolve_incremental(name, inc))
+                    .transpose()?;
                 ResolvedSource::Connection {
                     connection: connection.clone(),
                     config: resolve_connection(conn)?,
                     table: expand(table)?,
+                    incremental,
                 }
             }
         };
@@ -147,6 +170,43 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
         sources,
         principals,
     })
+}
+
+/// Resolve-time validation for an `incremental:` block (ADR 0005 §1): expand
+/// `${VAR}` in the cursor like `table`, then validate its identifier shape
+/// (defense in depth — it is double-quoted at the SQL build site anyway) and
+/// parse `lookback`. Cursor existence/type/nullability against the live
+/// warehouse column can only be checked at bind time.
+fn resolve_incremental(source_name: &str, inc: &Incremental) -> Result<ResolvedIncremental> {
+    let cursor = expand(&inc.cursor)?;
+    if !is_valid_cursor_identifier(&cursor) {
+        bail!(
+            "source '{source_name}': incremental cursor '{cursor}' is not a valid column \
+             identifier — use a bare column name matching [A-Za-z_][A-Za-z0-9_]* (no dots, \
+             quotes, or expressions)"
+        );
+    }
+    let lookback = match &inc.lookback {
+        Some(s) => {
+            let expanded = expand(s)?;
+            Some(
+                parse_duration(&expanded)
+                    .map_err(|e| anyhow::anyhow!("source '{source_name}': {e}"))?,
+            )
+        }
+        None => None,
+    };
+    Ok(ResolvedIncremental { cursor, lookback })
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*` — a bare column identifier, no dots/quotes/spaces.
+fn is_valid_cursor_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn resolve_connection(c: &Connection) -> Result<ResolvedConnection> {
@@ -391,6 +451,7 @@ mod tests {
             Source::Connection {
                 connection: "crm".to_string(),
                 table: "sales.accounts".to_string(),
+                incremental: None,
             },
         );
         let mut connections = IndexMap::new();
@@ -419,10 +480,12 @@ mod tests {
                 connection,
                 config: ResolvedConnection::Bigquery { project, .. },
                 table,
+                incremental,
             } => {
                 assert_eq!(connection, "crm");
                 assert_eq!(project, "acme-prod-crm");
                 assert_eq!(table, "sales.accounts");
+                assert!(incremental.is_none());
             }
             other => panic!("expected connection, got {other:?}"),
         }
@@ -435,6 +498,7 @@ mod tests {
             Source::Connection {
                 connection: "crm".to_string(),
                 table: "sales.accounts".to_string(),
+                incremental: None,
             },
         );
         let b = Bindings {
@@ -448,6 +512,127 @@ mod tests {
         let err = resolve(&def, &b).unwrap_err().to_string();
         assert!(err.contains("connections.crm"), "unexpected error: {err}");
         assert!(err.contains("crm_accounts"), "unexpected error: {err}");
+    }
+
+    fn bindings_with_crm_connection() -> Bindings {
+        let mut connections = IndexMap::new();
+        connections.insert(
+            "crm".to_string(),
+            Connection::Bigquery(BigQueryConnection {
+                project: "acme-prod-crm".to_string(),
+                billing_project: None,
+                credentials: None,
+            }),
+        );
+        Bindings {
+            catalog: Some("c".into()),
+            storage: "s".into(),
+            s3: None,
+            principals: None,
+            cells: IndexMap::new(),
+            connections,
+        }
+    }
+
+    #[test]
+    fn resolve_incremental_cursor_only() {
+        let def = cell_with_source(
+            "crm_accounts",
+            Source::Connection {
+                connection: "crm".to_string(),
+                table: "sales.accounts".to_string(),
+                incremental: Some(Incremental {
+                    cursor: "updated_at".to_string(),
+                    lookback: None,
+                }),
+            },
+        );
+        let r = resolve(&def, &bindings_with_crm_connection()).unwrap();
+        match r.sources.get("crm_accounts").unwrap() {
+            ResolvedSource::Connection { incremental, .. } => {
+                let inc = incremental.as_ref().unwrap();
+                assert_eq!(inc.cursor, "updated_at");
+                assert!(inc.lookback.is_none());
+            }
+            other => panic!("expected connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_incremental_cursor_and_lookback() {
+        let def = cell_with_source(
+            "crm_accounts",
+            Source::Connection {
+                connection: "crm".to_string(),
+                table: "sales.accounts".to_string(),
+                incremental: Some(Incremental {
+                    cursor: "updated_at".to_string(),
+                    lookback: Some("2h".to_string()),
+                }),
+            },
+        );
+        let r = resolve(&def, &bindings_with_crm_connection()).unwrap();
+        match r.sources.get("crm_accounts").unwrap() {
+            ResolvedSource::Connection { incremental, .. } => {
+                let inc = incremental.as_ref().unwrap();
+                assert_eq!(inc.cursor, "updated_at");
+                assert_eq!(inc.lookback.unwrap().as_secs(), 7200);
+            }
+            other => panic!("expected connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_bad_cursor_identifier() {
+        let def = cell_with_source(
+            "crm_accounts",
+            Source::Connection {
+                connection: "crm".to_string(),
+                table: "sales.accounts".to_string(),
+                incremental: Some(Incremental {
+                    cursor: "updated at, dropped()".to_string(),
+                    lookback: None,
+                }),
+            },
+        );
+        let err = resolve(&def, &bindings_with_crm_connection())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("crm_accounts"), "unexpected error: {err}");
+        assert!(
+            err.contains("updated at, dropped()"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("not a valid column identifier"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_an_unparseable_lookback() {
+        let def = cell_with_source(
+            "crm_accounts",
+            Source::Connection {
+                connection: "crm".to_string(),
+                table: "sales.accounts".to_string(),
+                incremental: Some(Incremental {
+                    cursor: "updated_at".to_string(),
+                    lookback: Some("2w".to_string()),
+                }),
+            },
+        );
+        let err = resolve(&def, &bindings_with_crm_connection())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("crm_accounts") || err.starts_with("source 'crm_accounts'"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("is not a valid duration"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

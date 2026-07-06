@@ -96,10 +96,118 @@ pub enum Contract {
     Supported,
 }
 
+/// Watermarked-read config for a `connection` source (ADR 0005). Valid only on
+/// `Source::Connection` — the cost problem this feature addresses (full
+/// warehouse re-scans) lives in warehouse reads, not raw files or cell-to-cell
+/// composition. Deliberately deserialized to deny unknown fields: a typo'd key
+/// here (`incremenetal:`) would otherwise silently parse as a plain connection
+/// source, running full scans forever while the author believes the cell is
+/// incremental.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Incremental {
+    /// Monotonic column to track (e.g. `updated_at`, an autoincrement id, an
+    /// ingestion timestamp). A property of the data, so contract, not
+    /// environment. Existence/type/nullability are validated at bind time
+    /// (offline `verify` cannot see the live warehouse column).
+    pub cursor: String,
+    /// Optional trailing window re-delivered every run to catch late-arriving
+    /// rows (`30m`, `2h`, `1d`). Parsed via `parse_duration` at resolve time.
+    /// Accepts any YAML scalar here (not just a quoted string) so an unquoted
+    /// `lookback: 2` reaches `parse_duration` as `"2"` and fails with our
+    /// no-unit error, never a raw serde type-mismatch error.
+    #[serde(default, deserialize_with = "de_lookback")]
+    pub lookback: Option<String>,
+}
+
+fn de_lookback<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_yaml::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
+        Some(serde_yaml::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(serde_yaml::Value::Bool(b)) => Ok(Some(b.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "`lookback` must be a duration like `2h`, got {}",
+            yaml_kind(&other)
+        ))),
+    }
+}
+
+/// Parse a duration string of the form `<integer><unit>` where unit is one of
+/// `s`/`m`/`h`/`d` (seconds/minutes/hours/days). This is the ADR 0005-ratified
+/// convention for future duration-valued fields (existing fields use plain
+/// unit-suffixed integers like `retention_days`; duration strings exist
+/// because lookback windows genuinely span mixed units).
+pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "`lookback: \"{s}\"` is not a valid duration — use an integer with a unit suffix: \
+             s, m, h, or d (e.g. `30m`, `2h`, `1d`)."
+        )
+    };
+
+    if s.is_empty() {
+        return Err(invalid());
+    }
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!(
+            "`lookback: \"{s}\"` has no unit — durations need a suffix: s, m, h, or d \
+             (e.g. `2h`)."
+        );
+    }
+    let (digits, suffix) = s.split_at(s.len() - 1);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    if !matches!(suffix, "s" | "m" | "h" | "d") {
+        return Err(invalid());
+    }
+    let n: u64 = digits.parse().map_err(|_| invalid())?;
+    if n == 0 {
+        anyhow::bail!(
+            "`lookback: \"{s}\"` is zero. Omit `lookback` to read only rows past the \
+             watermark, or give a non-zero window (e.g. `2h`)."
+        );
+    }
+    let secs = match suffix {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => unreachable!("suffix already validated"),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+fn yaml_kind(v: &serde_yaml::Value) -> &'static str {
+    match v {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a bool",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a list",
+        serde_yaml::Value::Mapping(_) => "a mapping",
+        serde_yaml::Value::Tagged(_) => "a tagged value",
+    }
+}
+
 /// An external input. A raw file path/URI (`s3://…`, local) read directly,
 /// another cell's managed DuckLake table read by name (versioned, governed), or
 /// a warehouse table read through a named connection (ADR 0003).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Deserialize` is implemented by hand below rather than derived with
+/// `#[serde(untagged)]`: an untagged enum swallows field-level serde errors
+/// behind "data did not match any variant of untagged enum Source", which is
+/// useless for a malformed `incremental:` block (ADR 0005 §1). Dispatch is on
+/// YAML shape instead — string, or a mapping keyed by `cell` or `connection` —
+/// and each mapping shape denies unknown fields, closing the same typo hazard
+/// `Incremental` closes. `Serialize` keeps the plain derive; round-tripping is
+/// unaffected.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Source {
     /// Raw path/URI; DuckDB reads it directly (Parquet/CSV/JSON, globs ok).
@@ -118,7 +226,137 @@ pub enum Source {
     /// and credentials is environment, resolved via the profile's `connections`
     /// map. The table path's shape is validated per connector (BigQuery:
     /// `dataset.table`).
-    Connection { connection: String, table: String },
+    Connection {
+        connection: String,
+        table: String,
+        /// Optional watermarked-read config (ADR 0005).
+        #[serde(default)]
+        incremental: Option<Incremental>,
+    },
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(s) => Ok(Source::Raw(s)),
+            serde_yaml::Value::Mapping(map) => {
+                let has_cell = map.contains_key("cell");
+                let has_connection = map.contains_key("connection");
+                match (has_cell, has_connection) {
+                    (true, true) => Err(D::Error::custom(
+                        "a source cannot have both `cell` and `connection` keys — it is either \
+                         a `{ cell, table }` reference to another cell, or a \
+                         `{ connection, table }` reference to a warehouse table, never both",
+                    )),
+                    (true, false) => {
+                        #[derive(Deserialize)]
+                        #[serde(deny_unknown_fields)]
+                        struct CellHelper {
+                            cell: String,
+                            table: String,
+                            #[serde(default)]
+                            version: Option<u64>,
+                        }
+                        let h: CellHelper = serde_yaml::from_value(serde_yaml::Value::Mapping(map))
+                            .map_err(D::Error::custom)?;
+                        Ok(Source::Cell {
+                            cell: h.cell,
+                            table: h.table,
+                            version: h.version,
+                        })
+                    }
+                    (false, true) => deserialize_connection(map).map_err(D::Error::custom),
+                    (false, false) => Err(D::Error::custom(
+                        "source must be a path string, a `{ cell, table }` map, or a \
+                         `{ connection, table }` map",
+                    )),
+                }
+            }
+            other => Err(D::Error::custom(format!(
+                "source must be a path string, a `{{ cell, table }}` map, or a \
+                 `{{ connection, table }}` map, got {}",
+                yaml_kind(&other)
+            ))),
+        }
+    }
+}
+
+/// Hand-rolled (not derived) so the `incremental:` field can wrap the nested
+/// `Incremental` error into ADR 0005's exact user-visible text, and so the
+/// connection helper's own unknown-field error names the three valid keys
+/// (rather than serde's generic "expected one of ..." list).
+fn deserialize_connection(map: serde_yaml::Mapping) -> std::result::Result<Source, String> {
+    let mut connection: Option<String> = None;
+    let mut table: Option<String> = None;
+    let mut incremental: Option<Incremental> = None;
+
+    for (k, v) in map {
+        let key = k
+            .as_str()
+            .ok_or_else(|| "a connection source's keys must be strings".to_string())?
+            .to_string();
+        match key.as_str() {
+            "connection" => connection = Some(as_yaml_string(v, "connection")?),
+            "table" => table = Some(as_yaml_string(v, "table")?),
+            "incremental" => {
+                let inc: Incremental = serde_yaml::from_value(v)
+                    .map_err(|e| rewrite_incremental_error(&e.to_string()))?;
+                incremental = Some(inc);
+            }
+            other => {
+                return Err(format!(
+                    "unknown field `{other}` — a connection source has `connection`, \
+                     `table`, and optional `incremental`."
+                ))
+            }
+        }
+    }
+
+    let connection = connection
+        .ok_or_else(|| "a connection source is missing required field `connection`".to_string())?;
+    let table =
+        table.ok_or_else(|| "a connection source is missing required field `table`".to_string())?;
+    Ok(Source::Connection {
+        connection,
+        table,
+        incremental,
+    })
+}
+
+fn as_yaml_string(v: serde_yaml::Value, field: &str) -> std::result::Result<String, String> {
+    match v {
+        serde_yaml::Value::String(s) => Ok(s),
+        other => Err(format!(
+            "`{field}` must be a string, got {}",
+            yaml_kind(&other)
+        )),
+    }
+}
+
+/// Rewrite serde's generic `deny_unknown_fields`/missing-field text for
+/// `Incremental` into ADR 0005's exact wording, naming the block (`incremental:`)
+/// and, for missing `cursor`, the fix.
+fn rewrite_incremental_error(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("unknown field `") {
+        if let Some(end) = rest.find('`') {
+            let field = &rest[..end];
+            return format!(
+                "unknown field `{field}` in `incremental:` — expected `cursor` or `lookback`."
+            );
+        }
+    }
+    if raw.starts_with("missing field `cursor`") {
+        return "`incremental:` is missing required field `cursor`. Name the monotonic \
+                column to track, e.g. `cursor: updated_at`."
+            .to_string();
+    }
+    format!("`incremental:` {raw}")
 }
 
 /// The location of an upstream cell, supplied per environment by a profile.
@@ -354,12 +592,227 @@ sources:
 "#;
         let def: CellDef = serde_yaml::from_str(yaml).unwrap();
         match def.sources.get("crm_accounts").unwrap() {
-            Source::Connection { connection, table } => {
+            Source::Connection {
+                connection,
+                table,
+                incremental,
+            } => {
                 assert_eq!(connection, "crm");
                 assert_eq!(table, "sales.accounts");
+                assert!(incremental.is_none());
             }
             other => panic!("expected connection source, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn celldef_parses_a_connection_source_with_incremental_cursor_only() {
+        let yaml = r#"
+cell: orders
+sources:
+  crm_accounts:
+    connection: crm
+    table: sales.accounts
+    incremental:
+      cursor: updated_at
+"#;
+        let def: CellDef = serde_yaml::from_str(yaml).unwrap();
+        match def.sources.get("crm_accounts").unwrap() {
+            Source::Connection { incremental, .. } => {
+                let inc = incremental.as_ref().unwrap();
+                assert_eq!(inc.cursor, "updated_at");
+                assert!(inc.lookback.is_none());
+            }
+            other => panic!("expected connection source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn celldef_parses_incremental_cursor_and_lookback() {
+        let yaml = r#"
+cell: orders
+sources:
+  crm_accounts:
+    connection: crm
+    table: sales.accounts
+    incremental:
+      cursor: updated_at
+      lookback: 2h
+"#;
+        let def: CellDef = serde_yaml::from_str(yaml).unwrap();
+        match def.sources.get("crm_accounts").unwrap() {
+            Source::Connection { incremental, .. } => {
+                let inc = incremental.as_ref().unwrap();
+                assert_eq!(inc.cursor, "updated_at");
+                assert_eq!(inc.lookback.as_deref(), Some("2h"));
+            }
+            other => panic!("expected connection source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn celldef_unquoted_lookback_int_errors_with_no_unit_text_not_a_serde_type_error() {
+        let yaml = r#"
+cell: orders
+sources:
+  crm_accounts:
+    connection: crm
+    table: sales.accounts
+    incremental:
+      cursor: updated_at
+      lookback: 2
+"#;
+        // `lookback: 2` deserializes cleanly here (as the string "2") — the
+        // no-unit error only fires when `parse_duration` runs at resolve time.
+        let def: CellDef = serde_yaml::from_str(yaml).unwrap();
+        match def.sources.get("crm_accounts").unwrap() {
+            Source::Connection { incremental, .. } => {
+                assert_eq!(incremental.as_ref().unwrap().lookback.as_deref(), Some("2"));
+            }
+            other => panic!("expected connection source, got {other:?}"),
+        }
+        let err = parse_duration("2").unwrap_err().to_string();
+        assert!(err.contains("has no unit"), "unexpected error: {err}");
+        assert!(!err.contains("invalid type"), "leaked a serde error: {err}");
+    }
+
+    #[test]
+    fn incremental_unknown_field_errors_with_user_visible_text() {
+        let yaml = r#"
+cell: orders
+sources:
+  crm_accounts:
+    connection: crm
+    table: sales.accounts
+    incremental:
+      cursor: updated_at
+      windw: 2h
+"#;
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "unknown field `windw` in `incremental:` — expected `cursor` or `lookback`."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn incremental_missing_cursor_errors_with_user_visible_text() {
+        let yaml = r#"
+cell: orders
+sources:
+  crm_accounts:
+    connection: crm
+    table: sales.accounts
+    incremental:
+      lookback: 2h
+"#;
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "`incremental:` is missing required field `cursor`. Name the monotonic column \
+                 to track, e.g. `cursor: updated_at`."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn connection_source_typo_top_level_key_errors_with_user_visible_text() {
+        let yaml = r#"
+cell: orders
+sources:
+  crm_accounts:
+    connection: crm
+    table: sales.accounts
+    incremenetal:
+      cursor: updated_at
+"#;
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "unknown field `incremenetal` — a connection source has `connection`, \
+                 `table`, and optional `incremental`."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn source_with_both_cell_and_connection_keys_errors() {
+        let yaml = r#"
+cell: orders
+sources:
+  bad:
+    cell: other
+    connection: crm
+    table: t
+"#;
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot have both `cell` and `connection` keys"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn source_with_neither_cell_nor_connection_key_errors() {
+        let yaml = r#"
+cell: orders
+sources:
+  bad:
+    table: t
+"#;
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "source must be a path string, a `{ cell, table }` map, or a \
+                          `{ connection, table }` map"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn duration_grammar_rejections() {
+        for bad in ["2w", "2.5h", "-2h", "1h30m", "", " ", "h", "2 h"] {
+            let err = parse_duration(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("is not a valid duration") || err.contains("has no unit"),
+                "for '{bad}': unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_rejects_zero() {
+        let err = parse_duration("0h").unwrap_err().to_string();
+        assert!(err.contains("is zero"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn duration_rejects_bare_number() {
+        let err = parse_duration("2").unwrap_err().to_string();
+        assert!(err.contains("has no unit"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn duration_parses_valid_forms() {
+        assert_eq!(parse_duration("30s").unwrap().as_secs(), 30);
+        assert_eq!(parse_duration("2m").unwrap().as_secs(), 120);
+        assert_eq!(parse_duration("2h").unwrap().as_secs(), 7200);
+        assert_eq!(parse_duration("1d").unwrap().as_secs(), 86_400);
     }
 
     #[test]

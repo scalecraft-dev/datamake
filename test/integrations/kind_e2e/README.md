@@ -220,3 +220,41 @@ by actually applying to a `kind` cluster:
    CronJob schedule raced with the harness's own manual trigger; the
    overlay now uses `0 3 1 1 *` (valid cron, never fires during a normal
    run) so `run.sh` has full control over exactly when the Builder runs.
+
+## Follow-up: ADR 0005 incremental e2e
+
+ADR 0005 (incremental source loading) is implemented and its mechanics are
+covered deeply at the `cargo test` layer: engine unit tests exercise the
+two-run bootstrap-then-delta path, `--full-refresh` overwrite,
+empty-delta-skip, `--verify-replay` pass/fail, the shrink comparator, and the
+`ESCAPE`d `__datamk_%` prefix check through a connector-agnostic seam. The
+CLI-surface flag behavior (no-op warnings, `--help` text, Stage-1 config
+errors reaching `datamk run`) is covered in `test/integrations/cli.rs`.
+
+What is **not** covered anywhere yet, and belongs in this harness once it's
+extended, is a real two-execution incremental run against a live warehouse
+connector and a real published-artifact lineage in MinIO:
+
+- **Two-execution delta exclusion against a real warehouse.** Deploy an
+  incremental cell, let the init Job bootstrap (full read, watermark
+  written), insert new upstream rows, trigger a second execution, and assert
+  the second execution's staged delta excludes every row the first execution
+  already accounted for -- the thing no unit test can prove because the unit
+  tests fake the connector seam rather than hitting a real BigQuery table.
+- **Rollback-then-run re-delivery.** `datamk rollback` repoints `LATEST` to
+  the pre-delta artifact; the next execution must re-stage exactly the rows
+  the rollback discarded (ADR 0005 §1's "rollback is automatic replay"
+  claim), asserted against real published artifacts rather than the engine
+  unit tests' in-process rollback probe.
+- **`status` watermark block against MinIO.** `datamk status` should show the
+  per-source cursor, current high-water value, and last delta size read back
+  from a real published catalog artifact in the bucket -- proving the
+  watermark table travels with the artifact lineage exactly as ADR 0005 §4
+  describes, not just against a local `.ducklake` file.
+
+This isn't in `cargo test` because incremental applies only to `connection`
+sources and the only connector today is BigQuery: a real assertion needs
+either live BigQuery credentials (the credential-gated warehouse test ADR
+0005's work item 5 calls out separately, including the bytes-scanned pushdown
+proof) or a research spike into faking one convincingly inside `kind`. Until
+one of those lands, this section stays a to-do rather than a script.

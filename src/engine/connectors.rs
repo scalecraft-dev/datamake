@@ -197,6 +197,7 @@ mod tests {
             connection: "crm".to_string(),
             config,
             table: "sales.accounts".to_string(),
+            incremental: None,
         }
     }
 

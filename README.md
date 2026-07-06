@@ -126,6 +126,25 @@ connections:
 Transforms filter through the view with full pushdown — write plain SQL against
 `crm_accounts` and DuckDB pushes projections/filters into the warehouse scanner.
 
+### Incremental loading
+
+A `connection` source can declare a cursor so the Builder reads only rows
+past a persisted watermark instead of re-scanning the whole table every run:
+
+```yaml
+sources:
+  events:
+    connection: crm
+    table: analytics.events
+    incremental:
+      cursor: updated_at   # a monotonic column; its max is the new watermark
+```
+
+Delivery is **at-least-once** — a transform reading an incremental source
+must be replay-safe (an anti-join or `MERGE`, never `CREATE OR REPLACE`). See
+[Incremental source loading](docs/incremental.md) for the full guide,
+`--full-refresh`/`--verify-replay`, and the edge cases.
+
 ---
 
 ## The CLI

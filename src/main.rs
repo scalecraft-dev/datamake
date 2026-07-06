@@ -34,7 +34,11 @@ async fn main() -> Result<()> {
                     0 => None,
                     d => Some(d * 86_400),
                 });
-            engine::run(&a.file, &a.profile, retention_secs)
+            let opts = engine::RunOptions {
+                full_refresh: a.full_refresh,
+                verify_replay: a.verify_replay,
+            };
+            engine::run(&a.file, &a.profile, retention_secs, opts)
         }
         Command::Verify(a) => verify::run(&a.file, &a.profile),
         Command::Release(a) => release::run(&a.file, &a.profile),

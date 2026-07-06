@@ -65,6 +65,20 @@ pub struct RunArgs {
     /// artifacts. 0 disables compaction. Ignored in direct-attach mode.
     #[arg(long, default_value_t = 30)]
     pub retention_days: u64,
+    /// Re-read every incremental source from zero and rewrite its watermark to the
+    /// fresh max(cursor) at commit. The recovery path for a changed cursor, an
+    /// upstream backfill behind the cursor, or a direct-attach verify failure. On a
+    /// large table this is a full scan and a full bill — the schedule never does it;
+    /// run it as a one-off Job. No-op on a cell with no incremental sources.
+    #[arg(long)]
+    pub full_refresh: bool,
+    /// After transforms succeed, replay them once against the same staged delta and
+    /// fail if any output table's row count or content changed. Catches transforms
+    /// that duplicate (plain INSERT) an incremental source before publish. One extra
+    /// local pass; the warehouse is not re-read, so it is cheap enough for CI.
+    /// No-op on a cell with no incremental sources.
+    #[arg(long)]
+    pub verify_replay: bool,
 }
 
 #[derive(Args)]

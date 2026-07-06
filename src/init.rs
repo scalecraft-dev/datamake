@@ -47,6 +47,11 @@ fn cell_yaml(name: &str) -> String {
 #   crm_accounts:                 # a warehouse table via a named connection
 #     connection: crm             # -> profiles/<name>.yaml `connections.crm`
 #     table: sales.accounts       # which table is contract; which project is environment
+#     incremental:                # read only rows past a watermark each run (ADR 0005)
+#       cursor: updated_at        # a monotonic column (timestamp/date/integer); its max is the mark
+#       # lookback: 2h            # optional: also re-read a trailing window for late rows (time cursors only)
+#     # A transform on an incremental source MUST be replay-safe: ANTI JOIN or MERGE,
+#     # NEVER `CREATE OR REPLACE` (it replaces history with just the delta). See docs/incremental.md.
                                   # transforms then read sources by name.
 
 transforms:                       # private; run in listed order, atomically -> one snapshot
