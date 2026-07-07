@@ -66,9 +66,11 @@ impl object_store::CredentialProvider for AwsChainCredentials {
 
     async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
         use aws_credential_types::provider::ProvideCredentials;
-        let generic = |source: Box<dyn std::error::Error + Send + Sync>| {
-            object_store::Error::Generic { store: "S3", source }
-        };
+        let generic =
+            |source: Box<dyn std::error::Error + Send + Sync>| object_store::Error::Generic {
+                store: "S3",
+                source,
+            };
         let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
             .await;
@@ -157,7 +159,7 @@ impl Store {
                 // secret provider (engine::create_s3_secret). object_store's
                 // own fallback is env vars + IMDS only, which silently skips
                 // shared-config profiles (AWS_PROFILE, SSO).
-                if s3.map_or(true, |s| s.key_id.is_none() || s.secret.is_none()) {
+                if s3.is_none_or(|s| s.key_id.is_none() || s.secret.is_none()) {
                     b = b.with_credentials(Arc::new(AwsChainCredentials));
                 }
                 Arc::new(b.build().context("building S3 client for storage")?)

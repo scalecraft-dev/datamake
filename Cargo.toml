@@ -1,6 +1,6 @@
 [package]
 name = "datamk"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "the cell — reduce time to value for data"
 license = "Apache-2.0"
