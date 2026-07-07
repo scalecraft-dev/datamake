@@ -277,6 +277,7 @@ fn create_s3_secret(conn: &Connection, s3: Option<&ResolvedS3>) -> Result<()> {
         url_style: None,
         key_id: None,
         secret: None,
+        session_token: None,
         use_ssl: None,
     });
 
@@ -284,6 +285,11 @@ fn create_s3_secret(conn: &Connection, s3: Option<&ResolvedS3>) -> Result<()> {
         (Some(k), Some(s)) => {
             parts.push(format!("KEY_ID '{}'", esc(k)));
             parts.push(format!("SECRET '{}'", esc(s)));
+            // Temporary STS credentials (SSO sessions, assumed roles) are a
+            // key triple — without the token the pair alone is invalid.
+            if let Some(t) = &s3.session_token {
+                parts.push(format!("SESSION_TOKEN '{}'", esc(t)));
+            }
         }
         _ => parts.push("PROVIDER credential_chain".to_string()),
     }

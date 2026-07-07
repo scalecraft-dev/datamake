@@ -58,7 +58,14 @@ pub fn latest_content(n: u64) -> String {
 /// so a cached SSO/IMDS provider would hold HTTP state from a dead runtime.
 /// Store calls are a handful per command; re-reading the chain is noise.
 #[derive(Debug)]
-struct AwsChainCredentials;
+struct AwsChainCredentials {
+    /// The profile's `s3.region`, passed to the loader ONLY so it skips its
+    /// own region resolution — which otherwise probes EC2 metadata
+    /// (169.254.169.254) on laptops: seconds of connect timeouts and a wall
+    /// of WARNs per client. S3 request signing never reads this; the
+    /// builder's `with_region` owns that.
+    region: Option<String>,
+}
 
 #[async_trait::async_trait]
 impl object_store::CredentialProvider for AwsChainCredentials {
@@ -71,7 +78,14 @@ impl object_store::CredentialProvider for AwsChainCredentials {
                 store: "S3",
                 source,
             };
+        let region = aws_config::Region::new(
+            // Any static value suppresses the IMDS region probe; the chain
+            // uses it only for its own STS/SSO calls, which accept any
+            // region. us-east-1 is the SDK's own last-resort convention.
+            self.region.clone().unwrap_or_else(|| "us-east-1".into()),
+        );
         let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(region)
             .load()
             .await;
         let creds = cfg
@@ -152,6 +166,9 @@ impl Store {
                         b = b
                             .with_access_key_id(k.clone())
                             .with_secret_access_key(s.clone());
+                        if let Some(t) = &s3.session_token {
+                            b = b.with_token(t.clone());
+                        }
                     }
                 }
                 // No explicit keys in the profile -> the standard AWS
@@ -160,7 +177,9 @@ impl Store {
                 // own fallback is env vars + IMDS only, which silently skips
                 // shared-config profiles (AWS_PROFILE, SSO).
                 if s3.is_none_or(|s| s.key_id.is_none() || s.secret.is_none()) {
-                    b = b.with_credentials(Arc::new(AwsChainCredentials));
+                    b = b.with_credentials(Arc::new(AwsChainCredentials {
+                        region: s3.and_then(|s| s.region.clone()),
+                    }));
                 }
                 Arc::new(b.build().context("building S3 client for storage")?)
             }

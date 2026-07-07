@@ -441,6 +441,11 @@ pub struct S3Binding {
     pub key_id: Option<String>,
     #[serde(default)]
     pub secret: Option<String>,
+    /// For temporary STS credentials (SSO sessions, assumed roles): the third
+    /// piece of the triple. Meaningful only alongside `key_id`/`secret`, and
+    /// expires with them — suited to dev loops, not long-lived deployments.
+    #[serde(default)]
+    pub session_token: Option<String>,
     #[serde(default)]
     pub use_ssl: Option<bool>,
 }

@@ -95,6 +95,7 @@ pub struct ResolvedS3 {
     pub url_style: Option<String>,
     pub key_id: Option<String>,
     pub secret: Option<String>,
+    pub session_token: Option<String>,
     pub use_ssl: Option<bool>,
 }
 
@@ -108,6 +109,7 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
             url_style: expand_opt(&s.url_style)?,
             key_id: expand_opt(&s.key_id)?,
             secret: expand_opt(&s.secret)?,
+            session_token: expand_opt(&s.session_token)?,
             use_ssl: s.use_ssl,
         }),
         None => None,
@@ -654,6 +656,7 @@ mod tests {
                 url_style: None,
                 key_id: None,
                 secret: None,
+                session_token: None,
                 use_ssl: Some(true),
             }),
             principals: None,
