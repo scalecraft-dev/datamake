@@ -18,7 +18,10 @@ use cli::{Cli, Command};
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            // aws_config narrates every credential-chain resolution (including
+            // access key ids) at INFO; that's RUST_LOG territory, not default output.
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,aws_config=warn".into()),
         )
         .init();
 

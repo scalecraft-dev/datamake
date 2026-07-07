@@ -53,6 +53,39 @@ pub fn latest_content(n: u64) -> String {
     format!("{n:08}")
 }
 
+/// The AWS credential chain bridged into object_store. Resolved fresh per
+/// request on purpose: `Store::block_on` builds and drops a runtime per call,
+/// so a cached SSO/IMDS provider would hold HTTP state from a dead runtime.
+/// Store calls are a handful per command; re-reading the chain is noise.
+#[derive(Debug)]
+struct AwsChainCredentials;
+
+#[async_trait::async_trait]
+impl object_store::CredentialProvider for AwsChainCredentials {
+    type Credential = object_store::aws::AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        use aws_credential_types::provider::ProvideCredentials;
+        let generic = |source: Box<dyn std::error::Error + Send + Sync>| {
+            object_store::Error::Generic { store: "S3", source }
+        };
+        let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        let creds = cfg
+            .credentials_provider()
+            .ok_or_else(|| generic("no AWS credentials provider in the credential chain".into()))?
+            .provide_credentials()
+            .await
+            .map_err(|e| generic(Box::new(e)))?;
+        Ok(Arc::new(object_store::aws::AwsCredential {
+            key_id: creds.access_key_id().to_string(),
+            secret_key: creds.secret_access_key().to_string(),
+            token: creds.session_token().map(str::to_string),
+        }))
+    }
+}
+
 /// A cell's slice of an object store: all keys are relative to the cell's
 /// storage prefix. Sync surface over an async client — every call drives its
 /// future on a fresh thread so callers are safe from any tokio context
@@ -118,6 +151,14 @@ impl Store {
                             .with_access_key_id(k.clone())
                             .with_secret_access_key(s.clone());
                     }
+                }
+                // No explicit keys in the profile -> the standard AWS
+                // credential chain, exactly like DuckDB's `credential_chain`
+                // secret provider (engine::create_s3_secret). object_store's
+                // own fallback is env vars + IMDS only, which silently skips
+                // shared-config profiles (AWS_PROFILE, SSO).
+                if s3.map_or(true, |s| s.key_id.is_none() || s.secret.is_none()) {
+                    b = b.with_credentials(Arc::new(AwsChainCredentials));
                 }
                 Arc::new(b.build().context("building S3 client for storage")?)
             }

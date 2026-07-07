@@ -163,14 +163,22 @@ datamk deploy -f cell.yaml -p prod             # apply
 
 ---
 
-## Install / build
+## Install
 
-Datamake is a single Rust binary. Building it requires the Rust toolchain
-(`rustup`); the first build compiles a bundled DuckDB and is slow, after which
-builds are incremental.
+Datamake is a single binary. The installer grabs the latest release for your
+platform (macOS Apple Silicon; Linux x86_64/arm64, glibc 2.28+), verifies its
+checksum, and installs to `~/.local/bin`:
 
 ```bash
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/scalecraft-dev/datamake/main/install.sh | sh
+```
+
+On Windows, run the same one-liner inside WSL2. On anything else (Intel Mac,
+Alpine/musl), build from source with the Rust toolchain (`rustup`) — the
+first build compiles a bundled DuckDB and is slow:
+
+```bash
+cargo install --git https://github.com/scalecraft-dev/datamake datamk
 ```
 
 ---

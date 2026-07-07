@@ -1,0 +1,137 @@
+name: Release binaries
+
+# Prebuilt host binaries for every tagged release, attached to a GitHub
+# Release (the container image is base-image.yml's job; both fire on the same
+# tag independently). Three targets, all built NATIVELY on their own runner —
+# same no-QEMU rationale as base-image.yml: bundled DuckDB under emulation
+# takes hours.
+#
+# Linux builds run inside manylinux_2_28 containers (AlmaLinux 8, modern GCC
+# on PATH) so the binaries' glibc floor is 2.28 — Amazon Linux 2023, RHEL 8+,
+# Debian 11+, Ubuntu 20.04+ — instead of whatever glibc the hosted runner du
+# jour ships. The host runner label is deliberately NOT load-bearing for
+# compatibility; only the container is.
+#
+# No cross-job build caches: tag builds are rare enough to be evicted anyway,
+# and a cold ~30min compile beats cache-key drift on a release artifact.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ci.yml only runs on push/PR — a tag push runs neither, so without this
+  # gate a release could ship binaries from a commit tests never touched.
+  # The tag guard lives here too: fail the cheap job in minutes, not a
+  # matrix build after an hour of compiling.
+  gate:
+    name: Gate (tag guard + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches Cargo.toml
+        # Same invariant as base-image.yml: the binary reports
+        # CARGO_PKG_VERSION and deploys ghcr.io/scalecraft-dev/datamk:v<it>,
+        # so a tag that doesn't match the stamp publishes a binary that
+        # points at a different release. `make release` stamps this
+        # correctly; this guards hand-pushed tags.
+        run: |
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}." >&2
+            echo "Cut releases with: make release VERSION=${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+      - name: Install toolchain
+        run: rustup show
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            container: null
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustup (manylinux containers ship none)
+        if: matrix.container != null
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install toolchain
+        # rust-toolchain.toml pins the channel; `rustup show` materializes it.
+        run: rustup show
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        # A named directory, not a bare binary: `tar xzf` into a random cwd
+        # must not spray files. install.sh reaches inside for the binary.
+        run: |
+          dir="datamk-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$dir"
+          cp target/release/datamk LICENSE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: datamk-*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # Matrix jobs racing `gh release create` collide, and four jobs can't write
+  # one checksums file — so a single publisher aggregates: one sha256sums.txt
+  # over all tarballs, one Release created exactly once.
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: sha256sum datamk-*.tar.gz > sha256sums.txt
+
+      - name: Create the Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --verify-tag: never mint a release for a tag that has vanished.
+        # Re-runs land in the `else` branch and re-upload idempotently.
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "datamk $GITHUB_REF_NAME" --generate-notes \
+              datamk-*.tar.gz sha256sums.txt
+          else
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --clobber datamk-*.tar.gz sha256sums.txt
+          fi

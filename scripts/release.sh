@@ -59,5 +59,6 @@ cat <<EOF
 Release $VERSION pushed. CI is now building and publishing:
   ghcr.io/scalecraft-dev/datamk:$VERSION
   ghcr.io/scalecraft-dev/datamk:latest
+  GitHub Release $VERSION with host binaries (macOS arm64, Linux x86_64/arm64)
 Watch it: gh run watch --repo scalecraft-dev/datamk \$(gh run list --repo scalecraft-dev/datamk --workflow base-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')
 EOF

@@ -40,6 +40,14 @@ sha2 = "0.10"                                         # content hash of the depl
 # for published catalog artifacts. DuckDB's httpfs is the *query* engine's S3
 # path; this is the publisher's. PutMode::Create works across S3/GCS/local.
 object_store = { version = "0.12", features = ["aws", "gcp"] }
+# The full AWS credential chain (env, shared config/SSO profiles, IMDS, ...)
+# for the native client above. object_store natively reads env vars only;
+# DuckDB already gets the whole chain via its `credential_chain` secret
+# provider — without this bridge the two clients disagree on which
+# credentials exist, and "one profile block drives both" (store.rs) is a lie.
+aws-config = "1"
+aws-credential-types = "1"
+async-trait = "0.1"                                   # object_store::CredentialProvider is async
 futures = "0.3"                                       # drive object_store's list streams
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.7"
