@@ -16,6 +16,14 @@ use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Two rustls CryptoProviders live in the dependency graph (kube -> ring,
+    // aws-config -> aws-lc-rs), so rustls cannot infer a process default —
+    // pin ring (the security-reviewed choice, see Cargo.toml's kube block)
+    // before any TLS client is built, or kube handshakes panic at runtime.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("installing the rustls ring CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             // aws_config narrates every credential-chain resolution (including

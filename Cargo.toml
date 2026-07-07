@@ -48,6 +48,11 @@ object_store = { version = "0.12", features = ["aws", "gcp"] }
 aws-config = "1"
 aws-credential-types = "1"
 async-trait = "0.1"                                   # object_store::CredentialProvider is async
+# Already in the graph twice over (kube brings rustls/ring, the AWS stack
+# brings rustls/aws-lc-rs) — restated directly because with BOTH provider
+# features present rustls refuses to infer a process default, and every kube
+# TLS handshake panics at runtime unless main() installs ring explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures = "0.3"                                       # drive object_store's list streams
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.7"

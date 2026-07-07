@@ -1150,6 +1150,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "object_store",
+ "rustls",
  "semver",
  "serde",
  "serde_json",
