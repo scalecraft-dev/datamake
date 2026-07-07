@@ -50,7 +50,14 @@ echo "==> running the release gate (fmt-check + clippy + tests)"
 make check
 
 echo "==> committing, tagging, and pushing $VERSION"
-git commit -am "Release $VERSION"
+# The stamp may already be committed (e.g. a previous attempt died in the
+# gate and the fix-up commit carried it) — an empty commit is not an error,
+# the tag just lands on HEAD as-is.
+if git diff --quiet && git diff --cached --quiet; then
+  echo "    version stamp already committed; tagging HEAD"
+else
+  git commit -am "Release $VERSION"
+fi
 git tag -a "$VERSION" -m "datamk $VERSION"
 git push origin main "$VERSION"
 
@@ -60,5 +67,5 @@ Release $VERSION pushed. CI is now building and publishing:
   ghcr.io/scalecraft-dev/datamk:$VERSION
   ghcr.io/scalecraft-dev/datamk:latest
   GitHub Release $VERSION with host binaries (macOS arm64, Linux x86_64/arm64)
-Watch it: gh run watch --repo scalecraft-dev/datamk \$(gh run list --repo scalecraft-dev/datamk --workflow base-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+Watch it: gh run watch --repo scalecraft-dev/datamake \$(gh run list --repo scalecraft-dev/datamake --workflow base-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')
 EOF
