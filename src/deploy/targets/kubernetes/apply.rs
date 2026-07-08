@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{ListParams, LogParams, Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, LogParams, Patch, PatchParams};
 use kube::core::NamespaceResourceScope;
 use kube::{Api, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
@@ -86,7 +86,22 @@ pub(crate) async fn apply_and_wait_init(
     job: &Job,
     timeout_secs: u64,
 ) -> Result<AppliedObject> {
-    let applied = apply_one(client, namespace, "Job", job).await?;
+    let applied = match apply_one(client, namespace, "Job", job).await {
+        Ok(a) => a,
+        // A Job's pod template is immutable, and the init Job's content-hashed
+        // name doesn't cover everything in its template (notably the image),
+        // so a leftover Job from a previous deploy can collide with SSA here.
+        // The old template is outdated by definition — replace the Job.
+        Err(e) if is_immutable_error(&e) => {
+            let name = job.metadata.name.as_deref().unwrap_or_default();
+            eprintln!(
+                "  replacing  Job {name} (pod template changed; Job templates are immutable)"
+            );
+            delete_job_and_wait_gone(client, namespace, name).await?;
+            apply_one(client, namespace, "Job", job).await?
+        }
+        Err(e) => return Err(e),
+    };
     let name = &applied.name;
 
     let api: Api<Job> = Api::namespaced(client.clone(), namespace);
@@ -129,6 +144,54 @@ pub(crate) async fn apply_and_wait_init(
         }
 
         sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Whether an apply error is Kubernetes rejecting a mutation of an immutable
+/// field (HTTP 422 Invalid, "field is immutable") — for Jobs, the pod
+/// template. Matched on the API error itself, not our context strings, so
+/// wrapping doesn't break detection.
+fn is_immutable_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<kube::Error>(),
+            Some(kube::Error::Api(ae)) if ae.code == 422 && ae.message.contains("field is immutable")
+        )
+    })
+}
+
+/// Delete a Job (foreground propagation: its Pods go first) and wait until the
+/// API server reports it fully gone — re-applying before the finalizer clears
+/// would just hit the same immutable-template rejection again.
+async fn delete_job_and_wait_gone(
+    client: &kube::Client,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    let api: Api<Job> = Api::namespaced(client.clone(), namespace);
+    api.delete(name, &DeleteParams::foreground())
+        .await
+        .with_context(|| {
+            format!("deleting outdated init Job '{name}' in namespace '{namespace}'")
+        })?;
+
+    // Foreground deletion is bounded by pod termination grace (30s default);
+    // 120s covers a slow kubelet without hanging a broken deploy forever.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match api.get_opt(name).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) if Instant::now() >= deadline => bail!(
+                "outdated init Job '{name}' in namespace '{namespace}' is still terminating after \
+                 120s; retry the deploy once it is gone (`kubectl -n {namespace} get job {name}`)"
+            ),
+            Ok(Some(_)) => sleep(POLL_INTERVAL).await,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("waiting for init Job '{name}' deletion in namespace '{namespace}'")
+                })
+            }
+        }
     }
 }
 
@@ -204,4 +267,42 @@ where
         name,
         namespace: Some(namespace.to_string()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_error(code: u16, message: &str) -> anyhow::Error {
+        let status = serde_json::from_value(serde_json::json!({
+            "status": "Failure",
+            "message": message,
+            "reason": "Invalid",
+            "code": code,
+        }))
+        .unwrap();
+        // The real call site wraps the kube error in context strings; detection
+        // must survive that.
+        anyhow::Error::new(kube::Error::Api(status))
+            .context("server-side applying Job 'x' in namespace 'y'")
+    }
+
+    #[test]
+    fn immutable_template_rejection_is_detected_through_context() {
+        let e = api_error(
+            422,
+            "Job.batch \"x\" is invalid: spec.template: ... field is immutable",
+        );
+        assert!(is_immutable_error(&e));
+    }
+
+    #[test]
+    fn other_api_errors_are_not_misclassified() {
+        assert!(!is_immutable_error(&api_error(409, "conflict")));
+        assert!(!is_immutable_error(&api_error(
+            422,
+            "spec.foo: Required value"
+        )));
+        assert!(!is_immutable_error(&anyhow::anyhow!("field is immutable"))); // text alone isn't proof
+    }
 }
