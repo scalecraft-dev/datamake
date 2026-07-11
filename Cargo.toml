@@ -1,6 +1,6 @@
 [package]
 name = "datamk"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 description = "Build, verify, release, and serve data cells"
 license = "Apache-2.0"
