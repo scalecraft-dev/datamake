@@ -129,9 +129,9 @@ fn serve_fails_loud_on_missing_principals() {
             "serve",
             "-f",
             "cell.yaml",
-            "-P",
-            "missing-principals",
             "-p",
+            "missing-principals",
+            "--port",
             "18091",
         ],
     );

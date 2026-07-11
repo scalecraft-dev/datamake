@@ -172,10 +172,10 @@ pub struct ServeArgs {
     #[arg(short, long, default_value = "cell.yaml")]
     pub file: PathBuf,
     /// Binding profile to use (reads profiles/<name>.yaml)
-    #[arg(short = 'P', long, default_value = "local")]
+    #[arg(short, long, default_value = "local")]
     pub profile: String,
     /// Port to bind
-    #[arg(short, long, default_value_t = 8080)]
+    #[arg(long, default_value_t = 8080)]
     pub port: u16,
     /// Seconds between LATEST-pointer checks in published-artifact mode — the
     /// staleness bound for experimental "latest" routes (ADR 0004). Ignored in
