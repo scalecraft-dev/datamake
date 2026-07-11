@@ -266,10 +266,13 @@ fn load_catalog_extension(conn: &Connection, catalog: &str) -> Result<()> {
     Ok(())
 }
 
-/// Register an S3 secret in DuckDB's Secrets Manager. With explicit key/secret we
-/// use static credentials; otherwise DuckDB's `credential_chain` provider resolves
-/// AWS env vars, shared profiles, and IAM roles — no secrets in the cell config.
-fn create_s3_secret(conn: &Connection, s3: Option<&ResolvedS3>) -> Result<()> {
+/// The option list for a DuckDB S3 secret, from the profile's `s3:` block.
+/// With explicit key/secret (and optionally a session token) we use static
+/// credentials; otherwise DuckDB's `credential_chain` provider resolves AWS
+/// env vars, shared profiles, and IAM roles — no secrets in the cell config.
+/// Shared between the engine's own secret (below) and `datamk attach`'s
+/// printed SQL, so the two can never describe different credentials.
+pub(crate) fn s3_secret_options(s3: Option<&ResolvedS3>) -> String {
     let mut parts = vec!["TYPE s3".to_string()];
     let s3 = s3.cloned().unwrap_or(ResolvedS3 {
         region: None,
@@ -305,10 +308,14 @@ fn create_s3_secret(conn: &Connection, s3: Option<&ResolvedS3>) -> Result<()> {
     if let Some(ssl) = s3.use_ssl {
         parts.push(format!("USE_SSL {ssl}"));
     }
+    parts.join(", ")
+}
 
+/// Register an S3 secret in DuckDB's Secrets Manager (see `s3_secret_options`).
+fn create_s3_secret(conn: &Connection, s3: Option<&ResolvedS3>) -> Result<()> {
     conn.execute_batch(&format!(
         "CREATE OR REPLACE SECRET __cell_s3 ({});",
-        parts.join(", ")
+        s3_secret_options(s3)
     ))
     .context("creating S3 secret")?;
     Ok(())
@@ -1348,13 +1355,13 @@ fn resolve_source_uri(uri: &str, dir: &Path) -> String {
     }
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('\'', "''")
 }
 
 /// Resolve the storage URI. Local relative paths are made absolute against the
 /// cell directory and created; remote URIs pass through untouched.
-fn resolve_storage(s: &str, dir: &Path) -> Result<String> {
+pub(crate) fn resolve_storage(s: &str, dir: &Path) -> Result<String> {
     if let Some(rest) = s.strip_prefix("file://") {
         return resolve_local(rest, dir, /* is_dir */ true);
     }
@@ -1367,7 +1374,7 @@ fn resolve_storage(s: &str, dir: &Path) -> Result<String> {
 /// Resolve the catalog binding. `sqlite:` DSNs pass through as-is; `postgres://`
 /// DSNs are translated to the libpq keyword string DuckLake actually expects
 /// (see `postgres_url_to_ducklake`); anything else is a local catalog file path.
-fn resolve_catalog(s: &str, dir: &Path) -> Result<String> {
+pub(crate) fn resolve_catalog(s: &str, dir: &Path) -> Result<String> {
     if s.starts_with("postgres://") {
         return postgres_url_to_ducklake(s);
     }

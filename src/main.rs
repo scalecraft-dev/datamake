@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         Command::Deploy(a) => deploy::run(&a).await,
         Command::Serve(a) => serve::run(&a.file, &a.profile, a.port, a.poll_interval).await,
         Command::Status(a) => ops::status(&a.file, &a.profile),
+        Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution),
         Command::Rollback(a) => ops::rollback(&a.file, &a.profile, a.execution),
         Command::Publish(a) => {
             eprintln!("publish has been renamed to `release` (it pins the supported snapshot).");

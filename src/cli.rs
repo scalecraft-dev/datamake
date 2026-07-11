@@ -1,12 +1,35 @@
 use crate::config::Target;
+use clap::builder::styling::{Effects, RgbColor, Styles};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+
+// Monokai palette, minus the hot pink: purple carries the headers,
+// green the names, italic cyan the placeholders.
+const GREEN: RgbColor = RgbColor(0xA6, 0xE2, 0x2E);
+const CYAN: RgbColor = RgbColor(0x66, 0xD9, 0xEF);
+const ORANGE: RgbColor = RgbColor(0xFD, 0x97, 0x1F);
+const PURPLE: RgbColor = RgbColor(0xAE, 0x81, 0xFF);
+const YELLOW: RgbColor = RgbColor(0xE6, 0xDB, 0x74);
+
+// Help/error color theme. clap only emits these on a tty and honors
+// NO_COLOR, so piped output stays clean.
+const STYLES: Styles = Styles::styled()
+    .header(PURPLE.on_default().effects(Effects::BOLD))
+    .usage(PURPLE.on_default().effects(Effects::BOLD))
+    .literal(GREEN.on_default().effects(Effects::BOLD))
+    .placeholder(CYAN.on_default().effects(Effects::ITALIC))
+    .error(PURPLE.on_default().effects(Effects::BOLD))
+    .valid(GREEN.on_default().effects(Effects::BOLD))
+    .invalid(ORANGE.on_default().effects(Effects::BOLD))
+    .context(YELLOW.on_default())
+    .context_value(CYAN.on_default());
 
 #[derive(Parser)]
 #[command(
     name = "datamk",
     version,
-    about = "the cell — reduce time to value for data"
+    about = "Manage your data products — build, verify, release, and serve",
+    styles = STYLES
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -29,6 +52,9 @@ pub enum Command {
     Serve(ServeArgs),
     /// Show the published executions and the LATEST pointer (published-artifact profiles)
     Status(FileArgs),
+    /// Print ready-to-run SQL that attaches the cell's catalog in DuckDB
+    /// (read-only). Pipe it: duckdb -c "$(datamk attach -p prod) SELECT ..."
+    Attach(AttachArgs),
     /// Roll back the served DATA to an earlier execution by repointing LATEST.
     /// (To roll back a version/code change, use your orchestrator's rollout undo.)
     Rollback(RollbackArgs),
@@ -36,6 +62,21 @@ pub enum Command {
     /// Deprecated alias for `release`; kept for one release.
     #[command(hide = true)]
     Publish(FileArgs),
+}
+
+#[derive(Args)]
+pub struct AttachArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml)
+    #[arg(short, long, default_value = "local")]
+    pub profile: String,
+    /// Attach a specific published execution instead of what LATEST names.
+    /// Caveat: superseded artifacts survive rollbacks as immutable dead
+    /// branches — pinning one can show data a rollback retired.
+    #[arg(long)]
+    pub execution: Option<u64>,
 }
 
 #[derive(Args)]

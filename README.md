@@ -142,6 +142,7 @@ must be replay-safe (an anti-join or `MERGE`, never `CREATE OR REPLACE`). See
 | `datamk release` | Pin the current snapshot as the supported contract. |
 | `datamk serve` | Serve the interface as REST + OpenAPI. |
 | `datamk deploy` | Run the cell as managed workloads on an orchestrator. |
+| `datamk attach` | Print SQL that attaches the cell's catalog in DuckDB, read-only. |
 
 ---
 

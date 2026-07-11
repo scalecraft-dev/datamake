@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::config;
 use crate::engine;
-use crate::store::{latest_content, Store, LATEST_KEY};
+use crate::store::{execution_key, latest_content, Store, LATEST_KEY};
 
 /// Load the profile and build the cell's store handle; both commands only make
 /// sense for published-artifact profiles.
@@ -589,9 +589,185 @@ fn format_rollback_lines(items: &[(String, RollbackChange)], target_execution: u
         .collect()
 }
 
+/// `datamk attach`: print ready-to-run SQL that attaches the cell's catalog
+/// in DuckDB, read-only. stdout carries ONLY SQL — one statement per line —
+/// so `duckdb -c "$(datamk attach ...) SELECT ..."` composes; resolution
+/// notes go to stderr. The attach mirrors the engine's own (same resolved
+/// paths, same DATA_PATH, same secret options via `engine::s3_secret_options`)
+/// so the printed recipe can never drift from what datamk itself does.
+pub fn attach(file: &Path, profile: &str, execution: Option<u64>) -> Result<()> {
+    let loaded = config::load(file, profile)?;
+    let alias = sanitize_ident(&loaded.def.cell);
+    let storage = engine::resolve_storage(&loaded.bindings.storage, &loaded.dir)?;
+
+    // Direct-attach (local dev) profiles: a `catalog:` and no published
+    // executions — attach that catalog exactly as the engine would.
+    if let Some(c) = &loaded.bindings.catalog {
+        if let Some(n) = execution {
+            bail!(
+                "profiles/{profile}.yaml sets `catalog:` (direct-attach mode) — there are no \
+                 published executions to pin, so --execution {n} does not apply here"
+            );
+        }
+        let catalog = engine::resolve_catalog(c, &loaded.dir)?;
+        if !config::is_metadata_db_catalog(&catalog) && !Path::new(&catalog).exists() {
+            bail!(
+                "no catalog at {catalog} — run `datamk run -f {} -p {profile}` first",
+                file.display()
+            );
+        }
+        print_attach_sql(&alias, &catalog, &storage, &loaded.bindings);
+        eprintln!(
+            "attach: cell '{}' profile '{profile}' (direct-attach catalog)",
+            loaded.def.cell
+        );
+        return Ok(());
+    }
+
+    // Published-artifact profiles (ADR 0004): resolve the artifact to attach.
+    if !config::is_remote(&storage) {
+        bail!(
+            "the profile has no `catalog:` (published-artifact mode), but storage `{storage}` \
+             is not an object store — nothing published to attach. For local development set \
+             `catalog:` (e.g. ./.cell/catalog.ducklake)."
+        );
+    }
+    let store = Store::for_storage(&storage, loaded.bindings.s3.as_ref())?;
+    let n = match execution {
+        Some(n) => {
+            let executions = store.list_executions()?;
+            if !executions.contains(&n) {
+                let range = match (executions.first(), executions.last()) {
+                    (Some(f), Some(l)) => format!("{f}..{l} ({} published)", executions.len()),
+                    _ => "none published".to_string(),
+                };
+                bail!("execution {n} does not exist; available: {range}");
+            }
+            eprintln!(
+                "attach: pinning execution {n} — a rollback may have retired it; LATEST is the \
+                 served view"
+            );
+            n
+        }
+        None => store.latest()?.with_context(|| {
+            format!(
+                "no LATEST pointer under {storage} — nothing published yet; run `datamk run -f \
+                 {} -p {profile}` first",
+                file.display()
+            )
+        })?,
+    };
+
+    let catalog = format!("{}/{}", storage.trim_end_matches('/'), execution_key(n));
+    let data_path = format!("{storage}/data");
+    print_attach_sql(&alias, &catalog, &data_path, &loaded.bindings);
+    eprintln!(
+        "attach: cell '{}' profile '{profile}' -> execution {n}{}",
+        loaded.def.cell,
+        if execution.is_none() { " (LATEST)" } else { "" }
+    );
+    Ok(())
+}
+
+/// The SQL itself (stdout): a namespaced S3 secret when anything attached is
+/// on S3 (same options the engine registers for itself), then the read-only
+/// ATTACH with the engine's explicit DATA_PATH.
+fn print_attach_sql(alias: &str, catalog: &str, data_path: &str, b: &config::ResolvedBindings) {
+    print!("{}", attach_sql(alias, catalog, data_path, b.s3.as_ref()));
+}
+
+/// Pure builder (testable without a store): one `;`-terminated statement per
+/// line, nothing but SQL.
+fn attach_sql(
+    alias: &str,
+    catalog: &str,
+    data_path: &str,
+    s3: Option<&config::ResolvedS3>,
+) -> String {
+    let mut out = String::new();
+    if catalog.starts_with("s3://") || data_path.starts_with("s3://") {
+        out.push_str(&format!(
+            "CREATE OR REPLACE SECRET datamk_{alias} ({});\n",
+            engine::s3_secret_options(s3)
+        ));
+    }
+    out.push_str(&format!(
+        "ATTACH 'ducklake:{}' AS {alias} (DATA_PATH '{}', READ_ONLY);\n",
+        engine::esc(catalog),
+        engine::esc(data_path)
+    ));
+    out
+}
+
+/// A cell name as a DuckDB identifier: `weather-kube` -> `weather_kube`.
+fn sanitize_ident(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() || s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        s.insert(0, '_');
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- attach ------------------------------------------------------------
+
+    #[test]
+    fn sanitize_ident_maps_cell_names_to_duckdb_identifiers() {
+        assert_eq!(sanitize_ident("weather-kube"), "weather_kube");
+        assert_eq!(sanitize_ident("orders"), "orders");
+        assert_eq!(sanitize_ident("1st.cell"), "_1st_cell");
+    }
+
+    #[test]
+    fn attach_sql_on_s3_prints_chain_secret_then_pinned_readonly_attach() {
+        let s3 = config::ResolvedS3 {
+            region: Some("us-west-2".to_string()),
+            endpoint: None,
+            url_style: None,
+            key_id: None,
+            secret: None,
+            session_token: None,
+            use_ssl: None,
+        };
+        let sql = attach_sql(
+            "weather_kube",
+            "s3://bkt/cells/weather-kube/catalog/executions/00000008.ducklake",
+            "s3://bkt/cells/weather-kube/data",
+            Some(&s3),
+        );
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE SECRET datamk_weather_kube (TYPE s3, PROVIDER credential_chain, \
+             REGION 'us-west-2');\n\
+             ATTACH 'ducklake:s3://bkt/cells/weather-kube/catalog/executions/00000008.ducklake' \
+             AS weather_kube (DATA_PATH 's3://bkt/cells/weather-kube/data', READ_ONLY);\n"
+        );
+    }
+
+    #[test]
+    fn attach_sql_local_catalog_has_no_secret() {
+        let sql = attach_sql(
+            "orders",
+            "/abs/.cell/catalog.ducklake",
+            "/abs/.cell/data",
+            None,
+        );
+        assert!(!sql.contains("CREATE OR REPLACE SECRET"), "got: {sql}");
+        assert!(sql.contains("ATTACH 'ducklake:/abs/.cell/catalog.ducklake' AS orders"));
+        assert!(sql.contains("READ_ONLY"));
+    }
 
     // --- group_thousands ---------------------------------------------------
 

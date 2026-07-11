@@ -2,7 +2,7 @@
 name = "datamk"
 version = "0.0.6"
 edition = "2021"
-description = "the cell — reduce time to value for data"
+description = "Build, verify, release, and serve data cells"
 license = "Apache-2.0"
 
 [[bin]]
