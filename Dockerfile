@@ -48,4 +48,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/datamk /usr/local/bin/datamk
+# In-cluster, pod stderr is the log pipeline; a file log under an emptyDir
+# (or worse, no writable volume at all) is an ephemeral-storage eviction
+# vector (ADR 0004 §6) for a record nothing else reads. Disable the
+# persistent-file-log feature in the deployed image; a local/dev invocation
+# of this same binary outside the image still gets it by default.
+ENV DATAMK_LOG=off
 ENTRYPOINT ["datamk"]

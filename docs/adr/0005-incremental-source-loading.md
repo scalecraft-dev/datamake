@@ -571,7 +571,11 @@ LATEST 7 -> 5
   reduction — if the predicate does not push, "incremental" degrades to
   full-scan-then-local-stage, which is *worse* than today, and the feature
   does not ship for that connector until it pushes or the degradation is
-  loudly documented per connector.
+  loudly documented per connector. (For **view-backed sources** read via
+  the jobs API, this precondition cannot be satisfied by construction:
+  the predicate is evaluated server-side, so bytes *returned* scale with
+  the delta, but bytes *scanned/billed* depend on the view's own SQL —
+  ADR 0006 documents that degradation per this clause.)
 - Two moments still cost a full scan by design and are labeled as such in
   docs: **bootstrap** (first run, or first run after adding
   `incremental:`) and every **`--full-refresh`**. Neither is a surprise

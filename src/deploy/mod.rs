@@ -61,9 +61,12 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
     // with the build pod's logs). Only a store that *answers* and proves
     // non-enforcement fails the deploy here. Skipped on --dry-run.
     if !args.dry_run {
-        let probe =
-            crate::store::Store::for_storage(&loaded.bindings.storage, loaded.bindings.s3.as_ref())
-                .and_then(|store| store.probe_conditional_put());
+        let probe = crate::store::Store::for_storage(
+            &loaded.bindings.storage,
+            loaded.bindings.s3.as_ref(),
+            loaded.bindings.gcs.as_ref(),
+        )
+        .and_then(|store| store.probe_conditional_put());
         match probe {
             Ok(crate::store::ProbeOutcome::Enforced) => {
                 tracing::info!("conditional-PUT capability probe passed");

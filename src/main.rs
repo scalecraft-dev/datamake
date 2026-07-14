@@ -3,11 +3,13 @@ mod config;
 mod deploy;
 mod engine;
 mod init;
+mod logging;
 mod manifest;
 mod ops;
 mod release;
 mod serve;
 mod store;
+mod timeutil;
 mod verify;
 
 use anyhow::Result;
@@ -24,16 +26,44 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("installing the rustls ring CryptoProvider");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            // aws_config narrates every credential-chain resolution (including
-            // access key ids) at INFO; that's RUST_LOG territory, not default output.
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,aws_config=warn".into()),
-        )
-        .init();
+    let cli = Cli::parse();
 
-    match Cli::parse().command {
+    // Console layer always; a second file layer for producer commands
+    // (run/release/rollback/deploy) unless DATAMK_LOG=off or the log dir
+    // can't be opened — see `logging` for the filter policy (the file sink
+    // pins credential-narrating targets even under a hostile RUST_LOG).
+    // Installed exactly once, before dispatch, as before.
+    let log_path = logging::init(&cli.command, cli.log_dir.as_deref(), cli.log_keep);
+
+    let result = dispatch(cli.command).await;
+
+    // Discoverability (one stderr line per file-logging invocation): the
+    // error itself already reached stderr via the branch below, or (on
+    // success) nothing has been said about the log file yet.
+    match &result {
+        Ok(()) => {
+            if let Some(path) = &log_path {
+                eprintln!("log: {}", path.display());
+            }
+        }
+        Err(e) => {
+            // Mirrors the default `Termination` impl's error rendering so
+            // failure output is unchanged when there's no file log; printed
+            // here (rather than left to the runtime) so the "See the full
+            // run log" line can follow it.
+            eprintln!("Error: {e:?}");
+            if let Some(path) = &log_path {
+                eprintln!("See the full run log: {}", path.display());
+            }
+            std::process::exit(1);
+        }
+    }
+
+    result
+}
+
+async fn dispatch(command: Command) -> Result<()> {
+    match command {
         Command::Init(a) => init::run(a),
         Command::Run(a) => {
             // Hidden test hook: DATAMK_RETENTION_SECONDS lets harnesses
@@ -56,7 +86,7 @@ async fn main() -> Result<()> {
         Command::Deploy(a) => deploy::run(&a).await,
         Command::Serve(a) => serve::run(&a.file, &a.profile, a.port, a.poll_interval).await,
         Command::Status(a) => ops::status(&a.file, &a.profile),
-        Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution),
+        Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution, a.download),
         Command::Rollback(a) => ops::rollback(&a.file, &a.profile, a.execution),
         Command::Publish(a) => {
             eprintln!("publish has been renamed to `release` (it pins the supported snapshot).");

@@ -26,7 +26,7 @@ name = "integrations"
 path = "test/integrations/cli.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] } # "env": --log-dir/--log-keep env fallbacks
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"

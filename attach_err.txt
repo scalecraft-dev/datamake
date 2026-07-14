@@ -1,0 +1,1 @@
+attach: cell 'proof_cell' profile 'local' (direct-attach catalog)

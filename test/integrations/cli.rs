@@ -80,6 +80,92 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// `run` writes a persistent file log under `.cell/logs/` and prints its
+/// path on stderr — the two discoverability halves of the feature: the file
+/// itself, and the one line that says where it went.
+#[test]
+fn run_writes_a_log_file_and_prints_its_path() {
+    let dir = fixture("orders", "logfile");
+    let out = run_ok(&dir, &["run", "-f", "cell.yaml", "-p", "local"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let log_line = stderr
+        .lines()
+        .find(|l| l.starts_with("log: "))
+        .unwrap_or_else(|| panic!("expected a `log:` line on stderr, got: {stderr}"));
+    let printed_path = log_line.trim_start_matches("log: ").trim();
+    let log_path = dir.join(printed_path.trim_start_matches("./"));
+    assert!(
+        log_path.exists(),
+        "log file {log_path:?} (printed as {printed_path:?}) does not exist"
+    );
+
+    let name = log_path.file_name().unwrap().to_string_lossy();
+    assert!(
+        name.starts_with("datamk_run_") && name.ends_with(".log"),
+        "unexpected log filename: {name}"
+    );
+    assert!(
+        log_path.starts_with(dir.join(".cell/logs")),
+        "log file must default under .cell/logs: {log_path:?}"
+    );
+
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        content.contains("running pipeline") && content.contains("pipeline complete"),
+        "log file missing expected narration lines: {content}"
+    );
+    assert!(
+        !content.contains('\u{1b}'),
+        "file log must carry no ANSI escapes (with_ansi(false)): {content:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `verify`/`status` never write a file log — only the four producer
+/// commands do (`run`/`release`/`rollback`/`deploy`).
+#[test]
+fn verify_and_status_never_write_a_log_file() {
+    let dir = fixture("orders", "logfile-excluded");
+    run_ok(&dir, &["run", "-f", "cell.yaml", "-p", "local"]);
+    let after_run = std::fs::read_dir(dir.join(".cell/logs")).unwrap().count();
+    assert_eq!(
+        after_run, 1,
+        "run itself should have written exactly one log"
+    );
+
+    run_ok(&dir, &["verify", "-f", "cell.yaml", "-p", "local"]);
+    let after_verify = std::fs::read_dir(dir.join(".cell/logs")).unwrap().count();
+    assert_eq!(after_verify, 1, "verify must not add a log file");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `DATAMK_LOG=off` disables file logging outright; no `.cell/logs` at all.
+#[test]
+fn datamk_log_off_disables_file_logging_entirely() {
+    let dir = fixture("orders", "logfile-off");
+    let out = Command::new(bin())
+        .current_dir(&dir)
+        .args(["run", "-f", "cell.yaml", "-p", "local"])
+        .env("DATAMK_LOG", "off")
+        .output()
+        .expect("spawning datamk");
+    assert!(out.status.success(), "run should still succeed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("log: ")),
+        "no `log:` line expected under DATAMK_LOG=off, got: {stderr}"
+    );
+    assert!(
+        !dir.join(".cell/logs").exists(),
+        ".cell/logs must not be created under DATAMK_LOG=off"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `release` pins the supported snapshot into `.cell/published.json`.
 #[test]
 fn release_pins_supported_snapshot() {
@@ -222,7 +308,53 @@ fn init_scaffolds_deploy_overlay_and_runnable_cell() {
     let gitignore = std::fs::read_to_string(target.join(".gitignore")).unwrap();
     assert!(gitignore.contains("deploy/ is tracked"), "{gitignore}");
 
-    // The scaffolded cell builds locally (paths resolve to the cell dir, not cwd).
+    // The scaffold is 100% declarative (ADR 0008: one language — every sql/
+    // file is a bare SELECT; every table-building decision lives in
+    // cell.yaml, never hand-written DDL). stg_orders.sql and orders_daily.sql
+    // are bare-path entries (`materialize: replace` implied — full rebuild
+    // each run, legal here: no incremental source); order_totals.sql is an
+    // explicit `materialize: upsert` mapping (an accumulator, demonstrating
+    // the other shape) alongside them.
+    let cell_yaml = std::fs::read_to_string(target.join("cell.yaml")).unwrap();
+    assert!(cell_yaml.contains("materialize: upsert"), "{cell_yaml}");
+    assert!(cell_yaml.contains("sql/stg_orders.sql"), "{cell_yaml}");
+    assert!(cell_yaml.contains("sql/orders_daily.sql"), "{cell_yaml}");
+    assert!(cell_yaml.contains("sql/order_totals.sql"), "{cell_yaml}");
+    // Only the live `transforms:` block matters here — the commented-out
+    // `sources:` prose above it mentions `materialize: replace` by name as
+    // documentation, which is fine; it's not a `transforms:` entry.
+    let transforms_block = cell_yaml
+        .split("transforms:")
+        .nth(1)
+        .and_then(|s| s.split("interface:").next())
+        .unwrap_or_default();
+    assert!(
+        !transforms_block.contains("materialize: replace"),
+        "stg_orders.sql/orders_daily.sql are bare paths now — replace is implied, not spelled \
+         out in the transforms: block: {transforms_block}"
+    );
+    for f in ["stg_orders.sql", "order_totals.sql", "orders_daily.sql"] {
+        let path = target.join("sql").join(f);
+        assert!(path.exists(), "sql/{f}");
+        let sql = std::fs::read_to_string(&path).unwrap();
+        // Strip `--` comment lines before checking — the comments legitimately
+        // explain what cell.yaml's `materialize:` wraps this SELECT in, which
+        // mentions CREATE OR REPLACE by name; the code itself must not.
+        let code: String = sql
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.to_uppercase().contains("CREATE"),
+            "sql/{f} must be SELECT-only, zero hand-written DDL — got code: {code}"
+        );
+    }
+
+    // The scaffolded cell builds locally (paths resolve to the cell dir, not
+    // cwd) — and it exercises every declarative entry for real: `run`
+    // composes and executes the staging/bootstrap/strategy DML (or the
+    // single `replace` statement) over each of the three sql/ files.
     let run = Command::new(bin())
         .arg("run")
         .arg("-f")
@@ -234,6 +366,38 @@ fn init_scaffolds_deploy_overlay_and_runnable_cell() {
         run.status.success(),
         "scaffolded cell failed to run: {}",
         String::from_utf8_lossy(&run.stderr)
+    );
+
+    // A second run — replay-safety by construction (ADR 0008 §3): the
+    // declarative accumulator must not error, and must not duplicate rows,
+    // on an identical re-delivery of the same synthesized demo data.
+    let run2 = Command::new(bin())
+        .arg("run")
+        .arg("-f")
+        .arg(target.join("cell.yaml"))
+        .args(["-p", "local"])
+        .output()
+        .expect("spawning datamk run (second run)");
+    assert!(
+        run2.status.success(),
+        "scaffolded cell's declarative entry failed on a second run (idempotent re-delivery): {}",
+        String::from_utf8_lossy(&run2.stderr)
+    );
+
+    // `datamk verify` must pass against the built snapshot too — the whole
+    // interface, including the `orders_daily` export (sourced from a bare-path
+    // replace rollup), unaffected by the upsert entry interleaved ahead of it.
+    let verify = Command::new(bin())
+        .arg("verify")
+        .arg("-f")
+        .arg(target.join("cell.yaml"))
+        .args(["-p", "local"])
+        .output()
+        .expect("spawning datamk verify");
+    assert!(
+        verify.status.success(),
+        "scaffolded cell failed to verify: {}",
+        String::from_utf8_lossy(&verify.stderr)
     );
 
     let _ = std::fs::remove_dir_all(&target);
@@ -315,12 +479,23 @@ fn deploy_dry_run_never_contacts_a_cluster() {
 // `incremental:` block) actually reach a user running `datamk run`, not just
 // the `src/config` unit tests.
 
-/// `orders` declares no sources at all, so it is a clean "no incremental
-/// sources" fixture. `--full-refresh` must still exit 0 and run completes
-/// normally, but it is not silent about doing nothing.
+/// The true `--full-refresh` no-op needs a cell with **zero transforms and
+/// zero incremental sources** (ADR 0008: every transform is declarative by
+/// construction now, so a cell with any `transforms:` entry always has
+/// something for `--full-refresh` to rebuild — see
+/// `full_refresh_rebuilds_declarative_tables_with_no_incremental_source_present`
+/// below). `orders` used to be this fixture back when a bare-path entry was
+/// a raw transform excluded from the declarative count; it no longer is,
+/// so this test builds its own empty cell instead of reusing `orders`.
 #[test]
-fn full_refresh_is_a_warned_noop_without_incremental_sources() {
-    let dir = fixture("orders", "fullrefreshnoop");
+fn full_refresh_is_a_warned_noop_with_no_transforms_and_no_incremental_sources() {
+    let dir = scratch_dir("fullrefreshnoop");
+    std::fs::write(dir.join("cell.yaml"), "cell: empty\ninterface: []\n").unwrap();
+    std::fs::write(
+        dir.join("profiles/local.yaml"),
+        "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+    )
+    .unwrap();
     let out = run_ok(
         &dir,
         &["run", "-f", "cell.yaml", "-p", "local", "--full-refresh"],
@@ -331,6 +506,49 @@ fn full_refresh_is_a_warned_noop_without_incremental_sources() {
         "expected the no-op warning, got: {log}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR 0008 §6: the `init` scaffold has a declarative `materialize:` entry
+/// but no incremental *source* at all (synthesized local demo data) — the
+/// third `--full-refresh` state. The stale "no effect" warning would lie
+/// here (a real rebuild happens); the engine must say what actually runs
+/// instead.
+#[test]
+fn full_refresh_rebuilds_declarative_tables_with_no_incremental_source_present() {
+    let target = std::env::temp_dir().join(format!(
+        "datamk_it_fullrefresh_declarative_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&target);
+    let init = Command::new(bin())
+        .args(["init", "mycell", "-p"])
+        .arg(&target)
+        .output()
+        .expect("spawning datamk init");
+    assert!(init.status.success(), "{}", combined(&init));
+
+    let out = run_ok(
+        &target,
+        &["run", "-f", "cell.yaml", "-p", "local", "--full-refresh"],
+    );
+    let log = combined(&out);
+    // Three transform entries now (ADR 0008: one language — stg_orders/
+    // orders_daily are bare paths, `replace` implied; order_totals is an
+    // explicit `materialize: upsert` mapping) — all three count towards the
+    // notice, regardless of strategy or syntax.
+    assert!(
+        log.contains(
+            "full refresh: rebuilding 3 declarative table(s) from scratch; no incremental \
+             watermarks to rewind"
+        ),
+        "expected the declarative-rebuild notice, got: {log}"
+    );
+    assert!(
+        !log.contains("--full-refresh has no effect"),
+        "must not claim no effect when a declarative table exists to rebuild: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&target);
 }
 
 /// Same shape as above for `--verify-replay`: no incremental sources means
@@ -462,10 +680,52 @@ fn malformed_incremental_block_typo_fails_datamk_run_with_the_stage1_error() {
     );
     assert!(
         err.contains(
-            "unknown field `incremenetal` — a connection source has `connection`, `table`, \
-             and optional `incremental`"
+            "unknown field `incremenetal` — a connection source has `connection`, one of \
+             `table`/`query`, and optional `incremental`"
         ),
         "expected the Stage-1 unknown-field error text, got: {err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `attach --download` is a native-GCS-extension-only escape hatch; every
+/// other profile shape attaches its catalog directly and must reject the flag.
+#[test]
+fn attach_download_is_rejected_outside_native_gcs_profiles() {
+    let dir = fixture("orders", "attachdl");
+    let out = run(
+        &dir,
+        &["attach", "-f", "cell.yaml", "-p", "local", "--download"],
+    );
+    assert!(
+        !out.status.success(),
+        "--download on a direct-attach profile must be refused"
+    );
+    let err = combined(&out);
+    assert!(
+        err.contains("--download only applies to native-GCS-extension profiles"),
+        "stderr: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `attach --help` documents the native-GCS `--download` contract: local,
+/// machine-specific, pinned copy.
+#[test]
+fn attach_help_documents_download() {
+    let out = Command::new(bin())
+        .args(["attach", "--help"])
+        .output()
+        .expect("spawning datamk attach --help");
+    assert!(out.status.success(), "attach --help must succeed");
+    let help = combined(&out);
+    assert!(help.contains("--download"), "help: {help}");
+    assert!(
+        help.contains("cannot ATTACH a remote catalog file"),
+        "expected the native-extension rationale, got: {help}"
+    );
+    assert!(
+        help.contains("machine-specific"),
+        "expected the locality caveat, got: {help}"
+    );
 }

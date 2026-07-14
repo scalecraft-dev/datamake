@@ -47,7 +47,7 @@ impl CellArtifact {
 
         let mut sql = Vec::with_capacity(def.transforms.len());
         for t in &def.transforms {
-            sql.push(read_artifact(dir, t)?);
+            sql.push(read_artifact(dir, t.file_path())?);
         }
 
         let published = if dir.join(".cell").join("published.json").exists() {

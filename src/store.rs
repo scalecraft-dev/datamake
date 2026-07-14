@@ -22,7 +22,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::config::ResolvedS3;
+use crate::config::{ResolvedGcs, ResolvedS3};
 
 pub const LATEST_KEY: &str = "catalog/LATEST";
 pub const EXECUTIONS_PREFIX: &str = "catalog/executions";
@@ -44,6 +44,22 @@ pub const NOT_ENFORCED_MSG: &str =
 /// numeric ordering.
 pub fn execution_key(n: u64) -> String {
     format!("{EXECUTIONS_PREFIX}/{n:08}.ducklake")
+}
+
+/// The local filename `download_execution` writes for execution N — the
+/// basename of `execution_key`, shared so callers that cache downloads
+/// (`ops::attach --download`) can't drift from the writer.
+pub fn execution_artifact_name(n: u64) -> String {
+    format!("{n:08}.ducklake")
+}
+
+/// The key of execution N's published run summary
+/// (`engine::run_summary::RunSummary`) — denormalized narration written
+/// best-effort alongside the artifact, never truth. Same numbering as
+/// `execution_key`, so the pair rises and falls together; `gc_artifacts`
+/// deletes both when an execution is collected.
+pub fn run_summary_key(n: u64) -> String {
+    format!("{EXECUTIONS_PREFIX}/{n:08}.run.json")
 }
 
 /// The normative `LATEST` content for execution N (ADR 0004 §2): the padded
@@ -114,9 +130,16 @@ pub struct Store {
 
 impl Store {
     /// Build a client for a cell's storage URI (`s3://bucket/pre/fix`,
-    /// `gs://bucket/pre/fix`), configured from the same `s3:` profile block as
-    /// DuckDB's secret (endpoint, url_style, use_ssl, region, keys/ambient).
-    pub fn for_storage(storage: &str, s3: Option<&ResolvedS3>) -> Result<Store> {
+    /// `gs://bucket/pre/fix`), configured from the same profile block as
+    /// DuckDB's secret. For S3 that is full credential parity (endpoint,
+    /// url_style, use_ssl, region, keys/ambient). For GCS the planes split by
+    /// necessity: this client authenticates with OAuth (`gcs.credentials` or
+    /// ambient ADC), while DuckDB's secret uses the HMAC pair.
+    pub fn for_storage(
+        storage: &str,
+        s3: Option<&ResolvedS3>,
+        gcs: Option<&ResolvedGcs>,
+    ) -> Result<Store> {
         let (scheme, rest) = storage
             .split_once("://")
             .with_context(|| format!("storage '{storage}' is not a remote URI"))?;
@@ -183,12 +206,29 @@ impl Store {
                 }
                 Arc::new(b.build().context("building S3 client for storage")?)
             }
-            "gs" | "gcs" => Arc::new(
-                object_store::gcp::GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(bucket)
-                    .build()
-                    .context("building GCS client for storage")?,
-            ),
+            // Conditional PUT (ADR 0004 §5) needs no opt-in here, unlike S3:
+            // object_store's GCS backend implements PutMode::Create natively
+            // via `x-goog-if-generation-match: 0` and maps the 412 to
+            // AlreadyExists. `probe_conditional_put` still verifies at run.
+            "gs" | "gcs" => {
+                let mut b = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                    .with_bucket_name(bucket);
+                // Explicit key file beats ambient ADC — a run with a BigQuery
+                // source sets GOOGLE_APPLICATION_CREDENTIALS process-wide for
+                // its own connector; naming `gcs.credentials` keeps the store
+                // out of that arbitration.
+                if let Some(c) = gcs.and_then(|g| g.credentials.as_ref()) {
+                    b = b.with_service_account_path(c.clone());
+                }
+                Arc::new(b.build().with_context(|| {
+                    format!(
+                        "building GCS client for '{storage}' — credentials come from \
+                         `gcs.credentials` (service-account key path) or the ambient ADC chain \
+                         (GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth application-default \
+                         login`, or workload identity)"
+                    )
+                })?)
+            }
             other => bail!("storage scheme '{other}://' is not a supported object store"),
         };
 
@@ -352,6 +392,25 @@ impl Store {
         })
     }
 
+    /// Delete every object under a relative prefix. Used for the oversized-
+    /// jobs-result `EXPORT DATA` escape hatch (ADR 0006 §3a): a run-scoped
+    /// scratch prefix, deleted once staging from the exported parquet
+    /// succeeds or fails. Callers treat this as best-effort — a failed
+    /// cleanup is a `warn`, never a run failure, because run-scoped paths
+    /// make orphans identifiable and safe to remove later (by hand or an
+    /// object-lifecycle rule).
+    pub fn delete_prefix(&self, rel_prefix: &str) -> Result<()> {
+        let key = self.key(rel_prefix);
+        self.block_on(async {
+            let metas: Vec<_> = self.inner.list(Some(&key)).try_collect().await?;
+            for m in metas {
+                self.inner.delete(&m.location).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .with_context(|| format!("deleting objects under {rel_prefix}"))
+    }
+
     /// The conditional-PUT capability probe (ADR 0004 §3): prove the store
     /// honors create-if-absent. Without it the single-writer guard silently
     /// degrades to last-writer-wins.
@@ -408,7 +467,7 @@ impl Store {
 
     /// Download execution N's artifact into `dest_dir`. Errors if absent.
     pub fn download_execution(&self, n: u64, dest_dir: &Path) -> Result<PathBuf> {
-        let dest = dest_dir.join(format!("{n:08}.ducklake"));
+        let dest = dest_dir.join(execution_artifact_name(n));
         if !self.get_to_file(&execution_key(n), &dest)? {
             bail!("catalog artifact for execution {n} not found in the store");
         }
@@ -420,6 +479,15 @@ impl Store {
     /// `keep` (what `LATEST` names must always survive, however old — a
     /// paused cell must not lose its serving artifact). Returns the deleted
     /// execution numbers. Dead branches from rollbacks age out here too.
+    ///
+    /// The paired run summary (`run_summary_key(n)`, `.run.json`) is
+    /// deleted alongside `execution_key(n)` — an orphaned summary for a
+    /// dead branch must not accumulate. It never drives the scan itself
+    /// (`list_meta` sees both extensions under this prefix, but only
+    /// `.ducklake` entries match `strip_suffix` below and reach the age
+    /// check); an execution with no summary at all (older artifacts, or one
+    /// whose summary write failed) is unaffected — `delete` is a no-op on a
+    /// missing key.
     pub fn gc_artifacts(&self, older_than_unix: i64, keep: &[u64]) -> Result<Vec<u64>> {
         let mut deleted = Vec::new();
         for (name, modified) in self.list_meta(EXECUTIONS_PREFIX)? {
@@ -433,6 +501,7 @@ impl Store {
                 continue;
             }
             self.delete(&execution_key(n))?;
+            self.delete(&run_summary_key(n))?;
             deleted.push(n);
         }
         deleted.sort_unstable();
@@ -551,6 +620,38 @@ mod tests {
     }
 
     #[test]
+    fn gc_deletes_the_paired_run_summary_alongside_its_execution_but_leaves_others_alone() {
+        let s = Store::in_memory();
+        let f = write_temp("datamk_store_gc_run_json", b"catalog");
+        for _ in 0..3 {
+            s.publish_execution(&f).unwrap();
+        }
+        // Only 2 and 3 get a run summary — 1 mimics an older artifact from
+        // before this feature (or a failed summary write), which GC must
+        // treat as a no-op, not an error.
+        s.put(&run_summary_key(2), b"{\"execution\":2}".to_vec())
+            .unwrap();
+        s.put(&run_summary_key(3), b"{\"execution\":3}".to_vec())
+            .unwrap();
+
+        let now_plus = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 60;
+        let deleted = s.gc_artifacts(now_plus, &[3]).unwrap();
+        assert_eq!(deleted, vec![1, 2]);
+
+        // The kept execution's summary survives...
+        assert!(s.get(&run_summary_key(3)).unwrap().is_some());
+        // ...the collected one's summary is gone...
+        assert!(s.get(&run_summary_key(2)).unwrap().is_none());
+        // ...and execution 1, which never had a summary, GC'd cleanly with
+        // no error from the missing-key delete.
+        assert!(s.get(&run_summary_key(1)).unwrap().is_none());
+    }
+
+    #[test]
     fn conditional_put_refuses_an_existing_key() {
         let s = Store::in_memory();
         assert!(s.put_if_absent("k", b"a".to_vec()).unwrap());
@@ -598,16 +699,43 @@ mod tests {
 
     #[test]
     fn for_storage_rejects_non_object_store_uris() {
-        let err = match Store::for_storage("./local/path", None) {
+        let err = match Store::for_storage("./local/path", None, None) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("local path must be rejected"),
         };
         assert!(err.contains("not a remote URI"), "got: {err}");
-        let err = match Store::for_storage("ftp://bucket/x", None) {
+        let err = match Store::for_storage("ftp://bucket/x", None, None) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("ftp scheme must be rejected"),
         };
         assert!(err.contains("not a supported object store"), "got: {err}");
+    }
+
+    #[test]
+    fn delete_prefix_removes_every_object_under_it_and_nothing_else() {
+        let s = Store::in_memory();
+        s.put("scratch/run-1/part-0000.parquet", b"a".to_vec())
+            .unwrap();
+        s.put("scratch/run-1/part-0001.parquet", b"b".to_vec())
+            .unwrap();
+        s.put("scratch/run-2/part-0000.parquet", b"c".to_vec())
+            .unwrap();
+
+        s.delete_prefix("scratch/run-1").unwrap();
+
+        assert!(s.get("scratch/run-1/part-0000.parquet").unwrap().is_none());
+        assert!(s.get("scratch/run-1/part-0001.parquet").unwrap().is_none());
+        assert_eq!(
+            s.get("scratch/run-2/part-0000.parquet").unwrap(),
+            Some(b"c".to_vec()),
+            "a sibling run's prefix must survive"
+        );
+    }
+
+    #[test]
+    fn delete_prefix_of_a_nonexistent_prefix_is_a_noop() {
+        let s = Store::in_memory();
+        s.delete_prefix("scratch/never-existed").unwrap();
     }
 
     #[test]

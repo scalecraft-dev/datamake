@@ -1,0 +1,1 @@
+ATTACH 'ducklake:/private/tmp/claude-501/-Users-scottypate-Dropbox-github-com-scalecraft-datamake/682b1779-8053-4d36-ad66-1a5b503ef42b/scratchpad/proof_cell/.cell/catalog.ducklake' AS proof_cell (DATA_PATH '/private/tmp/claude-501/-Users-scottypate-Dropbox-github-com-scalecraft-datamake/682b1779-8053-4d36-ad66-1a5b503ef42b/scratchpad/proof_cell/.cell/data', READ_ONLY);

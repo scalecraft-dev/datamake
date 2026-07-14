@@ -34,6 +34,18 @@ const STYLES: Styles = Styles::styled()
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+
+    /// Directory for run logs. Every invocation writes one plain-text log
+    /// (datamk_<command>_<UTC-timestamp>.log) — the durable record of source
+    /// routing, bytes scanned, staged row counts, and watermark moves that
+    /// otherwise scroll past in the terminal. Defaults to .cell/logs under
+    /// the cell directory.
+    #[arg(long, global = true, env = "DATAMK_LOG_DIR")]
+    pub log_dir: Option<PathBuf>,
+
+    /// Keep only the newest N log files; older ones are pruned at startup.
+    #[arg(long, global = true, default_value_t = 20, env = "DATAMK_LOG_KEEP")]
+    pub log_keep: u32,
 }
 
 #[derive(Subcommand)]
@@ -77,6 +89,13 @@ pub struct AttachArgs {
     /// branches — pinning one can show data a rollback retired.
     #[arg(long)]
     pub execution: Option<u64>,
+    /// Native-GCS-extension profiles only: fetch the resolved execution to
+    /// <cell>/.cell/attach/ and print an ATTACH of that LOCAL copy. Required
+    /// because a native GCS extension cannot ATTACH a remote catalog file.
+    /// The copy is machine-specific and pinned — it will not track new
+    /// executions; re-run to refresh. Delete .cell/attach/ to reclaim space.
+    #[arg(long)]
+    pub download: bool,
 }
 
 #[derive(Args)]

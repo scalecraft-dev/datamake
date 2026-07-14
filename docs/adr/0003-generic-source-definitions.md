@@ -159,7 +159,9 @@ Invariants every connector upholds:
   keeps `cell.yaml` a complete, reviewable input manifest: lineage without
   parsing SQL, table typos caught at resolve time instead of mid-transaction,
   and `dataset.table` named in one place so transform SQL stays portable
-  across environments.
+  across environments. (The pushdown half of this argument holds for
+  storage-scannable base tables only — jobs-API-routed objects have no
+  scanner to push into; see ADR 0006.)
 - **Read-through semantics.** Each `run` reads the source through the scanner
   at query time. Projections and filters written in transform SQL push down
   (through the inlined view) where the extension supports it; there is no
@@ -189,7 +191,9 @@ Invariants every connector upholds:
 ### 5. First connector: BigQuery
 
 Realized via the DuckDB community `bigquery` extension (which reads through
-the BigQuery Storage Read API):
+the BigQuery Storage Read API — for **base tables**; the Storage Read API
+cannot read views, materialized views, or external tables, which route
+through the jobs API instead, per ADR 0006):
 
 - **Config** (`type: bigquery`): `project` (required — the project whose
   datasets are read), `billing_project` (optional — where query/read costs
@@ -268,7 +272,9 @@ Folding it in is considered and deferred below.
   `cell.yaml` raises portability and validation questions this ADR doesn't
   need to answer. The `Connection` source shape admits an optional `query:`
   later without breaking anything, if scan-with-pushdown proves insufficient
-  for a real table.
+  for a real table. (That condition was met — a 2.57B-row view whose
+  consumer needs an aggregate — and this deferral is reopened and decided
+  by ADR 0007.)
 - **Extract-to-Parquet as the core mechanism** (engine runs a warehouse
   export to the bucket, then reads it as Raw). Rejected: it needs a staging
   location, doubles storage, and re-implements what the scanner extensions

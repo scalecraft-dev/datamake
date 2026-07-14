@@ -31,7 +31,7 @@ fn check_remote_storage(i: &PreflightInput) -> Result<()> {
     if !is_remote(&i.bindings.storage) {
         bail!(
             "profile '{p}' storage `{s}` is local; a deployed workload can't reach it.\n\
-             Point `storage:` in profiles/{p}.yaml at a shared object store (s3://…).",
+             Point `storage:` in profiles/{p}.yaml at a shared object store (s3://… or gs://…).",
             p = i.profile,
             s = i.bindings.storage,
         );
