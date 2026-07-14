@@ -285,7 +285,10 @@ fn contains_word_token(text: &str, word: &str) -> bool {
     while let Some(offset) = text[search_from..].find(word) {
         let start = search_from + offset;
         let end = start + word.len();
-        let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_ident(c));
+        let before_ok = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident(c));
         let after_ok = text[end..].chars().next().is_none_or(|c| !is_ident(c));
         if before_ok && after_ok {
             return true;
@@ -552,10 +555,7 @@ interface:
     }
 
     fn cell_with_export(yaml_export: &str) -> CellDef {
-        serde_yaml::from_str(&format!(
-            "cell: t\ninterface:\n{yaml_export}\n"
-        ))
-        .unwrap()
+        serde_yaml::from_str(&format!("cell: t\ninterface:\n{yaml_export}\n")).unwrap()
     }
 
     #[test]
@@ -570,12 +570,13 @@ interface:
 
     #[test]
     fn omitted_grain_inherits_a_composite_materialize_key() {
-        let mut def = cell_with_export(
-            "  - name: fct\n    version: 1.0.0\n    source: fct\n",
-        );
+        let mut def = cell_with_export("  - name: fct\n    version: 1.0.0\n    source: fct\n");
         let transforms = vec![materialize_transform("fct", &["a", "b"])];
         apply_declarative_grain_inheritance(&mut def, &transforms).unwrap();
-        assert_eq!(def.interface[0].grain, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            def.interface[0].grain,
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -612,7 +613,10 @@ interface:
             .unwrap_err()
             .to_string();
         assert!(err.contains("export 'fct'"), "got: {err}");
-        assert!(err.contains("does not contain materialize key"), "got: {err}");
+        assert!(
+            err.contains("does not contain materialize key"),
+            "got: {err}"
+        );
         assert!(err.contains("\"id\""), "got: {err}");
         assert!(err.contains("never be coarser"), "got: {err}");
     }
@@ -676,7 +680,8 @@ interface:
     // --- backstop -------------------------------------------------------
 
     #[test]
-    fn a_table_with_no_materialize_entry_and_no_declared_grain_falls_back_to_the_no_grain_warning() {
+    fn a_table_with_no_materialize_entry_and_no_declared_grain_falls_back_to_the_no_grain_warning()
+    {
         // `sources_without_grain_backstop` looks only at `def.interface`/
         // `def.sources` — it has no view of `transforms:` at all. This
         // pins the case that matters in practice: a table whose
@@ -804,8 +809,7 @@ interface:
             &[("rollup.sql", "SELECT count(*) AS n FROM events")],
         );
         let def: CellDef =
-            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap())
-                .unwrap();
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap()).unwrap();
         let transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
         let err = check_replace_incremental_gate(&def, &dir, &transforms)
             .unwrap_err()
@@ -825,8 +829,8 @@ interface:
     }
 
     #[test]
-    fn check_replace_incremental_gate_is_silent_when_replace_reads_an_accumulator_in_the_same_cell(
-    ) {
+    fn check_replace_incremental_gate_is_silent_when_replace_reads_an_accumulator_in_the_same_cell()
+    {
         // This is the case the old cell-wide ban wrongly forbade — pinned
         // per the coordinator's explicit instruction. `fct_events` contains
         // "events" as a substring but not as a word-boundary token (it's
@@ -845,15 +849,11 @@ interface:
             ),
             &[
                 ("fct_events.sql", "SELECT * FROM events"),
-                (
-                    "daily_rollup.sql",
-                    "SELECT count(*) AS n FROM fct_events",
-                ),
+                ("daily_rollup.sql", "SELECT count(*) AS n FROM fct_events"),
             ],
         );
         let def: CellDef =
-            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap())
-                .unwrap();
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap()).unwrap();
         let transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
         check_replace_incremental_gate(&def, &dir, &transforms).expect(
             "a replace rollup reading an upsert accumulator's table, not the delta source \
@@ -883,8 +883,7 @@ interface:
             )],
         );
         let def: CellDef =
-            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap())
-                .unwrap();
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap()).unwrap();
         let transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
         let err = check_replace_incremental_gate(&def, &dir, &transforms)
             .unwrap_err()
@@ -923,8 +922,7 @@ interface:
             &[("fct_events.sql", "SELECT * FROM events")],
         );
         let def: CellDef =
-            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap())
-                .unwrap();
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap()).unwrap();
         let transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
         check_replace_incremental_gate(&def, &dir, &transforms)
             .expect("upsert/append models reading the source directly are never scanned");
@@ -953,13 +951,15 @@ interface:
             &[("rollup.sql", "SELECT count(*) AS n FROM signups")],
         );
         let def: CellDef =
-            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap())
-                .unwrap();
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap()).unwrap();
         let transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
         let err = check_replace_incremental_gate(&def, &dir, &transforms)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("references incremental source 'signups'"), "got: {err}");
+        assert!(
+            err.contains("references incremental source 'signups'"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

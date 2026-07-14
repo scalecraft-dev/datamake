@@ -163,9 +163,6 @@ mod tests {
         assert_eq!(loaded.transforms[0].table, "fct_flights");
         assert_eq!(loaded.transforms[0].key, vec!["flight_id".to_string()]);
         // The export declared no `grain:` — it must have inherited `key:`.
-        assert_eq!(
-            loaded.def.interface[0].grain,
-            vec!["flight_id".to_string()]
-        );
+        assert_eq!(loaded.def.interface[0].grain, vec!["flight_id".to_string()]);
     }
 }

@@ -724,11 +724,7 @@ pub fn resolve_transforms(transforms: &[TransformEntry]) -> Result<Vec<ResolvedT
 /// cross-entry collision map — every entry goes through this, since the
 /// uniform naming invariant makes every entry's table name known from its
 /// filename alone, checkable in one pass.
-fn claim_table(
-    sql_path: &str,
-    table: &str,
-    claimed: &mut IndexMap<String, String>,
-) -> Result<()> {
+fn claim_table(sql_path: &str, table: &str, claimed: &mut IndexMap<String, String>) -> Result<()> {
     if !is_valid_identifier(table) {
         anyhow::bail!(
             "transform '{sql_path}': table name '{table}' (from the file's stem) is not a \
@@ -1000,7 +996,10 @@ access:
         let def: CellDef = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(def.cell, "orders");
         assert_eq!(
-            def.transforms.iter().map(TransformEntry::file_path).collect::<Vec<_>>(),
+            def.transforms
+                .iter()
+                .map(TransformEntry::file_path)
+                .collect::<Vec<_>>(),
             vec!["sql/stg.sql", "sql/final.sql"]
         );
 
@@ -1458,7 +1457,8 @@ cells:
 
     #[test]
     fn materialize_entry_typo_field_names_the_valid_fields_not_a_generic_variant_error() {
-        let yaml = "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materalize: upsert\n    key: [id]\n";
+        let yaml =
+            "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materalize: upsert\n    key: [id]\n";
         let err = serde_yaml::from_str::<CellDef>(yaml)
             .unwrap_err()
             .to_string();
@@ -1520,14 +1520,12 @@ cells:
 
     #[test]
     fn materialize_entry_empty_key_list_errors() {
-        let yaml = "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materialize: upsert\n    key: []\n";
+        let yaml =
+            "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materialize: upsert\n    key: []\n";
         let err = serde_yaml::from_str::<CellDef>(yaml)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("`key` must be a non-empty list"),
-            "got: {err}"
-        );
+        assert!(err.contains("`key` must be a non-empty list"), "got: {err}");
     }
 
     #[test]
@@ -1541,16 +1539,23 @@ cells:
             err.contains("`materialize: merge` is not a recognized strategy"),
             "got: {err}"
         );
-        assert!(err.contains("`append`, `upsert`, or `replace`"), "got: {err}");
+        assert!(
+            err.contains("`append`, `upsert`, or `replace`"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn materialize_entry_replace_forbids_key() {
-        let yaml = "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materialize: replace\n    key: [id]\n";
+        let yaml =
+            "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materialize: replace\n    key: [id]\n";
         let err = serde_yaml::from_str::<CellDef>(yaml)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("`key:` is not allowed with `materialize: replace`"), "got: {err}");
+        assert!(
+            err.contains("`key:` is not allowed with `materialize: replace`"),
+            "got: {err}"
+        );
         assert!(err.contains("nothing to reconcile"), "got: {err}");
     }
 

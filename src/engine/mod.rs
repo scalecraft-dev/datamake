@@ -792,9 +792,7 @@ fn execute_transform(
     // own function rather than threading a "strategy that skips
     // everything" branch through `execute_materialize`.
     match entry.strategy {
-        MaterializeStrategy::Replace => {
-            execute_replace(conn, dir, &entry.sql, &entry.table)
-        }
+        MaterializeStrategy::Replace => execute_replace(conn, dir, &entry.sql, &entry.table),
         MaterializeStrategy::Upsert | MaterializeStrategy::Append => execute_materialize(
             conn,
             dir,
@@ -853,7 +851,10 @@ fn execute_replace(conn: &Connection, dir: &Path, sql_path: &str, table: &str) -
     let stmt = format!("CREATE OR REPLACE TABLE {table_q} AS ({select_text});");
     tracing::info!(table = %table, sql = %stmt, "materialize: replace");
     conn.execute_batch(&stmt).with_context(|| {
-        composition_error_context(&format!("replacing table '{table}' from '{sql_path}'"), &select_text)
+        composition_error_context(
+            &format!("replacing table '{table}' from '{sql_path}'"),
+            &select_text,
+        )
     })?;
 
     let artifact = write_eject_artifact(dir, table, &[], &[stmt])?;
@@ -896,7 +897,10 @@ fn execute_materialize(
     let stage_stmt = format!("CREATE OR REPLACE TEMP TABLE {staging_q} AS ({select_text});");
     tracing::info!(table = %table, sql = %stage_stmt, "materialize: staging");
     conn.execute_batch(&stage_stmt).with_context(|| {
-        composition_error_context(&format!("staging '{sql_path}' into {staging}"), &select_text)
+        composition_error_context(
+            &format!("staging '{sql_path}' into {staging}"),
+            &select_text,
+        )
     })?;
 
     // (h) The staging relation is engine-owned scratch — dropped on every
@@ -1092,7 +1096,12 @@ fn log_eject_notice(table: &str, artifact_path: &Path) {
 /// `IN` semantics anti-join and `MERGE` both use (`NULL` never matches
 /// `NULL`). Hard error naming the column and the staged-delta NULL count,
 /// before any strategy DML — the exact wording ADR 0008 §7 specifies.
-fn check_null_keys(conn: &Connection, sql_path: &str, staging_q: &str, key: &[String]) -> Result<()> {
+fn check_null_keys(
+    conn: &Connection,
+    sql_path: &str,
+    staging_q: &str,
+    key: &[String],
+) -> Result<()> {
     for k in key {
         let kq = quote_ident(k);
         let null_count: i64 = conn
@@ -1126,7 +1135,11 @@ fn check_duplicate_keys(
     staging_q: &str,
     key: &[String],
 ) -> Result<()> {
-    let group_cols = key.iter().map(|k| quote_ident(k)).collect::<Vec<_>>().join(", ");
+    let group_cols = key
+        .iter()
+        .map(|k| quote_ident(k))
+        .collect::<Vec<_>>()
+        .join(", ");
     let display_expr = format!(
         "concat_ws(' | ', {})",
         key.iter()
@@ -1162,7 +1175,11 @@ fn check_duplicate_keys(
         .map(|(v, n)| format!("{v} ({n}x)"))
         .collect::<Vec<_>>()
         .join(", ");
-    let key_csv = key.iter().map(String::as_str).collect::<Vec<_>>().join(", ");
+    let key_csv = key
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
     anyhow::bail!(
         "transform '{sql_path}': materialize key {key:?} is not unique in the staged delta — \
          {total_offending} key value(s) appear more than once (e.g. {sample}). Declarative \
@@ -1249,7 +1266,11 @@ fn build_merge(
     let insert_values: Vec<String> = key
         .iter()
         .map(|k| format!("s.{}", quote_ident(k)))
-        .chain(non_key_cols.iter().map(|(c, _)| format!("s.{}", quote_ident(c))))
+        .chain(
+            non_key_cols
+                .iter()
+                .map(|(c, _)| format!("s.{}", quote_ident(c))),
+        )
         .collect();
 
     let when_matched = if non_key_cols.is_empty() {
@@ -2736,7 +2757,10 @@ fn verify_replay(cell: &Cell, full_refresh: bool) -> Result<()> {
         // gets diffed for replay-safety, not a no-op stand-in.
         for t in &cell.transforms {
             execute_transform(&cell.conn, &cell.dir, t, full_refresh).with_context(|| {
-                format!("re-executing transform {} for --verify-replay", t.file_path())
+                format!(
+                    "re-executing transform {} for --verify-replay",
+                    t.file_path()
+                )
             })?;
         }
         Ok(())
@@ -4176,7 +4200,10 @@ mod tests {
         let cell = materialize_test_cell(
             "replay-upsert",
             "  - sql: sql/fct.sql\n    materialize: upsert\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
         verify_replay(&cell, false).expect("a key-unique upsert must be replay-safe");
@@ -4245,7 +4272,11 @@ mod tests {
         conn.execute_batch("COMMIT;").expect("commit");
 
         let rows = select_id_val(&conn, "t");
-        assert_eq!(rows.len(), 1, "expected exactly one surviving row for key 1, got {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one surviving row for key 1, got {rows:?}"
+        );
         assert_eq!(rows[0].0, 1);
         assert!(
             rows[0].1 == "a" || rows[0].1 == "b",
@@ -4398,7 +4429,10 @@ mod tests {
         let cell = materialize_test_cell(
             "mat-upsert-accum",
             "  - sql: sql/fct.sql\n    materialize: upsert\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
         assert_eq!(
@@ -4429,7 +4463,10 @@ mod tests {
         let cell = materialize_test_cell(
             "mat-upsert-idempotent",
             "  - sql: sql/fct.sql\n    materialize: upsert\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
         let after_first = select_id_val(&cell.conn, "fct");
@@ -4446,7 +4483,10 @@ mod tests {
         let cell = materialize_test_cell(
             "mat-append",
             "  - sql: sql/fct.sql\n    materialize: append\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
 
@@ -4488,7 +4528,10 @@ mod tests {
             ),
             "got: {err}"
         );
-        assert!(err.contains("Make 'flight_id' NOT NULL upstream"), "got: {err}");
+        assert!(
+            err.contains("Make 'flight_id' NOT NULL upstream"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -4506,7 +4549,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("sql/fct.sql"), "got: {err}");
-        assert!(err.contains("is not unique in the staged delta"), "got: {err}");
+        assert!(
+            err.contains("is not unique in the staged delta"),
+            "got: {err}"
+        );
         assert!(err.contains('1'), "got: {err}");
         assert!(err.contains("QUALIFY row_number() OVER"), "got: {err}");
 
@@ -4543,8 +4589,14 @@ mod tests {
             err.contains("the SELECT now yields column 'carrier'"),
             "got: {err}"
         );
-        assert!(err.contains("does not migrate schema in place"), "got: {err}");
-        assert!(err.contains("no ALTER path inside the pipeline"), "got: {err}");
+        assert!(
+            err.contains("does not migrate schema in place"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("no ALTER path inside the pipeline"),
+            "got: {err}"
+        );
         assert!(err.contains("--full-refresh"), "got: {err}");
         assert!(err.contains("datamk attach"), "got: {err}");
 
@@ -4566,7 +4618,10 @@ mod tests {
         let cell = materialize_test_cell(
             "mat-trailing-semicolon",
             "  - sql: sql/fct.sql\n    materialize: upsert\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a')) AS t(id, val);\n")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a')) AS t(id, val);\n",
+            )],
         );
         let err = run_transforms(&cell, false).unwrap_err();
         let chain = format!("{err:?}"); // anyhow's Debug prints the full "Caused by" chain
@@ -4618,7 +4673,10 @@ mod tests {
         let cell = materialize_test_cell(
             "mat-full-refresh",
             "  - sql: sql/fct.sql\n    materialize: upsert\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
         assert_eq!(
@@ -4628,7 +4686,11 @@ mod tests {
 
         // Upstream hard-deleted id=1; a normal (non-full-refresh) run over
         // the surviving row alone must leave the ghost behind.
-        write_sql(&cell, "fct.sql", "SELECT * FROM (VALUES (2, 'b')) AS t(id, val)");
+        write_sql(
+            &cell,
+            "fct.sql",
+            "SELECT * FROM (VALUES (2, 'b')) AS t(id, val)",
+        );
         run_transforms(&cell, false).unwrap();
         assert_eq!(
             select_id_val(&cell.conn, "fct"),
@@ -4755,9 +4817,10 @@ mod tests {
         // model itself (delta consumers are exempt), `open` would return
         // `Err` and this test would fail right here — "gate silent" is
         // proven by `open` succeeding, not asserted separately.
-        let cell = open(&dir.join("cell.yaml"), "local", false)
-            .expect("gate 4c must stay silent: the upsert model is exempt, and the replace \
-                     rollup reads the accumulator table, never the source, by name");
+        let cell = open(&dir.join("cell.yaml"), "local", false).expect(
+            "gate 4c must stay silent: the upsert model is exempt, and the replace \
+                     rollup reads the accumulator table, never the source, by name",
+        );
 
         // Grain inheritance: fct_events (upsert) inherits `key:`; events_daily
         // (replace) keeps its explicit `grain:` — no key to inherit from.
@@ -4841,7 +4904,10 @@ mod tests {
             .conn
             .query_row("SELECT count(*) FROM events_daily", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n_groups, 3, "one group per distinct region across all 3 accumulated rows");
+        assert_eq!(
+            n_groups, 3,
+            "one group per distinct region across all 3 accumulated rows"
+        );
 
         crate::verify::check(&cell.conn, &cell.def)
             .expect("post-accumulation output must still verify cleanly");
@@ -4907,7 +4973,10 @@ mod tests {
         let cell = materialize_test_cell(
             "eject-artifact-header",
             "  - sql: sql/fct.sql\n    materialize: upsert\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
 
@@ -4926,20 +4995,14 @@ mod tests {
             artifact.contains("NULL-key, duplicate-key, and schema-drift"),
             "got: {artifact}"
         );
-        assert!(
-            artifact.contains("are NOT in this file"),
-            "got: {artifact}"
-        );
+        assert!(artifact.contains("are NOT in this file"), "got: {artifact}");
         // (c) audit/portability framing, not a migration path (ADR 0008 §7)
         // — no supported way to point cell.yaml at this file directly.
         assert!(
             artifact.contains("audit/portability artifact, not a migration path"),
             "got: {artifact}"
         );
-        assert!(
-            artifact.contains("no supported way to"),
-            "got: {artifact}"
-        );
+        assert!(artifact.contains("no supported way to"), "got: {artifact}");
         assert!(
             artifact.contains("point cell.yaml `transforms:` at this file directly"),
             "got: {artifact}"
@@ -4964,7 +5027,10 @@ mod tests {
         let cell = materialize_test_cell(
             "eject-artifact-upsert",
             "  - sql: sql/fct.sql\n    materialize: upsert\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
 
@@ -4985,7 +5051,10 @@ mod tests {
         conn.execute_batch(&pasted)
             .expect("first execution of the pasted eject artifact");
         let after_first = select_id_val(&conn, "fct");
-        assert_eq!(after_first, vec![(1, "a".to_string()), (2, "b".to_string())]);
+        assert_eq!(
+            after_first,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
 
         conn.execute_batch(&pasted).expect(
             "the pasted eject artifact must survive same-connection re-execution (exactly what \
@@ -5005,7 +5074,10 @@ mod tests {
         let cell = materialize_test_cell(
             "eject-artifact-append",
             "  - sql: sql/fct.sql\n    materialize: append\n    key: [id]\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
 
@@ -5021,7 +5093,10 @@ mod tests {
         conn.execute_batch(&pasted)
             .expect("first execution of the pasted eject artifact");
         let after_first = select_id_val(&conn, "fct");
-        assert_eq!(after_first, vec![(1, "a".to_string()), (2, "b".to_string())]);
+        assert_eq!(
+            after_first,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
 
         conn.execute_batch(&pasted)
             .expect("the pasted append eject artifact must survive same-connection re-execution");
@@ -5066,7 +5141,10 @@ mod tests {
         let cell = materialize_test_cell(
             "mat-replace-rebuild",
             "  - sql: sql/fct.sql\n    materialize: replace\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
         assert_eq!(
@@ -5078,7 +5156,11 @@ mod tests {
         // Unlike upsert/append (which never remove upstream deletions —
         // ADR 0008 §6), this is replace's whole point: no reconciliation
         // step needed, the rebuild IS the reconciliation.
-        write_sql(&cell, "fct.sql", "SELECT * FROM (VALUES (2, 'b')) AS t(id, val)");
+        write_sql(
+            &cell,
+            "fct.sql",
+            "SELECT * FROM (VALUES (2, 'b')) AS t(id, val)",
+        );
         run_transforms(&cell, false).unwrap();
         assert_eq!(
             select_id_val(&cell.conn, "fct"),
@@ -5095,14 +5177,20 @@ mod tests {
         let normal = materialize_test_cell(
             "mat-replace-normal",
             "  - sql: sql/fct.sql\n    materialize: replace\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&normal, false).unwrap();
 
         let full_refresh = materialize_test_cell(
             "mat-replace-full-refresh",
             "  - sql: sql/fct.sql\n    materialize: replace\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&full_refresh, true).unwrap();
 
@@ -5150,7 +5238,10 @@ mod tests {
             "got: {artifact}"
         );
         // One statement — no staging, no bootstrap.
-        assert!(artifact.contains("CREATE OR REPLACE TABLE"), "got: {artifact}");
+        assert!(
+            artifact.contains("CREATE OR REPLACE TABLE"),
+            "got: {artifact}"
+        );
         assert!(
             !artifact.contains("CREATE OR REPLACE TEMP TABLE"),
             "replace has no staging relation: {artifact}"
@@ -5166,7 +5257,10 @@ mod tests {
         let cell = materialize_test_cell(
             "eject-artifact-replace",
             "  - sql: sql/fct.sql\n    materialize: replace\n",
-            &[("fct.sql", "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)")],
+            &[(
+                "fct.sql",
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )],
         );
         run_transforms(&cell, false).unwrap();
 
@@ -5183,7 +5277,10 @@ mod tests {
         conn.execute_batch(&pasted)
             .expect("first execution of the pasted eject artifact");
         let after_first = select_id_val(&conn, "fct");
-        assert_eq!(after_first, vec![(1, "a".to_string()), (2, "b".to_string())]);
+        assert_eq!(
+            after_first,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
 
         conn.execute_batch(&pasted)
             .expect("the pasted replace eject artifact must survive same-connection re-execution");
