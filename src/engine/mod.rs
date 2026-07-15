@@ -1555,11 +1555,13 @@ fn bind_source(
             incremental,
         } => {
             let ty = config.type_name();
-            // Alias keyed on the connection name + ATTACH IF NOT EXISTS: a
-            // connection shared by several sources attaches once. Every
-            // connection source needs the extension loaded and the catalog
-            // attached, `table:` and `query:` alike — only what happens
-            // next (classification, `qualify()`) is target-specific.
+            // Alias keyed on the connection name; the setup batch is
+            // idempotent (ATTACH IF NOT EXISTS for BigQuery/Postgres; a
+            // secret re-create + probe for Snowflake, which never attaches
+            // — ADR 0009 §1a). Every connection source needs the extension
+            // loaded and the connection set up, `table:` and `query:` alike
+            // — only what happens next (classification, `qualify()`) is
+            // target-specific.
             let alias = format!("__conn_{connection}");
             conn.execute_batch(config.install_load_sql())
                 .with_context(|| format!("loading DuckDB '{ty}' extension"))?;
@@ -2471,13 +2473,14 @@ fn stage_incremental(
     gcs: Option<&ResolvedGcs>,
 ) -> Result<WatermarkAdvance> {
     // Cursor existence/type/nullability validation stays on `describe_columns`
-    // through the attach: `DESCRIBE SELECT * FROM <qualified>` is
-    // REST-metadata-only and works uniformly whether the object is a table or
-    // a view — it is never routed through the jobs API. Its failure is the
-    // *first* warehouse-touching statement of an incremental bind, so it goes
-    // through the connector's stage-error rewrite — an incremental source
-    // must get the same actionable not-found/no-warehouse text a plain one
-    // does.
+    // over the connector's `qualify()` expression: `DESCRIBE SELECT * FROM
+    // <qualified>` binds without reading data (BigQuery: REST-metadata-only,
+    // never the jobs API; Snowflake: the extension's LIMIT-0 schema probe
+    // through `snowflake_query`) and works uniformly whether the object is a
+    // table or a view. Its failure is the *first* warehouse-touching
+    // statement of an incremental bind, so it goes through the connector's
+    // stage-error rewrite — an incremental source must get the same
+    // actionable not-found/no-warehouse text a plain one does.
     let cols = describe_columns(conn, qualified).map_err(|e| {
         config.rewrite_stage_error(
             e,

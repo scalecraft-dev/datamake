@@ -30,8 +30,9 @@ pub enum ObjectKind {
     /// Bind as a read-through TEMP VIEW over the attached catalog —
     /// transform SQL scans the warehouse directly, with pushdown. BigQuery
     /// BASE TABLE / CLONE / SNAPSHOT (the Storage Read API can read them).
-    /// Snowflake never uses this path: its extension's attach-scan cannot
-    /// survive arbitrary transform shapes (`snowflake::classify_objects`).
+    /// Snowflake never uses this path: its extension's attach-scan emits
+    /// invalid SQL for zero-column transform shapes (ADR 0009 §1), so the
+    /// connection is never attached (`snowflake::classify_objects`).
     Table,
     /// Stage the connector's read once into a TEMP TABLE and bind the
     /// source view over the staged copy. BigQuery VIEW / MATERIALIZED VIEW /
@@ -191,9 +192,11 @@ impl ResolvedConnection {
         }
     }
 
-    /// The ATTACH statement (for Snowflake, a secret + ATTACH batch).
-    /// `IF NOT EXISTS` + an alias keyed on the connection name means a
-    /// connection shared by several sources attaches once.
+    /// The connection-setup batch: for BigQuery/Postgres an ATTACH (`IF NOT
+    /// EXISTS` + an alias keyed on the connection name means a connection
+    /// shared by several sources attaches once); for Snowflake a secret +
+    /// `SELECT 1` connectivity probe — no ATTACH at all (ADR 0009 §1a), the
+    /// probe forcing driver load and auth at the same fail-fast point.
     pub fn attach_sql(&self, alias: &str) -> String {
         match self {
             ResolvedConnection::Bigquery {
@@ -271,13 +274,18 @@ impl ResolvedConnection {
         }
     }
 
-    /// Validate + quote the connector-scoped table path against the connector's
-    /// expected shape, resolving it under the attach alias.
+    /// Validate + quote the connector-scoped table path against the
+    /// connector's expected shape, returning the DuckDB-side relation
+    /// expression for the object: an attach-qualified path for
+    /// BigQuery/Postgres, a `snowflake_query('SELECT * FROM …', <secret>)`
+    /// wrapper for Snowflake (ADR 0009 §1a — there is no attach).
     pub fn qualify(&self, alias: &str, table: &str) -> Result<String> {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::qualify(alias, table),
             ResolvedConnection::Postgres { .. } => postgres::qualify(alias, table),
-            ResolvedConnection::Snowflake { .. } => snowflake::qualify(alias, table),
+            ResolvedConnection::Snowflake { database, .. } => {
+                snowflake::qualify(alias, database, table)
+            }
         }
     }
 
@@ -374,9 +382,12 @@ impl ResolvedConnection {
                 meta,
                 predicate,
             ),
-            // Kind-independent: through the attach, predicate rendered
-            // DuckDB-side (`meta` carries nothing Snowflake needs).
-            ResolvedConnection::Snowflake { .. } => snowflake::read_sql(alias, table, predicate),
+            // Kind-independent: via `snowflake_query`, predicate rendered
+            // server-side in Snowflake dialect (`meta` carries nothing
+            // Snowflake needs).
+            ResolvedConnection::Snowflake { database, .. } => {
+                snowflake::read_sql(alias, database, table, predicate)
+            }
             // Defensive: everything classifies `Table`, so the engine never
             // routes a Postgres source here — but the answer is coherent
             // (same shape as the engine's own Table-kind staging SQL).

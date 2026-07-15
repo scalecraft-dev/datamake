@@ -265,7 +265,7 @@ mod tests {
     fn resolve_requires_user_for_external_browser() {
         // Live-verified: the extension refuses an externalbrowser secret
         // without USER ("Snowflake secret requires field 'user'") — fail at
-        // resolve time with the fix, not at attach.
+        // resolve time with the fix, not at connection setup.
         let mut c = browser();
         c.user = None;
         let err = resolve_snowflake("wh", &c).unwrap_err().to_string();

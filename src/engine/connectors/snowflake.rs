@@ -1,49 +1,64 @@
-//! All Snowflake-specific connector code: extension load, secret + ATTACH,
+//! All Snowflake-specific connector code: extension load, secret + probe,
 //! table-path validation/folding/quoting, and error rewrites. Realized via
-//! the DuckDB community `snowflake` extension, which reads over the Arrow
-//! ADBC Snowflake driver — plain SQL, so tables and views read through one
-//! uniform path (no BigQuery-style storage-vs-jobs split).
+//! the DuckDB community `snowflake` extension's `snowflake_query()` table
+//! function **only** — datamk-composed Snowflake SQL delivered verbatim,
+//! results streamed back over the Arrow ADBC Snowflake driver. The
+//! extension's attached-catalog surface is never used (ADR 0009 §1a): its
+//! scan rebuilds DuckDB query fragments into Snowflake SQL, and that
+//! translation layer emits invalid SQL for zero-column projections (a bare
+//! `SELECT COUNT(*)` renders `SELECT  FROM …` — live-diagnosed, present
+//! upstream), so the connection is never ATTACHed at all.
 //!
 //! Two Snowflake-shaped divergences from the BigQuery connector:
 //!
-//! - **Every read is staged.** The extension's attach-scan cannot survive
-//!   arbitrary transform SQL (a bare `SELECT COUNT(*)` over the scan fails
-//!   with pushdown enabled *and* disabled — live-verified), so no Snowflake
-//!   source is ever bound as a read-through view. `classify_objects`
+//! - **Every read is staged.** No Snowflake source is ever bound as a
+//!   read-through view (the attach-scan hazard above, §1). `classify_objects`
 //!   synthesizes `ObjectKind::Query` for everything, with no metadata job:
-//!   routing doesn't depend on the object's real kind, predicates render
-//!   DuckDB-side (no native column types needed), and the staging read
-//!   itself is the not-found detector (`rewrite_stage_error`).
+//!   routing doesn't depend on the object's real kind, predicates render in
+//!   Snowflake's own dialect inside the delivered SQL (no native column
+//!   types needed), and the staging read itself is the not-found detector
+//!   (`rewrite_stage_error`).
 //! - **The ADBC driver is a separate native library** the extension loads at
-//!   attach (`libadbc_driver_snowflake`) — not installable from DuckDB's
+//!   first use (`libadbc_driver_snowflake`) — not installable from DuckDB's
 //!   extension registry, so a missing driver gets an actionable rewrite
-//!   (`rewrite_attach_error`) instead of the raw searched-paths error.
+//!   (`rewrite_attach_error`, fired by the setup probe) instead of the raw
+//!   searched-paths error.
 
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
 
 use super::{quote, CursorPredicate, ObjectKind, ObjectMeta};
 use crate::config::SnowflakeAuth;
-use crate::engine::esc;
+use crate::engine::{esc, MarkValue};
 
 pub(super) const INSTALL_LOAD_SQL: &str = "INSTALL snowflake FROM community; LOAD snowflake;";
 
-/// The session-local DuckDB secret a connection's ATTACH references, derived
-/// from the attach alias so `attach_sql` and `query_read_sql` (which passes
-/// it to `snowflake_query()`) can never disagree on the name.
+/// The session-local DuckDB secret every `snowflake_query()` call
+/// references, derived from the connection alias so `attach_sql`, `qualify`,
+/// `read_sql`, and `query_read_sql` can never disagree on the name.
 fn secret_name(alias: &str) -> String {
     format!("{alias}_secret")
 }
 
-/// The secret + ATTACH batch. `CREATE OR REPLACE SECRET` + `ATTACH IF NOT
-/// EXISTS` keyed on the connection name: a connection shared by several
-/// sources attaches once, and re-running the batch is idempotent (the
-/// secret is re-created per source — a local, session-scoped metadata write
-/// with identical values; the already-attached connection is undisturbed).
-/// `enable_pushdown true` is safe because the engine only ever sends
-/// `SELECT *` (with an optional watermark predicate — pushdown of those
-/// comparisons is live-verified byte-correct) through the scan; transforms
-/// only ever see the staged copy.
+/// Wrap datamk-composed Snowflake SQL as the extension's `snowflake_query()`
+/// table function — the connector's single read mechanism (ADR 0009 §1a).
+/// `esc()` at the wrapping boundary is the only escaping layer: the inner
+/// SQL is composed plain, then delivered as one DuckDB string literal.
+fn wrap_query(inner_sql: &str, alias: &str) -> String {
+    format!(
+        "snowflake_query('{}', '{}')",
+        esc(inner_sql),
+        esc(&secret_name(alias))
+    )
+}
+
+/// The secret + connectivity-probe batch — there is no ATTACH (ADR 0009
+/// §1a). `CREATE OR REPLACE SECRET` keyed on the connection name is
+/// idempotent (a local, session-scoped metadata write with identical
+/// values). The `SELECT 1` probe forces ADBC driver load and authentication
+/// at the same lifecycle point ATTACH used to fail at, so missing-driver /
+/// bad-key / SSO errors keep their setup-time rewrites — and it runs even
+/// with no active warehouse (live-verified).
 pub(super) fn attach_sql(
     account: &str,
     database: &str,
@@ -84,36 +99,54 @@ pub(super) fn attach_sql(
     let secret = secret_name(alias);
     format!(
         "CREATE OR REPLACE SECRET \"{sq}\" ({params}); \
-         ATTACH IF NOT EXISTS '' AS \"{aq}\" \
-         (TYPE snowflake, SECRET \"{sq}\", READ_ONLY, enable_pushdown true);",
+         SELECT * FROM {probe};",
         sq = quote(&secret),
-        aq = quote(alias),
-        params = params.join(", ")
+        params = params.join(", "),
+        probe = wrap_query("SELECT 1", alias)
     )
 }
 
-/// Validate + fold + quote a `schema.table` path, resolving it under the
-/// attach alias. Parts are folded to UPPERCASE **before** quoting — the
-/// double quotes are injection safety, and without the fold they would flip
-/// the identifiers into Snowflake's case-*sensitive* resolution and stop
-/// `raw.vehicle_models` from matching the real `RAW.VEHICLE_MODELS`
+/// Validate + fold + quote the *Snowflake-side* three-part path
+/// (`"DB"."SCHEMA"."TABLE"`, database from the connection — explicit rather
+/// than session-resolved). Parts are folded to UPPERCASE **before** quoting
+/// — the double quotes are injection safety, and without the fold they
+/// would flip the identifiers into Snowflake's case-*sensitive* resolution
+/// and stop `raw.vehicle_models` from matching the real `RAW.VEHICLE_MODELS`
 /// (Snowflake's own rule: unquoted identifiers fold to uppercase).
-pub(super) fn qualify(alias: &str, table: &str) -> Result<String> {
+fn snowflake_path(database: &str, table: &str) -> Result<String> {
+    if database.contains('"') {
+        bail!(
+            "snowflake connection `database: {database}` contains a double quote — datamk \
+             resolves it with Snowflake's unquoted-identifier rule (folded to UPPERCASE); a \
+             case-sensitive (quoted) database name is not supported."
+        );
+    }
     let (schema, tbl) = split_schema_table(table)?;
     Ok(format!(
         "\"{}\".\"{}\".\"{}\"",
-        quote(alias),
+        database.to_ascii_uppercase(),
         schema.to_ascii_uppercase(),
         tbl.to_ascii_uppercase()
     ))
+}
+
+/// The DuckDB-side relation expression for a `table:` source — the
+/// `snowflake_query()` wrapper around a plain `SELECT *` of the three-part
+/// path. The engine consumes this in exactly one place for Snowflake:
+/// `DESCRIBE SELECT * FROM <qualified>` (incremental cursor validation),
+/// which binds via the extension's `LIMIT 0` schema probe — one cheap
+/// server round-trip, real column names and types (live-verified).
+pub(super) fn qualify(alias: &str, database: &str, table: &str) -> Result<String> {
+    let path = snowflake_path(database, table)?;
+    Ok(wrap_query(&format!("SELECT * FROM {path}"), alias))
 }
 
 /// `schema.table` — exactly two non-empty dot-separated parts; the database
 /// comes from the connection, never a third part. A double quote anywhere is
 /// rejected rather than escaped: datamk resolves the whole path with
 /// Snowflake's unquoted-identifier (uppercase-fold) semantics, so quoting
-/// can only be an attempt at a case-sensitive name — which the extension
-/// cannot reach through the attach at all; `query:` is the documented route.
+/// can only be an attempt at a case-sensitive name — deliberately not
+/// addressable via `table:`; `query:` is the documented route.
 fn split_schema_table(table: &str) -> Result<(&str, &str)> {
     if table.contains('"') {
         bail!(
@@ -136,8 +169,8 @@ fn split_schema_table(table: &str) -> Result<(&str, &str)> {
 /// No metadata job: every Snowflake object routes through the staged read
 /// (`ObjectKind::Query`), so classification would buy only a cosmetic
 /// table-vs-view label at the cost of a warehouse round-trip per schema per
-/// run. Table-path shape is still validated here (fail at bind, before
-/// ATTACH traffic); existence is checked by the staging read itself, whose
+/// run. Table-path shape is still validated here (fail at bind, before any
+/// read traffic); existence is checked by the staging read itself, whose
 /// failure `rewrite_stage_error` turns actionable.
 pub(super) fn classify_objects(tables: &[&str]) -> Result<IndexMap<String, ObjectMeta>> {
     let mut out = IndexMap::new();
@@ -154,27 +187,49 @@ pub(super) fn classify_objects(tables: &[&str]) -> Result<IndexMap<String, Objec
     Ok(out)
 }
 
-/// The SELECT the engine wraps in `CREATE TEMP TABLE … AS` — through the
-/// attach, with the watermark predicate (if any) rendered DuckDB-side
-/// (`MarkValue::as_literal`); the extension pushes the comparison down to
-/// Snowflake (live-verified byte-correct for DATE and TIMESTAMPTZ cursors).
+/// Render the watermark as a Snowflake-dialect literal for the server-side
+/// predicate — connector-owned, mirroring the BigQuery pattern (`MarkValue`
+/// itself grows no per-connector rendering mode). The cast form
+/// (`'…'::TIMESTAMP_TZ`) rather than a typed-literal keyword: Snowflake has
+/// no `TIMESTAMPTZ '…'` syntax; both cast forms are live-verified. `esc()`
+/// on the string variants is defense in depth against a crafted value
+/// escaping its literal *within the inner SQL* (the whole inner SQL is
+/// additionally escaped once at the `wrap_query` boundary — two independent
+/// layers, each correct alone).
+fn snowflake_literal(mark: &MarkValue) -> String {
+    match mark {
+        MarkValue::Ts(s) => format!("'{}'::TIMESTAMP_TZ", esc(s)),
+        MarkValue::Date(s) => format!("'{}'::DATE", esc(s)),
+        MarkValue::Int(n) => n.to_string(),
+    }
+}
+
+/// The SELECT the engine wraps in `CREATE TEMP TABLE … AS` — via
+/// `snowflake_query()`, with the watermark predicate (if any) baked into
+/// the server-side SQL in Snowflake's own dialect
+/// (`MarkValue::as_snowflake_literal` — live-verified byte-correct for DATE
+/// and TIMESTAMP_TZ cursors). The cursor identifier follows the §4 rule:
+/// folded to UPPERCASE, then quoted (a created-quoted, case-sensitive
+/// cursor column is not addressable — same boundary the table path draws).
 /// Kind-independent: tables and views read through the same path.
 pub(super) fn read_sql(
     alias: &str,
+    database: &str,
     table: &str,
     predicate: Option<&CursorPredicate>,
 ) -> Result<String> {
-    let qualified = qualify(alias, table)?;
-    Ok(match predicate {
+    let path = snowflake_path(database, table)?;
+    let inner = match predicate {
         Some(p) => {
-            let cq = p.cursor.replace('"', "\"\"");
+            let cq = p.cursor.to_ascii_uppercase().replace('"', "\"\"");
             format!(
-                "SELECT * FROM {qualified} WHERE \"{cq}\" > {}",
-                p.mark.as_literal()
+                "SELECT * FROM {path} WHERE \"{cq}\" > {}",
+                snowflake_literal(p.mark)
             )
         }
-        None => format!("SELECT * FROM {qualified}"),
-    })
+        None => format!("SELECT * FROM {path}"),
+    };
+    Ok(format!("SELECT * FROM {}", wrap_query(&inner, alias)))
 }
 
 /// ADR 0007 §2's server-side read for an author-owned `query:` source — the
@@ -185,21 +240,18 @@ pub(super) fn read_sql(
 /// `database` (the session database), so no `${connection.*}` binding
 /// applies.
 pub(super) fn query_read_sql(alias: &str, query: &str) -> String {
-    format!(
-        "SELECT * FROM snowflake_query('{}', '{}')",
-        esc(query),
-        esc(&secret_name(alias))
-    )
+    format!("SELECT * FROM {}", wrap_query(query, alias))
 }
 
-/// A LOAD/ATTACH failure whose text names the extension's missing-ADBC-driver
-/// lookup, rewritten into the actionable message (what the driver is, why
-/// datamk can't fetch it, the env-var override, where the install command
-/// lives); anything else is wrapped with the same context text every other
-/// connector's attach failure gets. `passphrase` is the connection's key
-/// passphrase, if any — the attach batch embeds it as a SQL literal, so any
-/// error text that happens to echo the failing statement is scrubbed before
-/// it can reach a log (defense in depth alongside the `Redacted` wrapper).
+/// A LOAD/setup (secret + probe) failure whose text names the extension's
+/// missing-ADBC-driver lookup, rewritten into the actionable message (what
+/// the driver is, why datamk can't fetch it, the env-var override, where the
+/// install command lives); anything else is wrapped with the same context
+/// text every other connector's attach failure gets. `passphrase` is the
+/// connection's key passphrase, if any — the setup batch embeds it as a SQL
+/// literal, so any error text that happens to echo the failing statement is
+/// scrubbed before it can reach a log (defense in depth alongside the
+/// `Redacted` wrapper).
 pub(super) fn rewrite_attach_error(
     err: duckdb::Error,
     connection: &str,
@@ -275,13 +327,18 @@ pub(super) fn rewrite_stage_error(
             "source '{name}' ({describe}): no active warehouse. {fix}\n\n{msg}"
         );
     }
-    // Deliberately narrow: DuckDB's own catalog error for a missing table
-    // through the attach ("Catalog Error: Table with name X does not
-    // exist!", live-captured) — NOT a bare "does not exist" match, which
+    // Deliberately narrow: Snowflake's own compilation error for a missing
+    // object through `snowflake_query` ("SQL compilation error: Object
+    // 'DB.SCHEMA.TABLE' does not exist or not authorized.", error 002003,
+    // live-captured) — the `Object '` prefix is load-bearing, because
     // Snowflake's warehouse/schema/role errors ("Warehouse 'X' does not
-    // exist or not authorized") would false-positive into a misleading
-    // table-not-found diagnosis.
-    if describe != "query" && msg.contains("Table with name") && msg.contains("does not exist") {
+    // exist or not authorized") share the suffix and would otherwise
+    // false-positive into a misleading table-not-found diagnosis.
+    if describe != "query"
+        && msg.contains("SQL compilation error")
+        && msg.contains("Object '")
+        && msg.contains("does not exist or not authorized")
+    {
         let seen_by = match role {
             Some(r) => format!("role {r}"),
             None => "the connection's user".to_string(),
@@ -314,8 +371,8 @@ pub(super) fn stage_narration(name: &str, table: &str) -> String {
 /// `ObjectKind::Query` arm with a mark).
 pub(super) fn stage_incremental_narration(name: &str, table: &str) -> String {
     format!(
-        "source '{name}' ({table}): staged delta past watermark — the predicate is pushed \
-         into the Snowflake read."
+        "source '{name}' ({table}): staged delta past watermark — the predicate executes \
+         server-side in the Snowflake read."
     )
 }
 
@@ -340,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_sql_is_read_only_pushdown_enabled_and_secret_aliased() {
+    fn attach_sql_creates_secret_and_probes_without_attaching() {
         assert_eq!(
             attach_sql(
                 "MYORG-ACCT",
@@ -353,8 +410,7 @@ mod tests {
             "CREATE OR REPLACE SECRET \"__conn_wh_secret\" (TYPE snowflake, \
              ACCOUNT 'MYORG-ACCT', DATABASE 'ANALYTICS', USER 'SVC_USER', \
              AUTH_TYPE 'key_pair', PRIVATE_KEY '/keys/sf.p8'); \
-             ATTACH IF NOT EXISTS '' AS \"__conn_wh\" (TYPE snowflake, \
-             SECRET \"__conn_wh_secret\", READ_ONLY, enable_pushdown true);"
+             SELECT * FROM snowflake_query('SELECT 1', '__conn_wh_secret');"
         );
     }
 
@@ -389,32 +445,45 @@ mod tests {
     }
 
     #[test]
-    fn qualify_folds_to_uppercase_then_quotes() {
+    fn qualify_folds_to_uppercase_and_wraps_as_snowflake_query() {
         assert_eq!(
-            qualify("__conn_wh", "raw.vehicle_models").unwrap(),
-            "\"__conn_wh\".\"RAW\".\"VEHICLE_MODELS\""
+            qualify("__conn_wh", "analytics", "raw.vehicle_models").unwrap(),
+            "snowflake_query('SELECT * FROM \"ANALYTICS\".\"RAW\".\"VEHICLE_MODELS\"', \
+             '__conn_wh_secret')"
         );
         assert_eq!(
-            qualify("__conn_wh", "RAW.VEHICLE_MODELS").unwrap(),
-            "\"__conn_wh\".\"RAW\".\"VEHICLE_MODELS\""
+            qualify("__conn_wh", "ANALYTICS", "RAW.VEHICLE_MODELS").unwrap(),
+            "snowflake_query('SELECT * FROM \"ANALYTICS\".\"RAW\".\"VEHICLE_MODELS\"', \
+             '__conn_wh_secret')"
         );
     }
 
     #[test]
     fn qualify_rejects_one_and_three_part_names() {
         for bad in ["accounts", "db.sales.accounts", "sales.", ".accounts", ""] {
-            let err = qualify("__conn_wh", bad).unwrap_err().to_string();
+            let err = qualify("__conn_wh", "ANALYTICS", bad)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("schema.table"), "for '{bad}': {err}");
         }
     }
 
     #[test]
     fn qualify_rejects_quoted_case_sensitive_names_steering_to_query() {
-        let err = qualify("__conn_wh", "\"sqlmesh\".\"_versions\"")
+        let err = qualify("__conn_wh", "ANALYTICS", "\"sqlmesh\".\"_versions\"")
             .unwrap_err()
             .to_string();
         assert!(err.contains("double quote"), "{err}");
         assert!(err.contains("`query:`"), "{err}");
+    }
+
+    #[test]
+    fn qualify_rejects_a_quoted_database_name() {
+        let err = qualify("__conn_wh", "\"analytics\"", "raw.t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("database"), "{err}");
+        assert!(err.contains("double quote"), "{err}");
     }
 
     #[test]
@@ -434,25 +503,49 @@ mod tests {
     }
 
     #[test]
-    fn read_sql_plain_reads_through_the_attach() {
+    fn read_sql_plain_reads_via_snowflake_query() {
         assert_eq!(
-            read_sql("__conn_wh", "raw.vehicle_models", None).unwrap(),
-            "SELECT * FROM \"__conn_wh\".\"RAW\".\"VEHICLE_MODELS\""
+            read_sql("__conn_wh", "ANALYTICS", "raw.vehicle_models", None).unwrap(),
+            "SELECT * FROM snowflake_query('SELECT * FROM \
+             \"ANALYTICS\".\"RAW\".\"VEHICLE_MODELS\"', '__conn_wh_secret')"
         );
     }
 
     #[test]
-    fn read_sql_with_predicate_renders_a_duckdb_literal() {
+    fn read_sql_with_ts_predicate_renders_a_server_side_snowflake_literal() {
         let mark = MarkValue::Ts("2026-07-04 10:58:00+00".to_string());
         let pred = CursorPredicate {
             cursor: "updated_at",
             mark: &mark,
         };
+        // The cursor folds to UPPERCASE (§4) and the literal is Snowflake
+        // dialect; the inner SQL's single quotes are doubled once by the
+        // `wrap_query` boundary.
         assert_eq!(
-            read_sql("__conn_wh", "raw.events", Some(&pred)).unwrap(),
-            "SELECT * FROM \"__conn_wh\".\"RAW\".\"EVENTS\" WHERE \"updated_at\" > \
-             TIMESTAMPTZ '2026-07-04 10:58:00+00'"
+            read_sql("__conn_wh", "ANALYTICS", "raw.events", Some(&pred)).unwrap(),
+            "SELECT * FROM snowflake_query('SELECT * FROM \"ANALYTICS\".\"RAW\".\"EVENTS\" \
+             WHERE \"UPDATED_AT\" > ''2026-07-04 10:58:00+00''::TIMESTAMP_TZ', \
+             '__conn_wh_secret')"
         );
+    }
+
+    #[test]
+    fn read_sql_with_date_and_int_predicates_render_snowflake_dialect() {
+        let mark = MarkValue::Date("2026-07-04".to_string());
+        let pred = CursorPredicate {
+            cursor: "d",
+            mark: &mark,
+        };
+        let sql = read_sql("__conn_wh", "ANALYTICS", "raw.events", Some(&pred)).unwrap();
+        assert!(sql.contains("\"D\" > ''2026-07-04''::DATE"), "{sql}");
+
+        let mark = MarkValue::Int(42);
+        let pred = CursorPredicate {
+            cursor: "seq",
+            mark: &mark,
+        };
+        let sql = read_sql("__conn_wh", "ANALYTICS", "raw.events", Some(&pred)).unwrap();
+        assert!(sql.contains("\"SEQ\" > 42"), "{sql}");
     }
 
     #[test]
@@ -545,11 +638,15 @@ mod tests {
         assert!(err.contains("GRANT USAGE ON WAREHOUSE WH"), "{err}");
     }
 
-    /// Live reality check: DuckDB's catalog error for a missing table
-    /// through the attach.
+    /// Live reality check: Snowflake's own compilation error for a missing
+    /// object through `snowflake_query` (error 002003, captured 2026-07-15).
     #[test]
     fn rewrite_stage_error_explains_the_uppercase_fold_on_not_found() {
-        let e = duck_err("Catalog Error: Table with name NO_SUCH_TABLE does not exist!");
+        let e = duck_err(
+            "IO Error: Failed to execute snowflake_query: [snowflake] 002003 (42S02): \
+             SQL compilation error:\nObject 'CAR_MANUFACTURING.RAW.NO_SUCH_TABLE' does not \
+             exist or not authorized.",
+        );
         let err = rewrite_stage_error(
             e,
             "models",
@@ -565,14 +662,14 @@ mod tests {
         assert!(err.contains("role CAR_MANUFACTURING_ROLE"), "{err}");
         assert!(err.contains("`query:`"), "{err}");
         // The root cause is appended, never discarded.
-        assert!(err.contains("Catalog Error"), "{err}");
+        assert!(err.contains("SQL compilation error"), "{err}");
     }
 
     #[test]
     fn rewrite_stage_error_never_misreads_a_missing_warehouse_as_a_missing_table() {
         // Snowflake's own "does not exist or not authorized" wording for a
         // warehouse/schema/role must not trip the table-not-found rewrite —
-        // the match is DuckDB's catalog-error shape ("Table with name"),
+        // the match requires the compilation error's `Object '` prefix,
         // nothing looser.
         let e =
             duck_err("IO Error: [snowflake] Warehouse 'TYPO_WH' does not exist or not authorized.");
@@ -585,12 +682,19 @@ mod tests {
 
     #[test]
     fn rewrite_stage_error_never_misreads_a_query_source_as_not_found() {
-        // A `query:` source's failure text can legitimately contain "does
-        // not exist" (Snowflake's own compilation error) — the not-found
-        // rewrite is table-shaped and must not fire for `describe == "query"`.
-        let e = duck_err("SQL compilation error: Object 'X' does not exist or not authorized");
+        // A `query:` source's failure text is the *same* compilation-error
+        // shape a missing table produces (the author's SQL names its own
+        // objects) — the not-found rewrite is table-shaped and must not fire
+        // for `describe == "query"`, whose fold/`query:` guidance would be
+        // nonsense for author-owned SQL.
+        let e = duck_err(
+            "IO Error: Failed to execute snowflake_query: [snowflake] 002003 (42S02): \
+             SQL compilation error:\nObject 'X' does not exist or not authorized.",
+        );
         let err = rewrite_stage_error(e, "s", "query", "DB", None, None, "staging ctx");
-        assert!(err.to_string().contains("staging ctx"), "{err}");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("table not found"), "{msg}");
+        assert!(msg.contains("staging ctx"), "{msg}");
     }
 
     #[test]

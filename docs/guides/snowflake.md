@@ -43,8 +43,8 @@ connections:
   (ADR 0003 §2), and Snowflake is phasing out single-factor passwords for
   service users anyway.
 - `externalbrowser` is interactive by nature: each `datamk run` opens your
-  browser once at attach. **Deploy pre-flight refuses it** — a Builder pod
-  has no browser; deployed profiles use `private_key_path:`.
+  browser once at connection setup. **Deploy pre-flight refuses it** — a
+  Builder pod has no browser; deployed profiles use `private_key_path:`.
 - `externalbrowser` **requires a SAML/SSO identity provider** (Okta, AzureAD,
   …) configured on the Snowflake account. An account with no IdP rejects the
   flow server-side (Snowflake error 390190) — the underlying driver stack
@@ -80,7 +80,7 @@ reference so the secret lives in the environment, never in the profile file.
 
 The DuckDB `snowflake` community extension reads through the **Arrow ADBC
 Snowflake driver**, a separate native library datamk cannot install from
-DuckDB's extension registry. Without it, the first attach fails with an
+DuckDB's extension registry. Without it, connection setup fails with an
 error pointing here.
 
 One-line install (macOS arm64 / Linux; inspect it first if you prefer):
@@ -124,12 +124,13 @@ sources:
 materialized into a session-local temp table — **in full, once per run**,
 plain base tables included. Transform `WHERE` clauses do **not** push down to
 Snowflake (the opposite of BigQuery base tables, which bind read-through
-with pushdown; the Snowflake extension's scan cannot survive arbitrary
-transform SQL, so datamk never exposes it to transforms). Staging once per
-run also means N transforms referencing a source cost one Snowflake read,
-not N. To bound a large source, use `incremental:` (§4) or aggregate
-server-side with `query:` (§5) — the run log says exactly this when a
-non-incremental source is staged.
+with pushdown; the Snowflake extension's attach-scan emits invalid SQL for
+ordinary shapes like a bare `COUNT(*)`, so datamk never exposes it to
+transforms — reads go through `snowflake_query()` instead, ADR 0009 §1a).
+Staging once per run also means N transforms referencing a source cost one
+Snowflake read, not N. To bound a large source, use `incremental:` (§4) or
+aggregate server-side with `query:` (§5) — the run log says exactly this
+when a non-incremental source is staged.
 
 ## 4. `incremental:`
 
@@ -145,15 +146,17 @@ sources:
       lookback: 2h
 ```
 
-The watermark predicate is pushed down into the Snowflake read (verified
-byte-correct for `DATE` and `TIMESTAMP_TZ` cursors), so steady-state runs
-transfer only the delta. Snowflake's `NUMBER(38,0)` integer columns work as
-cursors (they surface as `DECIMAL(38,0)`; values must fit in 64 bits).
+The watermark predicate executes server-side inside the Snowflake read
+(verified byte-correct for `DATE` and `TIMESTAMP_TZ` cursors), so
+steady-state runs transfer only the delta. The cursor column name follows
+the same UPPERCASE fold as table paths (§3). Snowflake's `NUMBER(38,0)`
+integer columns work as cursors (they surface as `DECIMAL(38,0)`; values
+must fit in 64 bits).
 
-`TIMESTAMP_NTZ`/`TIMESTAMP_LTZ` cursors work through the same DuckDB-side
-comparison; if your cursor is `TIMESTAMP_NTZ`, keep the session timezone
-consistent across runs (datamk compares against the watermark in the DuckDB
-session, and the ADBC driver surfaces NTZ values as naive timestamps).
+`TIMESTAMP_NTZ`/`TIMESTAMP_LTZ` cursors work through the same comparison;
+if your cursor is `TIMESTAMP_NTZ`, keep the session timezone consistent
+across runs (the watermark literal is rendered from the DuckDB session's
+value, and the ADBC driver surfaces NTZ values as naive timestamps).
 
 ## 5. `query:` sources
 
@@ -188,10 +191,10 @@ spend with your own `EXPLAIN` and the warehouse's resource monitors.
 - **"table not found in database …"** — the error names the UPPERCASE-folded
   path datamk actually looked for; check it exists and that the connection's
   role can see it, or use `query:` for a case-sensitive name.
-- **JWT/auth failures at attach** — the public key isn't registered on the
-  user (`ALTER USER … SET RSA_PUBLIC_KEY`), or the key file is wrong. datamk
-  verifies the key *file exists* before attaching; Snowflake verifies the
-  rest.
+- **JWT/auth failures at connection setup** — the public key isn't
+  registered on the user (`ALTER USER … SET RSA_PUBLIC_KEY`), or the key
+  file is wrong. datamk verifies the key *file exists* before any Snowflake
+  traffic; Snowflake verifies the rest at the setup probe.
 
 ## 7. What Snowflake sources don't have
 
