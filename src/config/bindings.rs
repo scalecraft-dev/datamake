@@ -1118,9 +1118,7 @@ mod tests {
                 assert_eq!(connection, "wh");
                 assert_eq!(account, "MYORG-ACCT");
                 assert_eq!(database, "ANALYTICS");
-                assert!(
-                    matches!(target, ConnectionTarget::Table(t) if t == "raw.vehicle_models")
-                );
+                assert!(matches!(target, ConnectionTarget::Table(t) if t == "raw.vehicle_models"));
             }
             other => panic!("expected snowflake connection, got {other:?}"),
         }
@@ -1165,7 +1163,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("`${connection.database}`"), "{err}");
-        assert!(err.contains("no `${connection.*}` binding applies"), "{err}");
+        assert!(
+            err.contains("no `${connection.*}` binding applies"),
+            "{err}"
+        );
         assert!(
             !err.contains("the only supported binding is"),
             "must not advise `${{connection.project}}` on snowflake: {err}"

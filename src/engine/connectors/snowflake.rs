@@ -238,9 +238,7 @@ pub(super) fn rewrite_attach_error(
     } else {
         // Built from the scrubbed text, not the original `err`, so a
         // statement-echoing error can never carry the passphrase onward.
-        anyhow::anyhow!("{msg}").context(format!(
-            "attaching connection '{connection}' (snowflake)"
-        ))
+        anyhow::anyhow!("{msg}").context(format!("attaching connection '{connection}' (snowflake)"))
     }
 }
 
@@ -273,7 +271,9 @@ pub(super) fn rewrite_stage_error(
                      connection."
                 .to_string(),
         };
-        return anyhow::anyhow!("source '{name}' ({describe}): no active warehouse. {fix}\n\n{msg}");
+        return anyhow::anyhow!(
+            "source '{name}' ({describe}): no active warehouse. {fix}\n\n{msg}"
+        );
     }
     // Deliberately narrow: DuckDB's own catalog error for a missing table
     // through the attach ("Catalog Error: Table with name X does not
@@ -342,7 +342,14 @@ mod tests {
     #[test]
     fn attach_sql_is_read_only_pushdown_enabled_and_secret_aliased() {
         assert_eq!(
-            attach_sql("MYORG-ACCT", "ANALYTICS", &keypair(), None, None, "__conn_wh"),
+            attach_sql(
+                "MYORG-ACCT",
+                "ANALYTICS",
+                &keypair(),
+                None,
+                None,
+                "__conn_wh"
+            ),
             "CREATE OR REPLACE SECRET \"__conn_wh_secret\" (TYPE snowflake, \
              ACCOUNT 'MYORG-ACCT', DATABASE 'ANALYTICS', USER 'SVC_USER', \
              AUTH_TYPE 'key_pair', PRIVATE_KEY '/keys/sf.p8'); \
@@ -358,14 +365,7 @@ mod tests {
             private_key_path: "/keys/sf.p8".to_string(),
             passphrase: Some(Redacted("s3'cret".to_string())),
         };
-        let sql = attach_sql(
-            "A",
-            "D",
-            &auth,
-            Some("WH"),
-            Some("ANALYST"),
-            "__conn_wh",
-        );
+        let sql = attach_sql("A", "D", &auth, Some("WH"), Some("ANALYST"), "__conn_wh");
         assert!(sql.contains("PRIVATE_KEY_PASSPHRASE 's3''cret'"), "{sql}");
         assert!(sql.contains("WAREHOUSE 'WH'"), "{sql}");
         assert!(sql.contains("ROLE 'ANALYST'"), "{sql}");
@@ -484,7 +484,10 @@ mod tests {
         );
         let err = rewrite_attach_error(e, "wh", None).to_string();
         assert!(err.contains("SNOWFLAKE_ADBC_DRIVER_PATH"), "{err}");
-        assert!(err.contains("docs/guides/snowflake.md#adbc-driver"), "{err}");
+        assert!(
+            err.contains("docs/guides/snowflake.md#adbc-driver"),
+            "{err}"
+        );
         assert!(err.contains("Searched locations"), "{err}");
         assert!(err.contains("connection 'wh'"), "{err}");
     }
@@ -493,7 +496,10 @@ mod tests {
     fn rewrite_attach_error_wraps_other_failures_with_context() {
         let e = duck_err("JWT token is invalid");
         let err = rewrite_attach_error(e, "wh", None);
-        assert!(err.to_string().contains("attaching connection 'wh'"), "{err}");
+        assert!(
+            err.to_string().contains("attaching connection 'wh'"),
+            "{err}"
+        );
         assert!(format!("{err:#}").contains("JWT token"), "{err:#}");
     }
 
@@ -520,7 +526,10 @@ mod tests {
         // into the error chain.
         let e = duck_err("Parser Error: near PRIVATE_KEY_PASSPHRASE 's3''cret' in ATTACH");
         let err = format!("{:#}", rewrite_attach_error(e, "wh", Some("s3'cret")));
-        assert!(!err.contains("s3'cret") && !err.contains("s3''cret"), "{err}");
+        assert!(
+            !err.contains("s3'cret") && !err.contains("s3''cret"),
+            "{err}"
+        );
         assert!(err.contains("<redacted>"), "{err}");
     }
 
@@ -532,8 +541,7 @@ mod tests {
         assert!(err.contains("Set `warehouse:`"), "{err}");
 
         let e = duck_err("No active warehouse selected in the current session");
-        let err =
-            rewrite_stage_error(e, "s", "raw.t", "DB", Some("WH"), None, "ctx").to_string();
+        let err = rewrite_stage_error(e, "s", "raw.t", "DB", Some("WH"), None, "ctx").to_string();
         assert!(err.contains("GRANT USAGE ON WAREHOUSE WH"), "{err}");
     }
 
@@ -566,7 +574,8 @@ mod tests {
         // warehouse/schema/role must not trip the table-not-found rewrite —
         // the match is DuckDB's catalog-error shape ("Table with name"),
         // nothing looser.
-        let e = duck_err("IO Error: [snowflake] Warehouse 'TYPO_WH' does not exist or not authorized.");
+        let e =
+            duck_err("IO Error: [snowflake] Warehouse 'TYPO_WH' does not exist or not authorized.");
         let err = rewrite_stage_error(e, "s", "raw.t", "DB", Some("TYPO_WH"), None, "staging ctx");
         let msg = format!("{err:#}");
         assert!(!msg.contains("table not found"), "{msg}");

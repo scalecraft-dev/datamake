@@ -1408,7 +1408,10 @@ connections:
         assert_eq!(sf.account, "MYORG-ACCT");
         assert_eq!(sf.user.as_deref(), Some("SVC_USER"));
         assert_eq!(sf.database, "ANALYTICS");
-        assert_eq!(sf.private_key_path.as_deref(), Some("/etc/datamk/sf-key.p8"));
+        assert_eq!(
+            sf.private_key_path.as_deref(),
+            Some("/etc/datamk/sf-key.p8")
+        );
         assert_eq!(sf.warehouse.as_deref(), Some("WH"));
         assert_eq!(sf.role.as_deref(), Some("ANALYST"));
         assert!(sf.authenticator.is_none());

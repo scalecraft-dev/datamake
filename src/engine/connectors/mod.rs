@@ -219,9 +219,8 @@ impl ResolvedConnection {
     /// connection …" context every connector gets.
     pub fn rewrite_attach_error(&self, err: duckdb::Error, connection: &str) -> anyhow::Error {
         match self {
-            ResolvedConnection::Bigquery { .. } => anyhow::Error::new(err).context(format!(
-                "attaching connection '{connection}' (bigquery)"
-            )),
+            ResolvedConnection::Bigquery { .. } => anyhow::Error::new(err)
+                .context(format!("attaching connection '{connection}' (bigquery)")),
             ResolvedConnection::Snowflake { auth, .. } => {
                 let passphrase = match auth {
                     SnowflakeAuth::KeyPair { passphrase, .. } => {
@@ -649,9 +648,10 @@ pub fn prepare(sources: &IndexMap<String, ResolvedSource>, dir: &Path) -> Result
         let ResolvedSource::Connection {
             config:
                 ResolvedConnection::Snowflake {
-                    auth: SnowflakeAuth::KeyPair {
-                        private_key_path, ..
-                    },
+                    auth:
+                        SnowflakeAuth::KeyPair {
+                            private_key_path, ..
+                        },
                     ..
                 },
             ..
@@ -776,10 +776,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("datamk_test_sf_key_verbatim.p8");
         std::fs::write(&tmp, "not really a key").unwrap();
         let mut sources = IndexMap::new();
-        sources.insert(
-            "a".to_string(),
-            sf_keypair_source(&tmp.to_string_lossy()),
-        );
+        sources.insert("a".to_string(), sf_keypair_source(&tmp.to_string_lossy()));
         prepare(&sources, Path::new("/would/break/if/joined")).unwrap();
         std::fs::remove_file(&tmp).ok();
     }
@@ -791,7 +788,9 @@ mod tests {
             "a".to_string(),
             sf_keypair_source("/definitely/not/there.p8"),
         );
-        let err = prepare(&sources, Path::new("/cell")).unwrap_err().to_string();
+        let err = prepare(&sources, Path::new("/cell"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("private key file"), "{err}");
         assert!(err.contains("/definitely/not/there.p8"), "{err}");
         assert!(err.contains("'a'"), "{err}");
