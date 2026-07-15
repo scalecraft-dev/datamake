@@ -163,6 +163,14 @@ s3:
 #     database: ${{SNOWFLAKE_DATABASE}}     # environment root — `table:` paths are schema.table
 #     # warehouse: ${{SNOWFLAKE_WAREHOUSE}} # omit to use the user's default warehouse
 #     # role: ${{SNOWFLAKE_ROLE}}           # omit to use the user's default role
+#   pg:
+#     type: postgres
+#     host: db.internal.example.com         # point at a read replica, not your production primary
+#     database: analytics                   # environment root — `table:` paths are schema.table
+#     user: datamk_ro                       # a read-only role (GRANT USAGE + SELECT only)
+#     password: ${{PG_PASSWORD}}            # pure ${{VAR}} only; omit for PGPASSWORD/~/.pgpass
+#     # port: "5432"
+#     # sslmode: require                    # the default — encrypted transport, unlike libpq
 "#
     )
 }

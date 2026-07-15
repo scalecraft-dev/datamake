@@ -817,6 +817,7 @@ pub struct Bindings {
 // connector, mirroring `engine::connectors`); re-exported here so `Connection`
 // stays the one place every connector's config shape is enumerated.
 pub use crate::config::connections::bigquery::BigQueryConnection;
+pub use crate::config::connections::postgres::PostgresConnection;
 pub use crate::config::connections::snowflake::SnowflakeConnection;
 
 /// One named warehouse connection, tagged by `type`. A closed enum: an unknown
@@ -825,6 +826,7 @@ pub use crate::config::connections::snowflake::SnowflakeConnection;
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Connection {
     Bigquery(BigQueryConnection),
+    Postgres(PostgresConnection),
     Snowflake(SnowflakeConnection),
 }
 
@@ -1433,7 +1435,34 @@ connections:
             .to_string();
         assert!(err.contains("redshift"), "unexpected error: {err}");
         assert!(err.contains("bigquery"), "unexpected error: {err}");
+        assert!(err.contains("postgres"), "unexpected error: {err}");
         assert!(err.contains("snowflake"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bindings_postgres_connection_parses() {
+        let yaml = r#"
+catalog: c
+storage: s
+connections:
+  pg:
+    type: postgres
+    host: db.internal.example.com
+    database: analytics
+    user: datamk_ro
+    password: ${PG_PASSWORD}
+    sslmode: verify-full
+"#;
+        let b: Bindings = serde_yaml::from_str(yaml).unwrap();
+        let Connection::Postgres(pg) = b.connections.get("pg").unwrap() else {
+            panic!("expected postgres");
+        };
+        assert_eq!(pg.host, "db.internal.example.com");
+        assert_eq!(pg.database, "analytics");
+        assert_eq!(pg.user.as_deref(), Some("datamk_ro"));
+        assert_eq!(pg.password.as_deref(), Some("${PG_PASSWORD}"));
+        assert_eq!(pg.sslmode.as_deref(), Some("verify-full"));
+        assert!(pg.port.is_none());
     }
 
     #[test]

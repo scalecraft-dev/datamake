@@ -11,6 +11,7 @@
 //! `config::connections::`. This file is dispatch only.
 
 mod bigquery;
+mod postgres;
 mod snowflake;
 
 use anyhow::{bail, Result};
@@ -173,6 +174,7 @@ impl ResolvedConnection {
     pub fn type_name(&self) -> &'static str {
         match self {
             ResolvedConnection::Bigquery { .. } => "bigquery",
+            ResolvedConnection::Postgres { .. } => "postgres",
             ResolvedConnection::Snowflake { .. } => "snowflake",
         }
     }
@@ -182,6 +184,9 @@ impl ResolvedConnection {
     pub fn install_load_sql(&self) -> &'static str {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::INSTALL_LOAD_SQL,
+            // Core extension — no `FROM community`, already baked wherever
+            // the metadata-DB catalog path works.
+            ResolvedConnection::Postgres { .. } => postgres::INSTALL_LOAD_SQL,
             ResolvedConnection::Snowflake { .. } => snowflake::INSTALL_LOAD_SQL,
         }
     }
@@ -210,6 +215,22 @@ impl ResolvedConnection {
                 role.as_deref(),
                 alias,
             ),
+            ResolvedConnection::Postgres {
+                host,
+                port,
+                database,
+                user,
+                password,
+                sslmode,
+            } => postgres::attach_sql(
+                host,
+                *port,
+                database,
+                user,
+                password.as_ref().map(|p| p.0.as_str()),
+                sslmode,
+                alias,
+            ),
         }
     }
 
@@ -230,6 +251,23 @@ impl ResolvedConnection {
                 };
                 snowflake::rewrite_attach_error(err, connection, passphrase)
             }
+            ResolvedConnection::Postgres {
+                host,
+                port,
+                database,
+                user,
+                password,
+                sslmode,
+            } => postgres::rewrite_attach_error(
+                err,
+                connection,
+                host,
+                *port,
+                database,
+                user,
+                sslmode,
+                password.as_ref().map(|p| p.0.as_str()),
+            ),
         }
     }
 
@@ -238,6 +276,7 @@ impl ResolvedConnection {
     pub fn qualify(&self, alias: &str, table: &str) -> Result<String> {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::qualify(alias, table),
+            ResolvedConnection::Postgres { .. } => postgres::qualify(alias, table),
             ResolvedConnection::Snowflake { .. } => snowflake::qualify(alias, table),
         }
     }
@@ -250,7 +289,9 @@ impl ResolvedConnection {
     fn credentials(&self) -> Option<&str> {
         match self {
             ResolvedConnection::Bigquery { credentials, .. } => credentials.as_deref(),
-            ResolvedConnection::Snowflake { .. } => None,
+            // Postgres auth is per-connection `CREATE SECRET` material (or
+            // libpq's ambient chain) — nothing process-global, like Snowflake.
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => None,
         }
     }
 
@@ -261,7 +302,9 @@ impl ResolvedConnection {
     pub fn staging_uri(&self) -> Option<&str> {
         match self {
             ResolvedConnection::Bigquery { staging_uri, .. } => staging_uri.as_deref(),
-            ResolvedConnection::Snowflake { .. } => None,
+            // Neither has a jobs-API result ceiling: Snowflake streams over
+            // Arrow, Postgres over the wire protocol.
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => None,
         }
     }
 
@@ -274,6 +317,9 @@ impl ResolvedConnection {
             ResolvedConnection::Bigquery { .. } => bigquery::point_adc_at(path),
             ResolvedConnection::Snowflake { .. } => {
                 unreachable!("snowflake has no process-global credential file")
+            }
+            ResolvedConnection::Postgres { .. } => {
+                unreachable!("postgres has no process-global credential file")
             }
         }
     }
@@ -297,6 +343,11 @@ impl ResolvedConnection {
             // Pure — no metadata job at all: every Snowflake object routes
             // through the staged path, so there is nothing to look up.
             ResolvedConnection::Snowflake { .. } => snowflake::classify_objects(tables),
+            // Pure, and the mirror image (ADR 0010): every Postgres object
+            // routes through the read-through path — postgres_scanner reads
+            // tables, views, and materialized views uniformly (live-verified)
+            // — so there is equally nothing to look up.
+            ResolvedConnection::Postgres { .. } => postgres::classify_objects(tables),
         }
     }
 
@@ -326,6 +377,10 @@ impl ResolvedConnection {
             // Kind-independent: through the attach, predicate rendered
             // DuckDB-side (`meta` carries nothing Snowflake needs).
             ResolvedConnection::Snowflake { .. } => snowflake::read_sql(alias, table, predicate),
+            // Defensive: everything classifies `Table`, so the engine never
+            // routes a Postgres source here — but the answer is coherent
+            // (same shape as the engine's own Table-kind staging SQL).
+            ResolvedConnection::Postgres { .. } => postgres::read_sql(alias, table, predicate),
         }
     }
 
@@ -336,9 +391,9 @@ impl ResolvedConnection {
     fn is_jobs_permission_denied(&self, err: &anyhow::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_jobs_permission_denied(err),
-            // Snowflake classification runs no job, so there is nothing to
-            // be denied — a classify error is always a genuine failure.
-            ResolvedConnection::Snowflake { .. } => false,
+            // Neither runs a classification job, so there is nothing to be
+            // denied — a classify error is always a genuine failure.
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => false,
         }
     }
 
@@ -349,10 +404,13 @@ impl ResolvedConnection {
     pub fn rewrite_view_leak(&self, err: duckdb::Error, name: &str, table: &str) -> anyhow::Error {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::rewrite_view_leak(err, name, table),
-            // Unreachable in practice — Snowflake classification never
-            // returns `Ok(None)`, so the probe that calls this never runs.
-            ResolvedConnection::Snowflake { .. } => anyhow::Error::new(err)
-                .context(format!("probing source '{name}' ({table}) before bind")),
+            // Unreachable in practice — Snowflake/Postgres classification
+            // never returns `Ok(None)`, so the probe that calls this never
+            // runs.
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => {
+                anyhow::Error::new(err)
+                    .context(format!("probing source '{name}' ({table}) before bind"))
+            }
         }
     }
 
@@ -387,6 +445,9 @@ impl ResolvedConnection {
                 role.as_deref(),
                 context,
             ),
+            ResolvedConnection::Postgres { database, user, .. } => {
+                postgres::rewrite_stage_error(err, name, describe, database, user, context)
+            }
         }
     }
 
@@ -398,7 +459,7 @@ impl ResolvedConnection {
     pub fn is_response_too_large(&self, err: &duckdb::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_response_too_large(err),
-            ResolvedConnection::Snowflake { .. } => false,
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => false,
         }
     }
 
@@ -428,9 +489,13 @@ impl ResolvedConnection {
                 run_prefix,
             ),
             // Unreachable: escalation is gated on `is_response_too_large`,
-            // which is never true for Snowflake.
+            // which is never true for either.
             ResolvedConnection::Snowflake { .. } => bail!(
                 "snowflake has no oversized-result export path (internal error) — please \
+                 report this"
+            ),
+            ResolvedConnection::Postgres { .. } => bail!(
+                "postgres has no oversized-result export path (internal error) — please \
                  report this"
             ),
         }
@@ -451,6 +516,7 @@ impl ResolvedConnection {
                 ..
             } => bigquery::query_read_sql(project, billing_project.as_deref(), query),
             ResolvedConnection::Snowflake { .. } => snowflake::query_read_sql(alias, query),
+            ResolvedConnection::Postgres { .. } => postgres::query_read_sql(alias, query),
         }
     }
 
@@ -474,6 +540,10 @@ impl ResolvedConnection {
                 "snowflake has no oversized-result export path (internal error) — please \
                  report this"
             ),
+            ResolvedConnection::Postgres { .. } => bail!(
+                "postgres has no oversized-result export path (internal error) — please \
+                 report this"
+            ),
         }
     }
 
@@ -493,7 +563,10 @@ impl ResolvedConnection {
                 billing_project.as_deref(),
                 query,
             )),
-            ResolvedConnection::Snowflake { .. } => None,
+            // Neither has a free dry-run (Postgres's EXPLAIN estimates rows
+            // but validates nothing a real read wouldn't) — the engine skips
+            // the preflight silently, an expected capability gap.
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => None,
         }
     }
 
@@ -504,8 +577,8 @@ impl ResolvedConnection {
     pub fn is_dry_run_query_error(&self, err: &duckdb::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_dry_run_query_error(err),
-            // No dry-run runs for Snowflake, so no failure to classify.
-            ResolvedConnection::Snowflake { .. } => false,
+            // No dry-run runs for either, so no failure to classify.
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => false,
         }
     }
 
@@ -520,6 +593,10 @@ impl ResolvedConnection {
         match self {
             ResolvedConnection::Bigquery { .. } => false,
             ResolvedConnection::Snowflake { .. } => true,
+            // Postgres has real INTEGER/BIGINT distinct from NUMERIC — a
+            // scale-zero NUMERIC cursor is a genuine decimal, not
+            // Snowflake's everything-is-NUMBER(38,0) situation.
+            ResolvedConnection::Postgres { .. } => false,
         }
     }
 
@@ -544,6 +621,13 @@ impl ResolvedConnection {
                     format!("staging source '{name}' -> {describe} from Snowflake")
                 }
             }
+            ResolvedConnection::Postgres { .. } => {
+                if describe == "query" {
+                    format!("staging query source '{name}' server-side in Postgres")
+                } else {
+                    format!("staging source '{name}' -> {describe} from Postgres")
+                }
+            }
         }
     }
 
@@ -554,7 +638,8 @@ impl ResolvedConnection {
     pub fn staged_kind(&self) -> &'static str {
         match self {
             ResolvedConnection::Bigquery { .. } => "view",
-            ResolvedConnection::Snowflake { .. } => "table",
+            // What the author declared is a table path.
+            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => "table",
         }
     }
 
@@ -570,6 +655,7 @@ impl ResolvedConnection {
                  read only new rows."
             ),
             ResolvedConnection::Snowflake { .. } => snowflake::stage_narration(name, table),
+            ResolvedConnection::Postgres { .. } => postgres::stage_narration(name, table),
         }
     }
 
@@ -584,6 +670,9 @@ impl ResolvedConnection {
             ResolvedConnection::Snowflake { .. } => {
                 snowflake::stage_incremental_narration(name, table)
             }
+            ResolvedConnection::Postgres { .. } => {
+                postgres::stage_incremental_narration(name, table)
+            }
         }
     }
 
@@ -595,6 +684,7 @@ impl ResolvedConnection {
                  jobs API"
             ),
             ResolvedConnection::Snowflake { .. } => snowflake::query_stage_narration(name),
+            ResolvedConnection::Postgres { .. } => postgres::query_stage_narration(name),
         }
     }
 }

@@ -3,7 +3,9 @@
 //! by `src/engine/connectors/` on the engine side (ADR 0003's enum-plus-match
 //! seam) — adding a connector is two new files (one here, one there) plus one
 //! `Connection`/`ResolvedConnection` variant and one match arm per dispatch
-//! point, never a trait or a cargo feature.
+//! point (about twenty methods at last count), never a trait or a cargo
+//! feature.
 
 pub mod bigquery;
+pub mod postgres;
 pub mod snowflake;

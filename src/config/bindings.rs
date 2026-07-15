@@ -92,6 +92,20 @@ pub enum ResolvedConnection {
         warehouse: Option<String>,
         role: Option<String>,
     },
+    Postgres {
+        host: String,
+        port: u16,
+        /// The database whose schemas are read — the environment root,
+        /// analog of BigQuery's `project`. `table:` paths are
+        /// `schema.table` under it.
+        database: String,
+        user: String,
+        /// `None` ⇒ libpq's ambient chain (`PGPASSWORD`, `~/.pgpass`) — the
+        /// analog of BigQuery's ambient ADC.
+        password: Option<Redacted>,
+        /// Validated against libpq's set at resolve time; default `require`.
+        sslmode: String,
+    },
 }
 
 /// How a Snowflake connection authenticates — exactly one mechanism,
@@ -281,6 +295,7 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
                         let substituted = substitute_connection_bindings(
                             name,
                             q,
+                            resolved_conn.type_name(),
                             connection_project(&resolved_conn),
                         )?;
                         ConnectionTarget::Query(expand(&substituted)?)
@@ -355,6 +370,7 @@ fn resolve_incremental(source_name: &str, inc: &Incremental) -> Result<ResolvedI
 fn resolve_connection(name: &str, c: &Connection) -> Result<ResolvedConnection> {
     match c {
         Connection::Bigquery(bq) => super::connections::bigquery::resolve_bigquery(bq),
+        Connection::Postgres(pg) => super::connections::postgres::resolve_postgres(name, pg),
         Connection::Snowflake(sf) => super::connections::snowflake::resolve_snowflake(name, sf),
     }
 }
@@ -364,14 +380,14 @@ fn resolve_connection(name: &str, c: &Connection) -> Result<ResolvedConnection> 
 /// BigQuery-shaped concept, and `query:` sources are a BigQuery-shaped
 /// feature today — a future non-BigQuery connector shouldn't be forced to
 /// answer "what's your project" just because this one binding needs it.
-/// `None` ⇒ the connector has no such binding (Snowflake: the session's
-/// database already qualifies unqualified names, so a `query:` body needs
-/// no placeholder at all — `${connection.project}` in one is an error
-/// naming that fact).
+/// `None` ⇒ the connector has no such binding (Snowflake and Postgres: the
+/// connection's `database` is the session database, so unqualified names in
+/// a `query:` body already resolve against it and no placeholder applies —
+/// `${connection.project}` in one is an error naming that fact).
 fn connection_project(c: &ResolvedConnection) -> Option<&str> {
     match c {
         ResolvedConnection::Bigquery { project, .. } => Some(project),
-        ResolvedConnection::Snowflake { .. } => None,
+        ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => None,
     }
 }
 
@@ -405,6 +421,7 @@ const CONNECTION_BINDING_PREFIX: &str = "connection.";
 fn substitute_connection_bindings(
     source_name: &str,
     query: &str,
+    ty: &str,
     project: Option<&str>,
 ) -> Result<String> {
     let mut out = String::new();
@@ -421,8 +438,8 @@ fn substitute_connection_bindings(
                 ("project", Some(p)) => out.push_str(p),
                 ("project", None) => bail!(
                     "source '{source_name}': `${{connection.project}}` does not apply to this \
-                     connection type — a snowflake `query:` runs with the connection's \
-                     `database` as the session database, so unqualified `schema.table` names \
+                     connection type — a {ty} `query:` runs with the connection's \
+                     `database` as the session database, so unqualified names \
                      already resolve against it; remove the placeholder."
                 ),
                 // The advice must match the connector: naming
@@ -437,8 +454,8 @@ fn substitute_connection_bindings(
                 (other, None) => bail!(
                     "source '{source_name}': `${{connection.{other}}}` is not a supported \
                      binding in `query:` — no `${{connection.*}}` binding applies to this \
-                     connection type; a snowflake `query:` runs with the connection's \
-                     `database` as the session database, so unqualified `schema.table` names \
+                     connection type; a {ty} `query:` runs with the connection's \
+                     `database` as the session database, so unqualified names \
                      already resolve against it."
                 ),
             }
@@ -496,8 +513,8 @@ pub fn expand(input: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::super::schema::{
-        BigQueryConnection, Bindings, CellLocation, Export, GcsBinding, S3Binding,
-        SnowflakeConnection,
+        BigQueryConnection, Bindings, CellLocation, Export, GcsBinding, PostgresConnection,
+        S3Binding, SnowflakeConnection,
     };
     use super::*;
 
@@ -1122,6 +1139,93 @@ mod tests {
             }
             other => panic!("expected snowflake connection, got {other:?}"),
         }
+    }
+
+    fn bindings_with_postgres_connection() -> Bindings {
+        let mut connections = IndexMap::new();
+        connections.insert(
+            "pg".to_string(),
+            Connection::Postgres(PostgresConnection {
+                host: "db.internal.example.com".to_string(),
+                port: None,
+                database: "analytics".to_string(),
+                user: Some("datamk_ro".to_string()),
+                password: None,
+                sslmode: None,
+            }),
+        );
+        Bindings {
+            catalog: Some("c".into()),
+            storage: "s".into(),
+            s3: None,
+            gcs: None,
+            principals: None,
+            cells: IndexMap::new(),
+            connections,
+        }
+    }
+
+    #[test]
+    fn resolve_links_a_postgres_connection_source_via_the_profile() {
+        let def = cell_with_source(
+            "orders",
+            Source::Connection {
+                connection: "pg".to_string(),
+                table: Some("public.orders".to_string()),
+                query: None,
+                incremental: None,
+            },
+        );
+        let r = resolve(&def, &bindings_with_postgres_connection()).unwrap();
+        match r.sources.get("orders").unwrap() {
+            ResolvedSource::Connection {
+                connection,
+                config:
+                    ResolvedConnection::Postgres {
+                        host,
+                        port,
+                        database,
+                        user,
+                        sslmode,
+                        ..
+                    },
+                target,
+                ..
+            } => {
+                assert_eq!(connection, "pg");
+                assert_eq!(host, "db.internal.example.com");
+                assert_eq!(*port, 5432);
+                assert_eq!(database, "analytics");
+                assert_eq!(user, "datamk_ro");
+                assert_eq!(sslmode, "require");
+                assert!(matches!(target, ConnectionTarget::Table(t) if t == "public.orders"));
+            }
+            other => panic!("expected postgres connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_connection_project_in_a_postgres_query_source_naming_postgres() {
+        // The error must name the author's actual connector, not hardcode
+        // another one's name.
+        let def = cell_with_source(
+            "spend",
+            Source::Connection {
+                connection: "pg".to_string(),
+                table: None,
+                query: Some("SELECT * FROM ${connection.project}.x.y".to_string()),
+                incremental: None,
+            },
+        );
+        let err = resolve(&def, &bindings_with_postgres_connection())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not apply to this connection type"),
+            "{err}"
+        );
+        assert!(err.contains("postgres `query:`"), "{err}");
+        assert!(!err.contains("snowflake"), "{err}");
     }
 
     #[test]
