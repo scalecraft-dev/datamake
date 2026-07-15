@@ -154,6 +154,15 @@ s3:
 #     project: ${{GCP_PROJECT}}             # the project whose datasets are read
 #     # billing_project: ${{GCP_BILLING_PROJECT}}   # defaults to `project`
 #     # credentials: /etc/datamk/bq-key.json        # SA key file (secret mount); omit to use ADC
+#   wh:
+#     type: snowflake
+#     account: ${{SNOWFLAKE_ACCOUNT}}       # account identifier, e.g. MYORG-ACCOUNT123
+#     user: ${{SNOWFLAKE_USER}}
+#     private_key_path: /etc/datamk/sf-key.p8   # PKCS#8 key file (secret mount) — service accounts
+#     # authenticator: externalbrowser      # local-dev alternative: SSO via your browser
+#     database: ${{SNOWFLAKE_DATABASE}}     # environment root — `table:` paths are schema.table
+#     # warehouse: ${{SNOWFLAKE_WAREHOUSE}} # omit to use the user's default warehouse
+#     # role: ${{SNOWFLAKE_ROLE}}           # omit to use the user's default role
 "#
     )
 }

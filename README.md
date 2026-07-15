@@ -103,14 +103,24 @@ sandbox project in dev and the real one in prod:
 # profiles/prod.yaml
 connections:
   crm:
-    type: bigquery                # the only connector today; more to come
+    type: bigquery                # connectors today: bigquery, snowflake
     project: acme-prod-crm
     # credentials: /etc/datamk/bq-key.json   # service-account key; omit to use ADC
     # staging_uri: gs://acme-bq-staging/datamk-scratch  # oversized view reads only; see below
+  wh:
+    type: snowflake               # see docs/guides/snowflake.md (needs the ADBC driver)
+    account: MYORG-ACCOUNT123
+    user: DATAMK_SVC
+    private_key_path: /etc/datamk/sf-key.p8  # key-pair auth; local dev can use
+    database: ANALYTICS                      # `authenticator: externalbrowser` instead
+    # warehouse: REPORTING_WH
 ```
 
-Transforms filter through the view with full pushdown — write plain SQL against
-`crm_accounts` and DuckDB pushes projections/filters into the warehouse scanner.
+On BigQuery, transforms filter through the view with full pushdown — write
+plain SQL against `crm_accounts` and DuckDB pushes projections/filters into
+the warehouse scanner. (Snowflake sources are instead staged once per run —
+tables and views alike, no transform pushdown; `incremental:` and `query:`
+bound the read. See docs/guides/snowflake.md.)
 View-backed connection sources (a BigQuery view, materialized view, or
 external table) are auto-detected and read via the BigQuery jobs API instead
 — no DuckDB pushdown; the full view materializes every run unless

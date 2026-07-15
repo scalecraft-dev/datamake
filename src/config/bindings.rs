@@ -83,6 +83,43 @@ pub enum ResolvedConnection {
         /// error naming this field.
         staging_uri: Option<String>,
     },
+    Snowflake {
+        account: String,
+        /// The database whose schemas are read — the environment root,
+        /// analog of BigQuery's `project`.
+        database: String,
+        auth: SnowflakeAuth,
+        warehouse: Option<String>,
+        role: Option<String>,
+    },
+}
+
+/// How a Snowflake connection authenticates — exactly one mechanism,
+/// established at resolve time (`resolve_snowflake`).
+#[derive(Debug, Clone)]
+pub enum SnowflakeAuth {
+    /// A service account's PKCS#8 key file — the deployed/prod shape.
+    KeyPair {
+        user: String,
+        private_key_path: String,
+        passphrase: Option<Redacted>,
+    },
+    /// SSO through the user's own browser — the interactive local-dev
+    /// shape; refused by deploy pre-flight (a pod has no browser). `user`
+    /// is required: the extension refuses a secret without it
+    /// (live-verified: "Snowflake secret requires field 'user'").
+    ExternalBrowser { user: String },
+}
+
+/// A secret string whose value must never reach logs or error text —
+/// `Debug` (what `{:?}` on any containing type prints) is redacted.
+#[derive(Clone)]
+pub struct Redacted(pub String);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl ResolvedSource {
@@ -210,7 +247,7 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
                          `connections.{connection}` entry"
                     )
                 })?;
-                let resolved_conn = resolve_connection(conn)?;
+                let resolved_conn = resolve_connection(connection, conn)?;
                 // ADR 0007 §3: the shipped watermark mechanics append
                 // `WHERE cursor > <literal>` to an engine-generated
                 // `SELECT *` — a syntax error after an author's `GROUP BY`,
@@ -315,9 +352,10 @@ fn resolve_incremental(source_name: &str, inc: &Incremental) -> Result<ResolvedI
     Ok(ResolvedIncremental { cursor, lookback })
 }
 
-fn resolve_connection(c: &Connection) -> Result<ResolvedConnection> {
+fn resolve_connection(name: &str, c: &Connection) -> Result<ResolvedConnection> {
     match c {
         Connection::Bigquery(bq) => super::connections::bigquery::resolve_bigquery(bq),
+        Connection::Snowflake(sf) => super::connections::snowflake::resolve_snowflake(name, sf),
     }
 }
 
@@ -326,9 +364,14 @@ fn resolve_connection(c: &Connection) -> Result<ResolvedConnection> {
 /// BigQuery-shaped concept, and `query:` sources are a BigQuery-shaped
 /// feature today — a future non-BigQuery connector shouldn't be forced to
 /// answer "what's your project" just because this one binding needs it.
-fn connection_project(c: &ResolvedConnection) -> &str {
+/// `None` ⇒ the connector has no such binding (Snowflake: the session's
+/// database already qualifies unqualified names, so a `query:` body needs
+/// no placeholder at all — `${connection.project}` in one is an error
+/// naming that fact).
+fn connection_project(c: &ResolvedConnection) -> Option<&str> {
     match c {
-        ResolvedConnection::Bigquery { project, .. } => project,
+        ResolvedConnection::Bigquery { project, .. } => Some(project),
+        ResolvedConnection::Snowflake { .. } => None,
     }
 }
 
@@ -359,7 +402,11 @@ const CONNECTION_BINDING_PREFIX: &str = "connection.";
 /// `${ENV_VAR}` substitution never has to special-case the `connection.`
 /// prefix. Any `${connection.*}` name other than `project` is a resolve-time
 /// error naming the one supported binding.
-fn substitute_connection_bindings(source_name: &str, query: &str, project: &str) -> Result<String> {
+fn substitute_connection_bindings(
+    source_name: &str,
+    query: &str,
+    project: Option<&str>,
+) -> Result<String> {
     let mut out = String::new();
     let mut i = 0;
     while i < query.len() {
@@ -370,12 +417,29 @@ fn substitute_connection_bindings(source_name: &str, query: &str, project: &str)
                 )
             })?;
             let name = &query[i + 2 + CONNECTION_BINDING_PREFIX.len()..end];
-            match name {
-                "project" => out.push_str(project),
-                other => bail!(
+            match (name, project) {
+                ("project", Some(p)) => out.push_str(p),
+                ("project", None) => bail!(
+                    "source '{source_name}': `${{connection.project}}` does not apply to this \
+                     connection type — a snowflake `query:` runs with the connection's \
+                     `database` as the session database, so unqualified `schema.table` names \
+                     already resolve against it; remove the placeholder."
+                ),
+                // The advice must match the connector: naming
+                // `${connection.project}` as "the one supported binding" to
+                // a connector that rejects it (the arm above) would steer
+                // the author into a second guaranteed failure.
+                (other, Some(_)) => bail!(
                     "source '{source_name}': `${{connection.{other}}}` is not a supported \
                      binding in `query:` — the only supported binding is \
                      `${{connection.project}}`."
+                ),
+                (other, None) => bail!(
+                    "source '{source_name}': `${{connection.{other}}}` is not a supported \
+                     binding in `query:` — no `${{connection.*}}` binding applies to this \
+                     connection type; a snowflake `query:` runs with the connection's \
+                     `database` as the session database, so unqualified `schema.table` names \
+                     already resolve against it."
                 ),
             }
             i = end + 1;
@@ -433,6 +497,7 @@ pub fn expand(input: &str) -> Result<String> {
 mod tests {
     use super::super::schema::{
         BigQueryConnection, Bindings, CellLocation, Export, GcsBinding, S3Binding,
+        SnowflakeConnection,
     };
     use super::*;
 
@@ -999,6 +1064,135 @@ mod tests {
             err.contains("`${connection.project}`"),
             "must name the one supported binding: {err}"
         );
+    }
+
+    fn bindings_with_snowflake_connection() -> Bindings {
+        let mut connections = IndexMap::new();
+        connections.insert(
+            "wh".to_string(),
+            Connection::Snowflake(SnowflakeConnection {
+                account: "MYORG-ACCT".to_string(),
+                user: Some("SVC_USER".to_string()),
+                database: "ANALYTICS".to_string(),
+                private_key_path: Some("/keys/sf.p8".to_string()),
+                private_key_passphrase: None,
+                authenticator: None,
+                warehouse: Some("WH".to_string()),
+                role: None,
+                password: None,
+            }),
+        );
+        Bindings {
+            catalog: Some("c".into()),
+            storage: "s".into(),
+            s3: None,
+            gcs: None,
+            principals: None,
+            cells: IndexMap::new(),
+            connections,
+        }
+    }
+
+    #[test]
+    fn resolve_links_a_snowflake_connection_source_via_the_profile() {
+        let def = cell_with_source(
+            "models",
+            Source::Connection {
+                connection: "wh".to_string(),
+                table: Some("raw.vehicle_models".to_string()),
+                query: None,
+                incremental: None,
+            },
+        );
+        let r = resolve(&def, &bindings_with_snowflake_connection()).unwrap();
+        match r.sources.get("models").unwrap() {
+            ResolvedSource::Connection {
+                connection,
+                config:
+                    ResolvedConnection::Snowflake {
+                        account, database, ..
+                    },
+                target,
+                ..
+            } => {
+                assert_eq!(connection, "wh");
+                assert_eq!(account, "MYORG-ACCT");
+                assert_eq!(database, "ANALYTICS");
+                assert!(
+                    matches!(target, ConnectionTarget::Table(t) if t == "raw.vehicle_models")
+                );
+            }
+            other => panic!("expected snowflake connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_connection_project_in_a_snowflake_query_source() {
+        let def = cell_with_source(
+            "spend",
+            Source::Connection {
+                connection: "wh".to_string(),
+                table: None,
+                query: Some("SELECT * FROM `${connection.project}.x.y`".to_string()),
+                incremental: None,
+            },
+        );
+        let err = resolve(&def, &bindings_with_snowflake_connection())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not apply to this connection type"),
+            "{err}"
+        );
+        assert!(err.contains("session database"), "{err}");
+    }
+
+    #[test]
+    fn resolve_rejects_other_connection_bindings_on_snowflake_without_bad_advice() {
+        // The generic unsupported-binding error names `${connection.project}`
+        // as the fix — advice that is itself rejected on snowflake, so this
+        // connector gets the no-bindings-apply explanation instead.
+        let def = cell_with_source(
+            "spend",
+            Source::Connection {
+                connection: "wh".to_string(),
+                table: None,
+                query: Some("SELECT * FROM ${connection.database}.raw.t".to_string()),
+                incremental: None,
+            },
+        );
+        let err = resolve(&def, &bindings_with_snowflake_connection())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`${connection.database}`"), "{err}");
+        assert!(err.contains("no `${connection.*}` binding applies"), "{err}");
+        assert!(
+            !err.contains("the only supported binding is"),
+            "must not advise `${{connection.project}}` on snowflake: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_a_snowflake_query_source_with_no_bindings() {
+        let def = cell_with_source(
+            "spend",
+            Source::Connection {
+                connection: "wh".to_string(),
+                table: None,
+                query: Some("SELECT model_id FROM RAW.VEHICLE_MODELS".to_string()),
+                incremental: None,
+            },
+        );
+        let r = resolve(&def, &bindings_with_snowflake_connection()).unwrap();
+        match r.sources.get("spend").unwrap() {
+            ResolvedSource::Connection { target, .. } => {
+                assert!(matches!(
+                    target,
+                    ConnectionTarget::Query(q) if q == "SELECT model_id FROM RAW.VEHICLE_MODELS"
+                ));
+            }
+            other => panic!("expected connection, got {other:?}"),
+        }
     }
 
     #[test]

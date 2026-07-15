@@ -7,9 +7,15 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub use bindings::{
-    is_gcs, is_metadata_db_catalog, is_remote, is_s3, resolve, ConnectionTarget, ResolvedBindings,
-    ResolvedConnection, ResolvedGcs, ResolvedIncremental, ResolvedS3, ResolvedSource,
+    is_gcs, is_metadata_db_catalog, is_remote, is_s3, resolve, ConnectionTarget,
+    ResolvedBindings, ResolvedConnection, ResolvedGcs, ResolvedIncremental, ResolvedS3,
+    ResolvedSource, SnowflakeAuth,
 };
+// Part of `SnowflakeAuth`'s public shape; constructed outside `config` only
+// by connector tests, which is what the non-test build would otherwise warn
+// about.
+#[allow(unused_imports)]
+pub use bindings::Redacted;
 pub use deploy::{DeployConfig, Target};
 pub use schema::{
     resolve_transforms, Bindings, CellDef, Contract, Export, MaterializeStrategy,
@@ -60,6 +66,31 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
         for p in [&mut g.credentials, &mut g.extension].into_iter().flatten() {
             if !Path::new(p.as_str()).is_absolute() {
                 *p = dir.join(p.as_str()).to_string_lossy().into_owned();
+            }
+        }
+    }
+    // Relative snowflake `private_key_path`s resolve against the cell
+    // directory the same way — resolved here (not in `connectors::prepare`)
+    // because the path is embedded into the connection's attach SQL, which
+    // only sees the resolved config.
+    for src in bindings.sources.values_mut() {
+        if let bindings::ResolvedSource::Connection {
+            config:
+                bindings::ResolvedConnection::Snowflake {
+                    auth:
+                        bindings::SnowflakeAuth::KeyPair {
+                            private_key_path, ..
+                        },
+                    ..
+                },
+            ..
+        } = src
+        {
+            if !Path::new(private_key_path.as_str()).is_absolute() {
+                *private_key_path = dir
+                    .join(private_key_path.as_str())
+                    .to_string_lossy()
+                    .into_owned();
             }
         }
     }

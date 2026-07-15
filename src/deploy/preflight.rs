@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
 
-use crate::config::{is_remote, CellDef, ResolvedBindings};
+use crate::config::{
+    is_remote, CellDef, ResolvedBindings, ResolvedConnection, ResolvedSource, SnowflakeAuth,
+};
 use crate::deploy::target::Workloads;
 
 /// Inputs for the target-agnostic pre-flight. All resolved without a database:
@@ -19,9 +21,39 @@ pub struct PreflightInput<'a> {
 pub fn check(i: &PreflightInput) -> Result<()> {
     check_remote_storage(i)?;
     check_no_catalog(i)?;
+    check_no_interactive_connections(i)?;
     if i.supports.long_lived() {
         check_servable(i)?;
         check_auth(i)?;
+    }
+    Ok(())
+}
+
+/// A deployed workload has no browser: a snowflake connection using
+/// `authenticator: externalbrowser` (the local-dev SSO shape) would hang the
+/// Builder pod waiting for an interactive login. Refused here, where it's
+/// knowable offline, instead of as a wedged init Job.
+fn check_no_interactive_connections(i: &PreflightInput) -> Result<()> {
+    for (name, src) in &i.bindings.sources {
+        if let ResolvedSource::Connection {
+            connection,
+            config:
+                ResolvedConnection::Snowflake {
+                    auth: SnowflakeAuth::ExternalBrowser { .. },
+                    ..
+                },
+            ..
+        } = src
+        {
+            bail!(
+                "source '{name}' uses snowflake connection '{connection}' with `authenticator: \
+                 externalbrowser`, which needs an interactive browser login — a deployed \
+                 workload has none.\n\
+                 In profiles/{p}.yaml, switch this connection to key-pair auth \
+                 (`private_key_path:` pointing at a service account's key mounted in the pod).",
+                p = i.profile,
+            );
+        }
     }
     Ok(())
 }
@@ -153,6 +185,61 @@ mod tests {
         // orders is shareable+no-roles, and deploy/prod.yaml sets allow_anonymous.
         let l = loaded("prod");
         check(&input(&l.def, &l.bindings, "prod", true)).unwrap();
+    }
+
+    #[test]
+    fn external_browser_snowflake_connection_is_refused() {
+        let l = loaded("prod");
+        let mut bindings = l.bindings.clone();
+        bindings.sources.insert(
+            "models".to_string(),
+            ResolvedSource::Connection {
+                connection: "wh".to_string(),
+                config: ResolvedConnection::Snowflake {
+                    account: "A".to_string(),
+                    database: "D".to_string(),
+                    auth: SnowflakeAuth::ExternalBrowser {
+                        user: "U".to_string(),
+                    },
+                    warehouse: None,
+                    role: None,
+                },
+                target: crate::config::ConnectionTarget::Table("raw.t".to_string()),
+                incremental: None,
+            },
+        );
+        let err = check(&input(&l.def, &bindings, "prod", true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("externalbrowser"), "got: {err}");
+        assert!(err.contains("private_key_path"), "got: {err}");
+        assert!(err.contains("connection 'wh'"), "got: {err}");
+    }
+
+    #[test]
+    fn keypair_snowflake_connection_passes_preflight() {
+        let l = loaded("prod");
+        let mut bindings = l.bindings.clone();
+        bindings.sources.insert(
+            "models".to_string(),
+            ResolvedSource::Connection {
+                connection: "wh".to_string(),
+                config: ResolvedConnection::Snowflake {
+                    account: "A".to_string(),
+                    database: "D".to_string(),
+                    auth: SnowflakeAuth::KeyPair {
+                        user: "U".to_string(),
+                        private_key_path: "/etc/datamk/sf-key.p8".to_string(),
+                        passphrase: None,
+                    },
+                    warehouse: None,
+                    role: None,
+                },
+                target: crate::config::ConnectionTarget::Table("raw.t".to_string()),
+                incremental: None,
+            },
+        );
+        check(&input(&l.def, &bindings, "prod", true)).unwrap();
     }
 
     #[test]

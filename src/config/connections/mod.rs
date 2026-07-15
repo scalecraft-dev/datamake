@@ -6,3 +6,4 @@
 //! point, never a trait or a cargo feature.
 
 pub mod bigquery;
+pub mod snowflake;

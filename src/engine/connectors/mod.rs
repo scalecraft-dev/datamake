@@ -11,27 +11,31 @@
 //! `config::connections::`. This file is dispatch only.
 
 mod bigquery;
+mod snowflake;
 
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::config::{ConnectionTarget, ResolvedConnection, ResolvedSource};
+use crate::config::{ConnectionTarget, ResolvedConnection, ResolvedSource, SnowflakeAuth};
 use crate::engine::MarkValue;
 
-/// Which physical read path a warehouse object needs, classified from the
-/// warehouse's own metadata (never from the attached catalog's DuckDB-side
-/// `information_schema`, which lies about views — see `classify_objects`).
+/// Which binding path a warehouse object gets. The names come from the
+/// first connector (BigQuery), where the split falls out of its Storage
+/// Read API; the *contract* is the binding decision, connector-defined:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
-    /// BASE TABLE / CLONE / SNAPSHOT — the Storage Read API can read it
-    /// directly through the attached catalog. Today's pushdown path,
-    /// unchanged.
+    /// Bind as a read-through TEMP VIEW over the attached catalog —
+    /// transform SQL scans the warehouse directly, with pushdown. BigQuery
+    /// BASE TABLE / CLONE / SNAPSHOT (the Storage Read API can read them).
+    /// Snowflake never uses this path: its extension's attach-scan cannot
+    /// survive arbitrary transform shapes (`snowflake::classify_objects`).
     Table,
-    /// VIEW / MATERIALIZED VIEW / EXTERNAL — the Storage Read API cannot read
-    /// it ("non-table entities cannot be read with the storage API"); route
-    /// through the connector's query-job path instead.
+    /// Stage the connector's read once into a TEMP TABLE and bind the
+    /// source view over the staged copy. BigQuery VIEW / MATERIALIZED VIEW /
+    /// EXTERNAL (jobs-API-routed — the Storage Read API refuses "non-table
+    /// entities"); Snowflake everything.
     Query,
 }
 
@@ -169,6 +173,7 @@ impl ResolvedConnection {
     pub fn type_name(&self) -> &'static str {
         match self {
             ResolvedConnection::Bigquery { .. } => "bigquery",
+            ResolvedConnection::Snowflake { .. } => "snowflake",
         }
     }
 
@@ -177,11 +182,13 @@ impl ResolvedConnection {
     pub fn install_load_sql(&self) -> &'static str {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::INSTALL_LOAD_SQL,
+            ResolvedConnection::Snowflake { .. } => snowflake::INSTALL_LOAD_SQL,
         }
     }
 
-    /// The ATTACH statement. `IF NOT EXISTS` + an alias keyed on the connection
-    /// name means a connection shared by several sources attaches once.
+    /// The ATTACH statement (for Snowflake, a secret + ATTACH batch).
+    /// `IF NOT EXISTS` + an alias keyed on the connection name means a
+    /// connection shared by several sources attaches once.
     pub fn attach_sql(&self, alias: &str) -> String {
         match self {
             ResolvedConnection::Bigquery {
@@ -189,6 +196,41 @@ impl ResolvedConnection {
                 billing_project,
                 ..
             } => bigquery::attach_sql(project, billing_project.as_deref(), alias),
+            ResolvedConnection::Snowflake {
+                account,
+                database,
+                auth,
+                warehouse,
+                role,
+            } => snowflake::attach_sql(
+                account,
+                database,
+                auth,
+                warehouse.as_deref(),
+                role.as_deref(),
+                alias,
+            ),
+        }
+    }
+
+    /// Rewrite a LOAD/ATTACH failure into the connector's actionable shape
+    /// (Snowflake: the missing-ADBC-driver lookup, with any key passphrase
+    /// scrubbed from the text); anything else keeps the plain "attaching
+    /// connection …" context every connector gets.
+    pub fn rewrite_attach_error(&self, err: duckdb::Error, connection: &str) -> anyhow::Error {
+        match self {
+            ResolvedConnection::Bigquery { .. } => anyhow::Error::new(err).context(format!(
+                "attaching connection '{connection}' (bigquery)"
+            )),
+            ResolvedConnection::Snowflake { auth, .. } => {
+                let passphrase = match auth {
+                    SnowflakeAuth::KeyPair { passphrase, .. } => {
+                        passphrase.as_ref().map(|p| p.0.as_str())
+                    }
+                    SnowflakeAuth::ExternalBrowser { .. } => None,
+                };
+                snowflake::rewrite_attach_error(err, connection, passphrase)
+            }
         }
     }
 
@@ -197,30 +239,43 @@ impl ResolvedConnection {
     pub fn qualify(&self, alias: &str, table: &str) -> Result<String> {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::qualify(alias, table),
+            ResolvedConnection::Snowflake { .. } => snowflake::qualify(alias, table),
         }
     }
 
+    /// The connector's process-global credential file, if it uses one
+    /// (BigQuery: the ADC key file — one per run, enforced by `prepare()`).
+    /// Snowflake keys are per-connection `CREATE SECRET` material, not
+    /// process-global, so several Snowflake connections with different keys
+    /// coexist in one run and this returns `None`.
     fn credentials(&self) -> Option<&str> {
         match self {
             ResolvedConnection::Bigquery { credentials, .. } => credentials.as_deref(),
+            ResolvedConnection::Snowflake { .. } => None,
         }
     }
 
     /// ADR 0006 §3a's scratch object-store prefix, if the connection has one
     /// configured. `None` ⇒ an oversized jobs-path result is a hard error
-    /// (`rewrite_response_too_large`) rather than an escalation.
+    /// (`rewrite_stage_error`) rather than an escalation. Snowflake has no
+    /// such field: results stream over Arrow with no response ceiling.
     pub fn staging_uri(&self) -> Option<&str> {
         match self {
             ResolvedConnection::Bigquery { staging_uri, .. } => staging_uri.as_deref(),
+            ResolvedConnection::Snowflake { .. } => None,
         }
     }
 
     /// Point the connector's credential mechanism at the resolved key-file
     /// path (BigQuery: Application Default Credentials). Called once per run
-    /// from `prepare()`.
+    /// from `prepare()`, only for a connector whose `credentials()` is
+    /// `Some` — never Snowflake.
     fn point_credentials_at(&self, path: &str) {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::point_adc_at(path),
+            ResolvedConnection::Snowflake { .. } => {
+                unreachable!("snowflake has no process-global credential file")
+            }
         }
     }
 
@@ -240,6 +295,9 @@ impl ResolvedConnection {
                 billing_project,
                 ..
             } => bigquery::classify_objects(conn, project, billing_project.as_deref(), tables),
+            // Pure — no metadata job at all: every Snowflake object routes
+            // through the staged path, so there is nothing to look up.
+            ResolvedConnection::Snowflake { .. } => snowflake::classify_objects(tables),
         }
     }
 
@@ -266,6 +324,9 @@ impl ResolvedConnection {
                 meta,
                 predicate,
             ),
+            // Kind-independent: through the attach, predicate rendered
+            // DuckDB-side (`meta` carries nothing Snowflake needs).
+            ResolvedConnection::Snowflake { .. } => snowflake::read_sql(alias, table, predicate),
         }
     }
 
@@ -276,6 +337,9 @@ impl ResolvedConnection {
     fn is_jobs_permission_denied(&self, err: &anyhow::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_jobs_permission_denied(err),
+            // Snowflake classification runs no job, so there is nothing to
+            // be denied — a classify error is always a genuine failure.
+            ResolvedConnection::Snowflake { .. } => false,
         }
     }
 
@@ -286,16 +350,20 @@ impl ResolvedConnection {
     pub fn rewrite_view_leak(&self, err: duckdb::Error, name: &str, table: &str) -> anyhow::Error {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::rewrite_view_leak(err, name, table),
+            // Unreachable in practice — Snowflake classification never
+            // returns `Ok(None)`, so the probe that calls this never runs.
+            ResolvedConnection::Snowflake { .. } => anyhow::Error::new(err)
+                .context(format!("probing source '{name}' ({table}) before bind")),
         }
     }
 
-    /// Rewrite a jobs-API staging failure that turns out to be the
-    /// warehouse's own result-size ceiling into the user-facing text naming
-    /// the actual limit (not the misleading permission framing the API
-    /// wraps it in). Falls back to a plain `context`-wrapped error for
-    /// anything else. `describe` names what was being read — a table/view
-    /// path, or `"query"` for an ADR 0007 `query:` source.
-    pub fn rewrite_response_too_large(
+    /// Rewrite a staging-read failure into the connector's actionable shape:
+    /// BigQuery detects its ~10GB anonymous-result ceiling (ADR 0006 §3a),
+    /// Snowflake its no-active-warehouse and folded-name-not-found shapes.
+    /// Falls back to a plain `context`-wrapped error for anything else.
+    /// `describe` names what was being read — a table/view path, or
+    /// `"query"` for an ADR 0007 `query:` source.
+    pub fn rewrite_stage_error(
         &self,
         err: duckdb::Error,
         name: &str,
@@ -306,16 +374,32 @@ impl ResolvedConnection {
             ResolvedConnection::Bigquery { .. } => {
                 bigquery::rewrite_response_too_large(err, name, describe, context)
             }
+            ResolvedConnection::Snowflake {
+                database,
+                warehouse,
+                role,
+                ..
+            } => snowflake::rewrite_stage_error(
+                err,
+                name,
+                describe,
+                database,
+                warehouse.as_deref(),
+                role.as_deref(),
+                context,
+            ),
         }
     }
 
     /// Whether `err` (from staging a jobs-path read) is the connector's
     /// shape of "the result exceeded the warehouse's anonymous-result
     /// ceiling" (ADR 0006 §3a) — the one, and only, trigger for escalating
-    /// to `export_sql`.
+    /// to `export_sql`. Snowflake streams results over Arrow and has no
+    /// ceiling; nothing ever escalates.
     pub fn is_response_too_large(&self, err: &duckdb::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_response_too_large(err),
+            ResolvedConnection::Snowflake { .. } => false,
         }
     }
 
@@ -344,48 +428,73 @@ impl ResolvedConnection {
                 predicate,
                 run_prefix,
             ),
+            // Unreachable: escalation is gated on `is_response_too_large`,
+            // which is never true for Snowflake.
+            ResolvedConnection::Snowflake { .. } => bail!(
+                "snowflake has no oversized-result export path (internal error) — please \
+                 report this"
+            ),
         }
     }
 
-    /// Pure: ADR 0007 §2's jobs-API read for an author-owned `query:`
+    /// Pure: ADR 0007 §2's server-side read for an author-owned `query:`
     /// source — the connector's only transformation of `query` is `esc()`
-    /// for delivery; no identifier rewriting, no predicate injection. Jobs-
-    /// routed by construction: unlike `read_sql`, there is no `meta` to
+    /// for delivery; no identifier rewriting, no predicate injection.
+    /// Staged by construction: unlike `read_sql`, there is no `meta` to
     /// route on, because a `query:` source is never classified at all.
-    pub fn query_read_sql(&self, query: &str) -> String {
+    /// `alias` is the connection's attach alias — Snowflake derives its
+    /// secret name from it; BigQuery carries everything in its config.
+    pub fn query_read_sql(&self, alias: &str, query: &str) -> String {
         match self {
             ResolvedConnection::Bigquery {
                 project,
                 billing_project,
                 ..
             } => bigquery::query_read_sql(project, billing_project.as_deref(), query),
+            ResolvedConnection::Snowflake { .. } => snowflake::query_read_sql(alias, query),
         }
     }
 
     /// Pure: ADR 0007 §2's `EXPORT DATA` statement for an oversized
     /// `query:` source's §3a escalation — the export wraps the author's
     /// query verbatim instead of a generated `SELECT *`. Sibling to
-    /// `export_sql`.
-    pub fn query_export_sql(&self, query: &str, run_prefix: &str) -> String {
+    /// `export_sql`, unreachable for the same reason on Snowflake.
+    pub fn query_export_sql(&self, query: &str, run_prefix: &str) -> Result<String> {
         match self {
             ResolvedConnection::Bigquery {
                 project,
                 billing_project,
                 ..
-            } => bigquery::query_export_sql(project, billing_project.as_deref(), query, run_prefix),
+            } => Ok(bigquery::query_export_sql(
+                project,
+                billing_project.as_deref(),
+                query,
+                run_prefix,
+            )),
+            ResolvedConnection::Snowflake { .. } => bail!(
+                "snowflake has no oversized-result export path (internal error) — please \
+                 report this"
+            ),
         }
     }
 
     /// Pure: ADR 0007 §4's dry-run preflight statement for a `query:`
-    /// source — the same `bigquery_query()` call `query_read_sql` issues,
-    /// `dry_run := true` appended.
-    pub fn query_dry_run_sql(&self, query: &str) -> String {
+    /// source — BigQuery's `bigquery_query(..., dry_run := true)` call.
+    /// `None` ⇒ the connector has no free dry-run (Snowflake) and the
+    /// engine skips the preflight silently — an expected capability gap,
+    /// not a failure.
+    pub fn query_dry_run_sql(&self, query: &str) -> Option<String> {
         match self {
             ResolvedConnection::Bigquery {
                 project,
                 billing_project,
                 ..
-            } => bigquery::query_dry_run_sql(project, billing_project.as_deref(), query),
+            } => Some(bigquery::query_dry_run_sql(
+                project,
+                billing_project.as_deref(),
+                query,
+            )),
+            ResolvedConnection::Snowflake { .. } => None,
         }
     }
 
@@ -396,6 +505,97 @@ impl ResolvedConnection {
     pub fn is_dry_run_query_error(&self, err: &duckdb::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_dry_run_query_error(err),
+            // No dry-run runs for Snowflake, so no failure to classify.
+            ResolvedConnection::Snowflake { .. } => false,
+        }
+    }
+
+    /// Whether an `incremental:` cursor whose live DuckDB type is a
+    /// scale-zero DECIMAL/NUMERIC counts as an Integer cursor. True for
+    /// Snowflake (its integer types are all NUMBER(38,0) ⇒ DECIMAL(38,0),
+    /// and the predicate renders DuckDB-side); false for BigQuery, whose
+    /// jobs-path predicate renderer cannot render NUMERIC — accepting it at
+    /// bind time would defer the failure until *after* a full bootstrap
+    /// ingest.
+    pub fn integer_cursor_accepts_decimal(&self) -> bool {
+        match self {
+            ResolvedConnection::Bigquery { .. } => false,
+            ResolvedConnection::Snowflake { .. } => true,
+        }
+    }
+
+    /// The `context` string the engine hands `rewrite_stage_error` for a
+    /// staging failure — connector-owned so BigQuery's long-standing "via
+    /// the jobs API" error text stays byte-identical while Snowflake never
+    /// mentions BigQuery machinery. `describe` is a table path, or
+    /// `"query"` for an ADR 0007 `query:` source.
+    pub fn stage_context(&self, name: &str, describe: &str) -> String {
+        match self {
+            ResolvedConnection::Bigquery { .. } => {
+                if describe == "query" {
+                    format!("staging query source '{name}' via the jobs API")
+                } else {
+                    format!("staging view source '{name}' -> {describe} via the jobs API")
+                }
+            }
+            ResolvedConnection::Snowflake { .. } => {
+                if describe == "query" {
+                    format!("staging query source '{name}' server-side in Snowflake")
+                } else {
+                    format!("staging source '{name}' -> {describe} from Snowflake")
+                }
+            }
+        }
+    }
+
+    /// The `SourceRunInfo.kind` label for a staged (`ObjectKind::Query`)
+    /// `table:` source. BigQuery only stages non-table entities ("view");
+    /// Snowflake stages everything, and what the author declared is a table
+    /// path ("table").
+    pub fn staged_kind(&self) -> &'static str {
+        match self {
+            ResolvedConnection::Bigquery { .. } => "view",
+            ResolvedConnection::Snowflake { .. } => "table",
+        }
+    }
+
+    /// The bind-time narration for a staged non-incremental `table:` source
+    /// — connector-owned because the honest story differs: BigQuery stages
+    /// because the object is a view the Storage API can't scan; Snowflake
+    /// stages everything by design.
+    pub fn stage_narration(&self, name: &str, table: &str) -> String {
+        match self {
+            ResolvedConnection::Bigquery { .. } => format!(
+                "source '{name}' is a view ({table}) — reading via the BigQuery jobs API \
+                 (full view materialized every run). Add `incremental:` with a cursor to \
+                 read only new rows."
+            ),
+            ResolvedConnection::Snowflake { .. } => snowflake::stage_narration(name, table),
+        }
+    }
+
+    /// The bind-time narration for a staged incremental delta read with a
+    /// watermark. Sibling of `stage_narration`.
+    pub fn stage_incremental_narration(&self, name: &str, table: &str) -> String {
+        match self {
+            ResolvedConnection::Bigquery { .. } => format!(
+                "source '{name}' is a view ({table}) — reading via the BigQuery jobs API \
+                 with the watermark predicate baked into the job."
+            ),
+            ResolvedConnection::Snowflake { .. } => {
+                snowflake::stage_incremental_narration(name, table)
+            }
+        }
+    }
+
+    /// The bind-time narration for an ADR 0007 `query:` source.
+    pub fn query_stage_narration(&self, name: &str) -> String {
+        match self {
+            ResolvedConnection::Bigquery { .. } => format!(
+                "source '{name}' is a query source — executing server-side via the BigQuery \
+                 jobs API"
+            ),
+            ResolvedConnection::Snowflake { .. } => snowflake::query_stage_narration(name),
         }
     }
 }
@@ -433,6 +633,38 @@ pub fn prepare(sources: &IndexMap<String, ResolvedSource>, dir: &Path) -> Result
             );
         }
         config.point_credentials_at(&path);
+    }
+
+    // Snowflake: every key-pair connection's private key file must exist
+    // before anything attaches — a deployed pod with an absent secret mount
+    // should crash with this error, not limp into a JWT auth failure. Keys
+    // are per-connection secrets (not process-global like ADC), so there is
+    // no one-file-per-run constraint to enforce. The path is checked
+    // verbatim, NOT re-resolved against `dir`: `config::load` already
+    // anchored a relative `private_key_path` to the cell directory (the
+    // attach SQL embeds it, so the resolution must happen where the config
+    // is built) — joining again here would double the prefix whenever the
+    // cell directory itself is relative.
+    for (name, src) in sources {
+        let ResolvedSource::Connection {
+            config:
+                ResolvedConnection::Snowflake {
+                    auth: SnowflakeAuth::KeyPair {
+                        private_key_path, ..
+                    },
+                    ..
+                },
+            ..
+        } = src
+        else {
+            continue;
+        };
+        if !Path::new(private_key_path).is_file() {
+            bail!(
+                "private key file '{private_key_path}' (snowflake connection used by source \
+                 '{name}') does not exist or is not a file"
+            );
+        }
     }
     Ok(())
 }
@@ -515,6 +747,54 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    fn sf_keypair_source(private_key_path: &str) -> ResolvedSource {
+        ResolvedSource::Connection {
+            connection: "wh".to_string(),
+            config: ResolvedConnection::Snowflake {
+                account: "A".to_string(),
+                database: "D".to_string(),
+                auth: SnowflakeAuth::KeyPair {
+                    user: "U".to_string(),
+                    private_key_path: private_key_path.to_string(),
+                    passphrase: None,
+                },
+                warehouse: None,
+                role: None,
+            },
+            target: ConnectionTarget::Table("s.t".to_string()),
+            incremental: None,
+        }
+    }
+
+    #[test]
+    fn prepare_checks_the_snowflake_key_file_verbatim_without_rejoining_dir() {
+        // `config::load` already anchored a relative key path to the cell
+        // dir; prepare must check it as stored — joining `dir` again would
+        // double the prefix whenever the cell dir itself is relative.
+        let tmp = std::env::temp_dir().join("datamk_test_sf_key_verbatim.p8");
+        std::fs::write(&tmp, "not really a key").unwrap();
+        let mut sources = IndexMap::new();
+        sources.insert(
+            "a".to_string(),
+            sf_keypair_source(&tmp.to_string_lossy()),
+        );
+        prepare(&sources, Path::new("/would/break/if/joined")).unwrap();
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn prepare_fails_loud_on_a_missing_snowflake_key_file() {
+        let mut sources = IndexMap::new();
+        sources.insert(
+            "a".to_string(),
+            sf_keypair_source("/definitely/not/there.p8"),
+        );
+        let err = prepare(&sources, Path::new("/cell")).unwrap_err().to_string();
+        assert!(err.contains("private key file"), "{err}");
+        assert!(err.contains("/definitely/not/there.p8"), "{err}");
+        assert!(err.contains("'a'"), "{err}");
     }
 
     #[test]

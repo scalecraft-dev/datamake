@@ -813,10 +813,11 @@ pub struct Bindings {
     pub connections: IndexMap<String, Connection>,
 }
 
-// BigQueryConnection moved to `config::connections::bigquery` (one module per
+// Connector config shapes live in `config::connections` (one module per
 // connector, mirroring `engine::connectors`); re-exported here so `Connection`
 // stays the one place every connector's config shape is enumerated.
 pub use crate::config::connections::bigquery::BigQueryConnection;
+pub use crate::config::connections::snowflake::SnowflakeConnection;
 
 /// One named warehouse connection, tagged by `type`. A closed enum: an unknown
 /// type is a parse error naming the valid types. Every field is env-expandable.
@@ -824,6 +825,7 @@ pub use crate::config::connections::bigquery::BigQueryConnection;
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Connection {
     Bigquery(BigQueryConnection),
+    Snowflake(SnowflakeConnection),
 }
 
 /// S3 connection settings. Each field is env-expandable. With no key/secret,
@@ -1355,7 +1357,9 @@ connections:
     staging_uri: gs://acme-bq-staging/datamk-scratch
 "#;
         let b: Bindings = serde_yaml::from_str(yaml).unwrap();
-        let Connection::Bigquery(bq) = b.connections.get("crm").unwrap();
+        let Connection::Bigquery(bq) = b.connections.get("crm").unwrap() else {
+            panic!("expected bigquery");
+        };
         assert_eq!(bq.project, "acme-prod-crm");
         assert_eq!(bq.billing_project.as_deref(), Some("acme-billing"));
         assert_eq!(bq.credentials.as_deref(), Some("/etc/datamk/bq-key.json"));
@@ -1376,23 +1380,56 @@ connections:
     project: acme-prod-crm
 "#;
         let b: Bindings = serde_yaml::from_str(yaml).unwrap();
-        let Connection::Bigquery(bq) = b.connections.get("crm").unwrap();
+        let Connection::Bigquery(bq) = b.connections.get("crm").unwrap() else {
+            panic!("expected bigquery");
+        };
         assert_eq!(bq.staging_uri, None);
     }
 
     #[test]
-    fn bindings_reject_an_unknown_connection_type() {
+    fn bindings_snowflake_connection_parses() {
+        let yaml = r#"
+catalog: c
+storage: s
+connections:
+  wh:
+    type: snowflake
+    account: MYORG-ACCT
+    user: SVC_USER
+    database: ANALYTICS
+    private_key_path: /etc/datamk/sf-key.p8
+    warehouse: WH
+    role: ANALYST
+"#;
+        let b: Bindings = serde_yaml::from_str(yaml).unwrap();
+        let Connection::Snowflake(sf) = b.connections.get("wh").unwrap() else {
+            panic!("expected snowflake");
+        };
+        assert_eq!(sf.account, "MYORG-ACCT");
+        assert_eq!(sf.user.as_deref(), Some("SVC_USER"));
+        assert_eq!(sf.database, "ANALYTICS");
+        assert_eq!(sf.private_key_path.as_deref(), Some("/etc/datamk/sf-key.p8"));
+        assert_eq!(sf.warehouse.as_deref(), Some("WH"));
+        assert_eq!(sf.role.as_deref(), Some("ANALYST"));
+        assert!(sf.authenticator.is_none());
+        assert!(sf.password.is_none());
+    }
+
+    #[test]
+    fn bindings_reject_an_unknown_connection_type_naming_the_valid_ones() {
         let yaml = r#"
 catalog: c
 storage: s
 connections:
   crm:
-    type: snowflake
+    type: redshift
     project: p
 "#;
         let err = serde_yaml::from_str::<Bindings>(yaml)
             .unwrap_err()
             .to_string();
+        assert!(err.contains("redshift"), "unexpected error: {err}");
+        assert!(err.contains("bigquery"), "unexpected error: {err}");
         assert!(err.contains("snowflake"), "unexpected error: {err}");
     }
 

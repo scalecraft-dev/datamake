@@ -1564,7 +1564,7 @@ fn bind_source(
             conn.execute_batch(config.install_load_sql())
                 .with_context(|| format!("loading DuckDB '{ty}' extension"))?;
             conn.execute_batch(&config.attach_sql(&alias))
-                .with_context(|| format!("attaching connection '{connection}' ({ty})"))?;
+                .map_err(|e| config.rewrite_attach_error(e, connection))?;
 
             match target {
                 // ADR 0007: author-owned server-side SQL, jobs-routed by
@@ -1598,7 +1598,7 @@ fn bind_source(
                     // The connector's only transformation of the author's
                     // string is `esc()` for delivery — no identifier
                     // rewriting, no predicate injection (§2).
-                    let select = config.query_read_sql(query);
+                    let select = config.query_read_sql(&alias, query);
                     let temp_table = format!("__jobs_{idx}");
                     let staging_uri = config.staging_uri();
                     let staged_rows = match conn
@@ -1618,15 +1618,15 @@ fn bind_source(
                                 staging_uri.expect("checked Some above"),
                                 s3,
                                 gcs,
-                                |run_prefix| Ok(config.query_export_sql(query, run_prefix)),
+                                |run_prefix| config.query_export_sql(query, run_prefix),
                             )?
                         }
                         Err(e) => {
-                            return Err(config.rewrite_response_too_large(
+                            return Err(config.rewrite_stage_error(
                                 e,
                                 name,
                                 "query",
-                                &format!("staging query source '{name}' via the jobs API"),
+                                &config.stage_context(name, "query"),
                             ))
                         }
                     };
@@ -1642,8 +1642,7 @@ fn bind_source(
                     .with_context(|| format!("binding connection source '{name}' (query:)"))?;
                     tracing::info!(
                         source = %name, connection = %connection, staged_rows,
-                        "source '{name}' is a query source — executing server-side via the \
-                         BigQuery jobs API"
+                        "{}", config.query_stage_narration(name)
                     );
                     SourceRunInfo {
                         name: name.to_string(),
@@ -1746,14 +1745,11 @@ fn bind_source(
                                         )?
                                     }
                                     Err(e) => {
-                                        return Err(config.rewrite_response_too_large(
+                                        return Err(config.rewrite_stage_error(
                                             e,
                                             name,
                                             table,
-                                            &format!(
-                                                "staging view source '{name}' -> {table} via \
-                                                 the jobs API"
-                                            ),
+                                            &config.stage_context(name, table),
                                         ))
                                     }
                                 };
@@ -1767,14 +1763,12 @@ fn bind_source(
                                 })?;
                                 tracing::info!(
                                     source = %name, connection = %connection, table = %table, staged_rows,
-                                    "source '{name}' is a view ({table}) — reading via the \
-                                     BigQuery jobs API (full view materialized every run). Add \
-                                     `incremental:` with a cursor to read only new rows."
+                                    "{}", config.stage_narration(name, table)
                                 );
                                 SourceRunInfo {
                                     name: name.to_string(),
                                     connection: Some(connection.clone()),
-                                    kind: Some("view".to_string()),
+                                    kind: Some(config.staged_kind().to_string()),
                                     staged_rows: Some(staged_rows),
                                     bytes_scanned: None,
                                 }
@@ -1799,7 +1793,7 @@ fn bind_source(
                             )?;
                             let kind = match meta.kind {
                                 ObjectKind::Table => "table",
-                                ObjectKind::Query => "view",
+                                ObjectKind::Query => config.staged_kind(),
                             };
                             let info = SourceRunInfo {
                                 name: name.to_string(),
@@ -2012,7 +2006,12 @@ fn dry_run_preflight(
     name: &str,
     query: &str,
 ) -> Result<Option<i64>> {
-    let dry_run_sql = config.query_dry_run_sql(query);
+    // A connector with no free dry-run (Snowflake) skips the preflight
+    // silently — an expected capability gap, not a failure worth a warning;
+    // the real read below fails loud on its own if the query is broken.
+    let Some(dry_run_sql) = config.query_dry_run_sql(query) else {
+        return Ok(None);
+    };
     match conn.query_row(&dry_run_sql, [], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -2056,6 +2055,7 @@ fn dry_run_preflight(
 /// incremental).
 fn narrate_staged_types(conn: &Connection, name: &str, temp_table: &str) -> Result<()> {
     let cols = describe_columns(conn, temp_table)
+        .map_err(anyhow::Error::new)
         .with_context(|| format!("describing staged types for source '{name}'"))?;
     let pairs = cols
         .iter()
@@ -2142,8 +2142,14 @@ struct WatermarkAdvance {
 }
 
 /// Classify a live DuckDB column type string into the closed cursor-type set.
-/// `None` ⇒ not a supported cursor type.
-fn classify_cursor_type(actual_type: &str) -> Option<CursorType> {
+/// `None` ⇒ not a supported cursor type. `accept_decimal_integer` is
+/// connector-scoped (`ResolvedConnection::integer_cursor_accepts_decimal`):
+/// Snowflake's integer types are all NUMBER(38,0), which DuckDB surfaces as
+/// DECIMAL(38,0) — a whole-number cursor in substance — but a BigQuery
+/// NUMERIC(p,0) must stay refused at bind time, because its jobs-routed
+/// predicate renderer (`render_bq_predicate`) cannot render it and would
+/// otherwise fail only *after* a full bootstrap ingest.
+fn classify_cursor_type(actual_type: &str, accept_decimal_integer: bool) -> Option<CursorType> {
     let t = actual_type.to_uppercase();
     if t.starts_with("TIMESTAMP") {
         Some(CursorType::Timestamp)
@@ -2163,16 +2169,37 @@ fn classify_cursor_type(actual_type: &str) -> Option<CursorType> {
             | "UHUGEINT"
     ) {
         Some(CursorType::Integer)
+    } else if accept_decimal_integer && is_scale_zero_decimal(&t) {
+        // Values are cast to BIGINT where the engine reads them
+        // (`compute_advance`), failing loud past i64 range rather than
+        // silently truncating.
+        Some(CursorType::Integer)
     } else {
         None
     }
+}
+
+/// Whether an (uppercased) DuckDB type string is a scale-zero DECIMAL /
+/// NUMERIC — integer-valued by construction.
+fn is_scale_zero_decimal(t: &str) -> bool {
+    let inner = t
+        .strip_prefix("DECIMAL(")
+        .or_else(|| t.strip_prefix("NUMERIC("))
+        .and_then(|s| s.strip_suffix(')'));
+    matches!(
+        inner.and_then(|s| s.split(',').nth(1)),
+        Some(scale) if scale.trim() == "0"
+    )
 }
 
 /// `(column_name, duckdb_type, nullable)` for every column of a table
 /// expression, via `DESCRIBE SELECT * FROM <qualified>` — a plain `DESCRIBE
 /// <qualified>` doesn't parse for a dotted/aliased multi-part reference (a
 /// connector's `qualify()` output), so this is the form that works uniformly.
-fn describe_columns(conn: &Connection, qualified: &str) -> Result<Vec<(String, String, bool)>> {
+fn describe_columns(
+    conn: &Connection,
+    qualified: &str,
+) -> std::result::Result<Vec<(String, String, bool)>, duckdb::Error> {
     let mut stmt = conn.prepare(&format!("DESCRIBE SELECT * FROM {qualified}"))?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -2206,6 +2233,7 @@ fn validate_cursor(
     table: &str,
     cursor: &str,
     cols: &[(String, String, bool)],
+    accept_decimal_integer: bool,
 ) -> Result<(CursorType, String, bool)> {
     let Some((_, actual_ty, nullable)) = find_column(cols, cursor) else {
         let available = cols
@@ -2219,7 +2247,7 @@ fn validate_cursor(
              full-scan this source."
         );
     };
-    match classify_cursor_type(actual_ty) {
+    match classify_cursor_type(actual_ty, accept_decimal_integer) {
         Some(ty) => Ok((ty, actual_ty.clone(), *nullable)),
         None => anyhow::bail!(
             "source '{name}': incremental cursor '{cursor}' is {actual_ty}; a cursor must be a \
@@ -2403,8 +2431,11 @@ fn compute_advance(
             (n, m.map(MarkValue::Date))
         }
         CursorType::Integer => {
+            // `::BIGINT`: an Integer cursor may physically be DECIMAL(38,0)
+            // (Snowflake NUMBER) — the cast is a no-op for native integer
+            // columns and fails loud past i64 range instead of truncating.
             let (n, m): (i64, Option<i64>) = conn.query_row(
-                &format!("SELECT count(*), max(\"{cq}\") FROM __delta_{idx}"),
+                &format!("SELECT count(*), max(\"{cq}\")::BIGINT FROM __delta_{idx}"),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
@@ -2442,10 +2473,26 @@ fn stage_incremental(
     // Cursor existence/type/nullability validation stays on `describe_columns`
     // through the attach: `DESCRIBE SELECT * FROM <qualified>` is
     // REST-metadata-only and works uniformly whether the object is a table or
-    // a view — it is never routed through the jobs API.
-    let cols = describe_columns(conn, qualified)
-        .with_context(|| format!("describing source '{name}' ({table}) for incremental bind"))?;
-    let (ty, actual_ty, nullable) = validate_cursor(name, table, &inc.cursor, &cols)?;
+    // a view — it is never routed through the jobs API. Its failure is the
+    // *first* warehouse-touching statement of an incremental bind, so it goes
+    // through the connector's stage-error rewrite — an incremental source
+    // must get the same actionable not-found/no-warehouse text a plain one
+    // does.
+    let cols = describe_columns(conn, qualified).map_err(|e| {
+        config.rewrite_stage_error(
+            e,
+            name,
+            table,
+            &format!("describing source '{name}' ({table}) for incremental bind"),
+        )
+    })?;
+    let (ty, actual_ty, nullable) = validate_cursor(
+        name,
+        table,
+        &inc.cursor,
+        &cols,
+        config.integer_cursor_accepts_decimal(),
+    )?;
     let lookback_sql = validate_lookback(name, &inc.cursor, ty, &actual_ty, inc.lookback)?;
 
     if nullable {
@@ -2523,7 +2570,7 @@ fn stage_incremental(
             )?;
         }
         Err(e) => {
-            return Err(config.rewrite_response_too_large(
+            return Err(config.rewrite_stage_error(
                 e,
                 name,
                 table,
@@ -2548,8 +2595,7 @@ fn stage_incremental(
     match (&mark, meta.kind) {
         (Some(m), ObjectKind::Query) => tracing::info!(
             source = %name, staged_rows, watermark = %m,
-            "source '{name}' is a view ({table}) — reading via the BigQuery jobs API with the \
-             watermark predicate baked into the job."
+            "{}", config.stage_incremental_narration(name, table)
         ),
         (Some(m), ObjectKind::Table) => tracing::info!(
             source = %name, staged_rows, watermark = %m,
@@ -3275,25 +3321,45 @@ mod tests {
     #[test]
     fn classify_cursor_type_covers_the_closed_set() {
         assert_eq!(
-            classify_cursor_type("TIMESTAMP"),
+            classify_cursor_type("TIMESTAMP", false),
             Some(CursorType::Timestamp)
         );
         assert_eq!(
-            classify_cursor_type("TIMESTAMP WITH TIME ZONE"),
+            classify_cursor_type("TIMESTAMP WITH TIME ZONE", false),
             Some(CursorType::Timestamp)
         );
         assert_eq!(
-            classify_cursor_type("TIMESTAMP_NS"),
+            classify_cursor_type("TIMESTAMP_NS", false),
             Some(CursorType::Timestamp)
         );
-        assert_eq!(classify_cursor_type("DATE"), Some(CursorType::Date));
+        assert_eq!(classify_cursor_type("DATE", false), Some(CursorType::Date));
         for int_ty in [
             "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UBIGINT",
         ] {
-            assert_eq!(classify_cursor_type(int_ty), Some(CursorType::Integer));
+            assert_eq!(
+                classify_cursor_type(int_ty, false),
+                Some(CursorType::Integer)
+            );
         }
-        assert_eq!(classify_cursor_type("VARCHAR"), None);
-        assert_eq!(classify_cursor_type("DOUBLE"), None);
+        // Snowflake NUMBER(38,0) surfaces as DECIMAL(38,0) — integer-valued
+        // by construction, accepted where the connector opts in; BigQuery
+        // does not (its jobs-path predicate renderer cannot render NUMERIC,
+        // so bind-time refusal must be preserved). Nonzero scale is never a
+        // cursor.
+        assert_eq!(
+            classify_cursor_type("DECIMAL(38,0)", true),
+            Some(CursorType::Integer)
+        );
+        assert_eq!(
+            classify_cursor_type("NUMERIC(10,0)", true),
+            Some(CursorType::Integer)
+        );
+        assert_eq!(classify_cursor_type("DECIMAL(38,0)", false), None);
+        assert_eq!(classify_cursor_type("NUMERIC(10,0)", false), None);
+        assert_eq!(classify_cursor_type("DECIMAL(10,2)", true), None);
+        assert_eq!(classify_cursor_type("DECIMAL", true), None);
+        assert_eq!(classify_cursor_type("VARCHAR", false), None);
+        assert_eq!(classify_cursor_type("DOUBLE", false), None);
     }
 
     #[test]
@@ -3302,7 +3368,7 @@ mod tests {
             ("id".to_string(), "INTEGER".to_string(), false),
             ("region".to_string(), "VARCHAR".to_string(), false),
         ];
-        let err = validate_cursor("events", "analytics.events", "updated_at", &cols)
+        let err = validate_cursor("events", "analytics.events", "updated_at", &cols, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3316,7 +3382,7 @@ mod tests {
     #[test]
     fn validate_cursor_rejects_an_unsupported_type() {
         let cols = vec![("updated_at".to_string(), "VARCHAR".to_string(), false)];
-        let err = validate_cursor("events", "analytics.events", "updated_at", &cols)
+        let err = validate_cursor("events", "analytics.events", "updated_at", &cols, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3330,7 +3396,7 @@ mod tests {
     fn validate_cursor_matches_case_insensitively_and_classifies() {
         let cols = vec![("Updated_At".to_string(), "TIMESTAMP".to_string(), true)];
         let (ty, actual_ty, nullable) =
-            validate_cursor("events", "t", "updated_at", &cols).unwrap();
+            validate_cursor("events", "t", "updated_at", &cols, false).unwrap();
         assert_eq!(ty, CursorType::Timestamp);
         assert_eq!(actual_ty, "TIMESTAMP");
         assert!(nullable);
