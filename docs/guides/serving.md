@@ -69,6 +69,6 @@ On Kubernetes, the same job belongs to your ingress controller (e.g.
 | 503  | Over the concurrency cap — retry with backoff. |
 
 The pre-auth `/` health route carries one liveness fact (plus the served
-execution number in published mode); everything else — `/interface`,
+execution number in published mode); everything else — `/context`,
 `/openapi.json`, and the data routes — sits behind the same `access`
 policy.

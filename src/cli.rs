@@ -67,6 +67,11 @@ pub enum Command {
     /// Print ready-to-run SQL that attaches the cell's catalog in DuckDB
     /// (read-only). Pipe it: duckdb -c "$(datamk attach -p prod) SELECT ..."
     Attach(AttachArgs),
+    /// Emit the cell's context document (ADR 0012) — the interface made
+    /// machine-readable for agents: exports, grain, schema, query grammar,
+    /// and (published profiles) verified provenance. Same JSON `serve`
+    /// hosts at GET /context.
+    Context(ContextArgs),
     /// Roll back the served DATA to an earlier execution by repointing LATEST.
     /// (To roll back a version/code change, use your orchestrator's rollout undo.)
     Rollback(RollbackArgs),
@@ -96,6 +101,19 @@ pub struct AttachArgs {
     /// executions; re-run to refresh. Delete .cell/attach/ to reclaim space.
     #[arg(long)]
     pub download: bool,
+}
+
+#[derive(Args)]
+pub struct ContextArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml)
+    #[arg(short, long, default_value = "local")]
+    pub profile: String,
+    /// Write the document to a file instead of stdout
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Args)]

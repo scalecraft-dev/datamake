@@ -1,24 +1,22 @@
-use crate::config::{CellDef, Export, Visibility};
+use crate::config::Export;
 use serde_json::{json, Map, Value};
 
-/// Generate an OpenAPI 3.1 document directly from the cell interface — the
-/// interface is the single source of truth, so the spec is derived, never
-/// hand-annotated.
-pub fn generate(def: &CellDef) -> Value {
+/// Generate an OpenAPI 3.1 document from the shared visibility-filtered
+/// route list (`context::discoverable_routes` — ADR 0012 §4: one list, never
+/// an independent re-application of the predicate). The interface is the
+/// single source of truth, so the spec is derived, never hand-annotated.
+/// `version` is the context document's interface digest (ADR 0012 §7) — it
+/// moves when the interface moves, not when data refreshes under it.
+pub fn generate(cell: &str, routes: &[(String, Export)], version: &str) -> Value {
     let mut paths = Map::new();
-    for export in &def.interface {
-        if export.visibility != Visibility::Discoverable {
-            continue;
-        }
-        if let Ok(route) = export.route() {
-            paths.insert(format!("/{route}"), path_item(export));
-        }
+    for (route, export) in routes {
+        paths.insert(format!("/{route}"), path_item(export));
     }
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": def.cell,
-            "version": "0.0.0",
+            "title": cell,
+            "version": version,
             "description": "Generated from the cell interface"
         },
         "paths": Value::Object(paths)
@@ -99,7 +97,7 @@ fn openapi_type(ty: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Contract, Export, Visibility};
+    use crate::config::{CellDef, Contract, Export, Visibility};
     use indexmap::IndexMap;
 
     fn export_with(name: &str, version: &str, visibility: Visibility) -> Export {
@@ -152,9 +150,13 @@ mod tests {
             ],
             access: Default::default(),
         };
-        let doc = generate(&def);
+        // The same shared route list `serve` and `/context` read (ADR 0012 §4).
+        let routes = crate::context::discoverable_routes(&def).unwrap();
+        let doc = generate(&def.cell, &routes, "digest123");
         assert_eq!(doc["openapi"], "3.1.0");
         assert_eq!(doc["info"]["title"], "orders");
+        // ADR 0012 §7: the version is the interface digest, not "0.0.0".
+        assert_eq!(doc["info"]["version"], "digest123");
 
         let paths = doc["paths"].as_object().unwrap();
         // Discoverable export is routed on its major version; private one is omitted.

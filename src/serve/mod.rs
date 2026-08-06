@@ -12,16 +12,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::config::{Contract, Export, Visibility};
+use crate::config::{Contract, Export};
 use crate::engine;
 
-const MAX_LIMIT: usize = 1000;
-const DEFAULT_LIMIT: usize = 100;
+pub(crate) const MAX_LIMIT: usize = 1000;
+pub(crate) const DEFAULT_LIMIT: usize = 100;
 /// Cap on `offset` (ADR 0012 §7): parsed-but-uncapped offsets let a paginating
 /// caller walk arbitrarily deep scans. Requests beyond the cap are rejected
 /// (400), never silently clamped — a clamped offset would return a page the
 /// caller didn't ask for, which reads as data, not as an error.
-const MAX_OFFSET: usize = 1_000_000;
+pub(crate) const MAX_OFFSET: usize = 1_000_000;
 /// Default for `--max-concurrency`: requests over this are shed with 503
 /// rather than queued without bound — agents fan out and retry tirelessly
 /// (ADR 0012 §7). Real per-client rate limiting belongs to a reverse proxy.
@@ -49,6 +49,23 @@ struct AppState {
     execution: std::sync::atomic::AtomicU64,
     /// Poll telemetry — what makes bounded staleness visible (ADR 0004 §6).
     freshness: Mutex<Freshness>,
+    /// The declared region of the context document (ADR 0012), precomputed —
+    /// the interface never changes for the lifetime of the process.
+    declared: crate::context::Declared,
+    /// The interface digest: `/context`'s `ETag`, `/openapi.json`'s
+    /// `info.version`, and the `X-Datamk-Context-Digest` back-link header.
+    digest: String,
+    /// Whether this server runs on a direct-attach (local catalog) profile —
+    /// pinless, so its context document is a draft by definition (ADR 0012 §4).
+    direct_attach: bool,
+    /// The served execution's run summary, fetched by the poller on every
+    /// tick (ADR 0012 §5) — decoupled from the swap check, so a summary that
+    /// lands after `LATEST` advances is never orphaned. Handlers touch no
+    /// store and no DuckDB; they read this cache only.
+    run_summary: Mutex<Option<crate::engine::run_summary::RunSummary>>,
+    /// Newest lake snapshot time, cached at open and at swap — never queried
+    /// on the request path.
+    data_as_of: Mutex<Option<String>>,
 }
 
 #[derive(Default, Clone)]
@@ -133,6 +150,14 @@ pub async fn run(
     let cell = engine::open(file, profile, /* read_only */ true)?;
     let (state, store) = build_state(cell)?;
 
+    // Initial run-summary fetch (ADR 0012 §5): serve startup already talks to
+    // the store (`engine::open` downloaded the artifact), so one more GET here
+    // is the same trust and cost — and it means `/context` is verified from
+    // the first request, not after the first poll tick.
+    if let Some(store) = &store {
+        fetch_run_summary(&state, store);
+    }
+
     if let Some(store) = store {
         spawn_poller(
             state.clone(),
@@ -159,12 +184,17 @@ pub async fn run(
 fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::store::Store>>)> {
     let published = load_published(&cell.dir);
 
-    let mut routes = HashMap::new();
-    for export in &cell.def.interface {
-        if export.visibility == Visibility::Discoverable {
-            routes.insert(export.route()?, export.clone());
-        }
-    }
+    // The one visibility-filtered route list (ADR 0012 §4): the router's
+    // dispatch map, the OpenAPI doc, and the context document all derive
+    // from this single call — never three independent predicates.
+    let route_list = crate::context::discoverable_routes(&cell.def)?;
+    let routes: HashMap<String, Export> = route_list.iter().cloned().collect();
+    let declared = crate::context::declared(&cell.def, &route_list, /* with_query */ true);
+    let data = crate::context::DataBlock {
+        served_here: true,
+        channels: Vec::new(),
+    };
+    let digest = crate::context::interface_digest(&cell.def.cell, &declared, &data);
 
     let principals = load_principals(cell.principals.as_deref())?;
     if !cell.def.access.roles.is_empty() && principals.is_empty() {
@@ -182,8 +212,11 @@ fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::s
         .and_then(|p| p.execution)
         .unwrap_or(0);
 
+    let data_as_of = query_data_as_of(&cell.conn);
+    let direct_attach = cell.published.is_none();
+
     let state = Arc::new(AppState {
-        openapi: openapi::generate(&cell.def),
+        openapi: openapi::generate(&cell.def.cell, &route_list, &digest),
         cell_name: cell.def.cell.clone(),
         routes,
         published,
@@ -195,9 +228,63 @@ fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::s
             latest_seen: execution,
             last_ok_poll_unix: store.as_ref().map(|_| unix_now()),
         }),
+        declared,
+        digest,
+        direct_attach,
+        run_summary: Mutex::new(None),
+        data_as_of: Mutex::new(data_as_of),
         cell: Mutex::new(cell),
     });
     Ok((state, store))
+}
+
+/// Newest lake snapshot time — when the data actually last moved. Best-effort
+/// and never on the request path (ADR 0012 §5): read once at open and again
+/// at swap; a failure is `None`, never a fabricated value.
+fn query_data_as_of(conn: &duckdb::Connection) -> Option<String> {
+    conn.prepare("SELECT CAST(max(snapshot_time) AS VARCHAR) FROM ducklake_snapshots('lake')")
+        .and_then(|mut s| s.query_row([], |r| r.get::<_, Option<String>>(0)))
+        .ok()
+        .flatten()
+}
+
+/// Fetch the served execution's run summary into the state cache (ADR 0012
+/// §5). Skips the GET only when the cache already holds the summary for the
+/// currently served execution — summaries are immutable once written, and a
+/// miss (summary not yet landed, or store hiccup) is retried on every tick,
+/// which is the property the ADR requires: nothing is gated on the swap
+/// branch, so a summary that lands late is never orphaned.
+fn fetch_run_summary(state: &AppState, store: &crate::store::Store) {
+    let served = state.execution.load(std::sync::atomic::Ordering::Relaxed);
+    if served == 0 {
+        return;
+    }
+    {
+        let cached = state
+            .run_summary
+            .lock()
+            .expect("run_summary mutex poisoned");
+        if cached.as_ref().is_some_and(|s| s.execution == served) {
+            return;
+        }
+    }
+    match store.get(&crate::store::run_summary_key(served)) {
+        Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+            Ok(summary) => {
+                *state
+                    .run_summary
+                    .lock()
+                    .expect("run_summary mutex poisoned") = Some(summary);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, execution = served, "run summary unparseable; context provenance stays absent");
+            }
+        },
+        Ok(None) => {} // not landed yet — retried next tick
+        Err(e) => {
+            tracing::warn!(error = %e, execution = served, "run summary fetch failed; retrying next tick");
+        }
+    }
 }
 
 /// The router `serve` binds, wrapped in the throttle stack (ADR 0012 §7):
@@ -206,9 +293,14 @@ fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::s
 /// semaphore makes the cap global across connections. Per-client fairness
 /// is a reverse proxy's job (docs/guides/serving.md), not this socket's.
 fn app(state: Arc<AppState>, max_concurrency: usize) -> Router {
+    // `/context` replaces the old `/interface` stub (ADR 0012 §4): renamed,
+    // not duplicated — one document, one route, and the old name 404s (same
+    // rule as unmounted data routes: no door, no 403). No reserved-name
+    // collision: export routes always carry the major (`name@major`), so an
+    // export named `context` serves at `/context@1`.
     Router::new()
         .route("/", get(health))
-        .route("/interface", get(interface))
+        .route("/context", get(context_doc))
         .route("/openapi.json", get(openapi_doc))
         .route("/:route", get(serve_export))
         .layer(
@@ -233,7 +325,7 @@ fn app(state: Arc<AppState>, max_concurrency: usize) -> Router {
 /// thread: the store's surface is sync, and the swap is an assignment.
 ///
 /// A wedged poll (store unreachable) keeps serving last-good data; the
-/// freshness telemetry on `/interface` is what stops that from being
+/// freshness telemetry on `/context` is what stops that from being
 /// invisible.
 fn spawn_poller(
     state: Arc<AppState>,
@@ -264,33 +356,41 @@ fn spawn_poller(
         }
 
         let served = state.execution.load(std::sync::atomic::Ordering::Relaxed);
-        if latest == served {
-            continue;
+        if latest != served {
+            // A rollback (§9) moves LATEST backwards; advance or retreat alike,
+            // serve what the pointer names.
+            match engine::open(&file, &profile, /* read_only */ true) {
+                Ok(new_cell) => {
+                    let n = new_cell
+                        .published
+                        .as_ref()
+                        .and_then(|p| p.execution)
+                        .unwrap_or(0);
+                    // Read the new lake's snapshot time before the swap — off
+                    // the request path, on the connection no request holds yet.
+                    let as_of = query_data_as_of(&new_cell.conn);
+                    // Swap under the lock: in-flight requests finish on the old
+                    // cell first (they hold the lock for the query's duration);
+                    // dropping it reclaims its scratch artifact.
+                    *state.cell.lock().expect("cell mutex poisoned") = new_cell;
+                    state
+                        .execution
+                        .store(n, std::sync::atomic::Ordering::Relaxed);
+                    *state.data_as_of.lock().expect("data_as_of mutex poisoned") = as_of;
+                    tracing::info!(execution = n, "swapped to newly published execution");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, execution = latest,
+                        "failed to open newly published execution; keeping last-good catalog");
+                }
+            }
         }
 
-        // A rollback (§9) moves LATEST backwards; advance or retreat alike,
-        // serve what the pointer names.
-        match engine::open(&file, &profile, /* read_only */ true) {
-            Ok(new_cell) => {
-                let n = new_cell
-                    .published
-                    .as_ref()
-                    .and_then(|p| p.execution)
-                    .unwrap_or(0);
-                // Swap under the lock: in-flight requests finish on the old
-                // cell first (they hold the lock for the query's duration);
-                // dropping it reclaims its scratch artifact.
-                *state.cell.lock().expect("cell mutex poisoned") = new_cell;
-                state
-                    .execution
-                    .store(n, std::sync::atomic::Ordering::Relaxed);
-                tracing::info!(execution = n, "swapped to newly published execution");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, execution = latest,
-                    "failed to open newly published execution; keeping last-good catalog");
-            }
-        }
+        // ADR 0012 §5: the run-summary fetch rides every poll tick, never the
+        // swap branch — the summary is written after `publish_execution`
+        // returns, so gating it on the swap would orphan any summary that
+        // lands after `LATEST` advances.
+        fetch_run_summary(&state, &store);
     });
 }
 
@@ -315,28 +415,97 @@ async fn health(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(body)
 }
 
-async fn interface(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// `GET /context` (ADR 0012): the cell's interface made machine-readable.
+/// Same auth tier as the data — the document is the map (grain, columns,
+/// upstream refs); no lower "docs" tier, no pre-auth serving. Handlers touch
+/// no store and no DuckDB: everything here reads precomputed state and the
+/// poller-maintained caches.
+async fn context_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(resp) = authorize(&s, &headers) {
         return resp;
     }
-    let mut exports: Vec<_> = s.routes.keys().cloned().collect();
-    exports.sort();
-    let mut body = serde_json::json!({ "cell": s.cell_name, "exports": exports });
+
+    let etag = format!("\"{}\"", s.digest);
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == etag)
+    {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
+
     let execution = s.execution.load(std::sync::atomic::Ordering::Relaxed);
-    if execution > 0 {
+
+    // Provenance only when the cached summary describes the execution being
+    // served right now — a summary from a previous execution paired with
+    // fresher rows would be a claim mislabeled as a measurement.
+    let provenance = s
+        .run_summary
+        .lock()
+        .expect("run_summary mutex poisoned")
+        .as_ref()
+        .filter(|summary| summary.execution == execution)
+        .map(|summary| {
+            crate::context::provenance_from(
+                summary,
+                s.data_as_of
+                    .lock()
+                    .expect("data_as_of mutex poisoned")
+                    .clone(),
+            )
+        });
+
+    // Poll telemetry (ADR 0004 §6, carried over from the old `/interface`):
+    // published mode only — direct mode has no poller and no staleness bound.
+    let freshness = (execution > 0).then(|| {
         let f = s
             .freshness
             .lock()
             .expect("freshness mutex poisoned")
             .clone();
-        body["freshness"] = serde_json::json!({
-            "serving_execution": execution,
-            "latest_seen": f.latest_seen,
-            "last_successful_poll_age_seconds":
-                f.last_ok_poll_unix.map(|t| unix_now().saturating_sub(t)),
-        });
+        crate::context::FreshnessBlock {
+            serving_execution: execution,
+            latest_seen: f.latest_seen,
+            last_successful_poll_age_seconds: f
+                .last_ok_poll_unix
+                .map(|t| unix_now().saturating_sub(t)),
+        }
+    });
+
+    let doc = crate::context::assemble(
+        s.cell_name.clone(),
+        s.declared.clone(),
+        provenance,
+        freshness,
+        /* served_here */ true,
+        s.direct_attach,
+    );
+    (StatusCode::OK, [(header::ETAG, etag)], Json(doc)).into_response()
+}
+
+/// The back-link headers every data-route response carries (ADR 0012 §4) —
+/// 200 and 404 alike, because a wrong guess is exactly when the map matters.
+/// `X-Datamk-Context-Digest`, not `ETag`: on a data response the ETag tags
+/// the rows, and overloading it breaks `If-None-Match`. `X-Datamk-Execution`
+/// mirrors what the pre-auth health route already exposes. Headers only —
+/// the row body stays a bare JSON array.
+fn with_context_headers(s: &AppState, mut resp: Response) -> Response {
+    use axum::http::HeaderValue;
+    let h = resp.headers_mut();
+    h.insert(
+        header::LINK,
+        HeaderValue::from_static("</context>; rel=\"describedby\""),
+    );
+    if let Ok(v) = HeaderValue::from_str(&s.digest) {
+        h.insert("x-datamk-context-digest", v);
     }
-    Json(body).into_response()
+    let execution = s.execution.load(std::sync::atomic::Ordering::Relaxed);
+    if execution > 0 {
+        if let Ok(v) = HeaderValue::from_str(&execution.to_string()) {
+            h.insert("x-datamk-execution", v);
+        }
+    }
+    resp
 }
 
 async fn openapi_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -355,6 +524,17 @@ async fn serve_export(
     if let Err(resp) = authorize(&s, &headers) {
         return resp;
     }
+    // Every post-auth response — 200, 400, 404, 500 — carries the context
+    // back-link headers (ADR 0012 §4): a wrong guess is exactly when the map
+    // matters.
+    with_context_headers(&s, serve_export_inner(&s, route, params).await)
+}
+
+async fn serve_export_inner(
+    s: &Arc<AppState>,
+    route: String,
+    params: HashMap<String, String>,
+) -> Response {
     let export = match s.routes.get(&route) {
         Some(e) => e.clone(),
         None => return (StatusCode::NOT_FOUND, format!("no export '{route}'")).into_response(),
@@ -528,6 +708,7 @@ fn run_json_query(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Visibility;
     use indexmap::IndexMap;
 
     fn export() -> Export {
@@ -750,6 +931,56 @@ mod tests {
         assert_eq!(map.get("tok").unwrap(), &vec!["analyst".to_string()]);
     }
 
+    // ADR 0012 §7: the fixture test binding the context document's `query`
+    // claims to the constants and validation `build_query`/`validate_params`
+    // enforce — hand-restated prose beside enforcing code orphans silently on
+    // the next change to either. A change to the grammar or to the block
+    // fails here, loudly.
+    #[test]
+    fn context_query_block_claims_match_the_enforced_grammar() {
+        let e = export();
+        let qb = crate::context::query_block("orders_daily@2", &e);
+
+        // The caps in the block are the caps in the code — same constants.
+        assert_eq!(qb.limit_default, DEFAULT_LIMIT);
+        assert_eq!(qb.limit_max, MAX_LIMIT);
+        assert_eq!(qb.offset_max, MAX_OFFSET);
+
+        // The advertised filters are exactly the accepted filter params:
+        // every advertised one validates, any declared-but-unadvertised
+        // column is rejected.
+        assert_eq!(qb.filters, e.grain);
+        for f in &qb.filters {
+            let mut p = HashMap::new();
+            p.insert(f.clone(), "x".to_string());
+            validate_params(&e, &p).expect("advertised filter must validate");
+        }
+        let unadvertised: Vec<&String> = e
+            .schema
+            .keys()
+            .filter(|c| !qb.filters.contains(c))
+            .collect();
+        assert!(!unadvertised.is_empty(), "test needs a non-grain column");
+        for c in unadvertised {
+            let mut p = HashMap::new();
+            p.insert(c.clone(), "x".to_string());
+            assert!(
+                validate_params(&e, &p).is_err(),
+                "unadvertised column '{c}' must be rejected"
+            );
+        }
+
+        // The sample request is a legal sentence in the grammar.
+        let (path, query) = qb.sample_request.split_once('?').unwrap();
+        assert_eq!(path, "/orders_daily@2");
+        let params: HashMap<String, String> = query
+            .split('&')
+            .map(|kv| kv.split_once('=').unwrap())
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_params(&e, &params).expect("sample_request must be a legal call");
+    }
+
     // §9: request queries must stay in autocommit. An explicit BEGIN would pin the
     // catalog attach and block the Builder's commit. Guard the built query string.
     #[test]
@@ -852,7 +1083,7 @@ mod smoke {
     }
 
     #[test]
-    fn open_cell_serves_health_interface_openapi_and_rows() {
+    fn open_cell_serves_health_context_openapi_and_rows() {
         let router = router_with(|_| {});
         rt().block_on(async {
             let (status, body) = get(&router, "/", None).await;
@@ -861,15 +1092,39 @@ mod smoke {
             assert_eq!(v["cell"], "smoke");
             assert_eq!(v["status"], "ok");
 
-            let (status, body) = get(&router, "/interface", None).await;
+            // The context document (ADR 0012): a direct-attach (local) cell
+            // is pinless, therefore draft, with observed null and the
+            // engine-emitted note — never fabricated provenance.
+            let (status, body) = get(&router, "/context", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(v["exports"], serde_json::json!(["orders_daily@2"]));
+            assert_eq!(v["datamk_context"], 1);
+            assert_eq!(v["cell"], "smoke");
+            assert_eq!(v["status"], "draft");
+            assert_eq!(v["grain_verified"], false);
+            assert!(v["observed"].is_null(), "{body}");
+            assert_eq!(v["declared"]["exports"][0]["route"], "orders_daily@2");
+            assert_eq!(
+                v["declared"]["exports"][0]["query"]["sample_request"],
+                "/orders_daily@2?limit=10"
+            );
+            assert_eq!(v["data"]["served_here"], true);
+            assert_eq!(v["notes"][0], crate::context::NOTE_DIRECT_ATTACH);
+
+            // The old /interface stub is renamed, not duplicated (ADR 0012
+            // §4): no door, no 403 — a plain 404.
+            let (status, _) = get(&router, "/interface", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
 
             let (status, body) = get(&router, "/openapi.json", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(v["paths"]["/orders_daily@2"].is_object(), "{body}");
+            // ADR 0012 §7: the hardcoded "0.0.0" is gone — the version is
+            // the interface digest.
+            let version = v["info"]["version"].as_str().unwrap();
+            assert_ne!(version, "0.0.0");
+            assert_eq!(version.len(), 64, "sha256 hex digest: {version}");
 
             let (status, body) = get(&router, "/orders_daily@2", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -877,6 +1132,68 @@ mod smoke {
             assert!(!rows.is_empty(), "scaffold cell must serve rows");
             assert!(rows[0].get("order_date").is_some(), "{body}");
             assert!(rows[0].get("revenue").is_some(), "{body}");
+        });
+    }
+
+    /// ADR 0012 §2/§4: the digest is the document's ETag (If-None-Match ->
+    /// 304), and every data-route response answers back with the map's
+    /// location and digest — 200 and 404 alike.
+    #[test]
+    fn context_etag_and_data_route_back_links() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/context")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let etag = resp
+                .headers()
+                .get(header::ETAG)
+                .expect("context carries an ETag")
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/context")
+                        .header(header::IF_NONE_MATCH, &etag)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+            for uri in ["/orders_daily@2", "/no_such@1"] {
+                let resp = router
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.headers()
+                        .get(header::LINK)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("</context>; rel=\"describedby\""),
+                    "{uri} must link back to /context"
+                );
+                let digest = resp
+                    .headers()
+                    .get("x-datamk-context-digest")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("data route carries the context digest");
+                assert_eq!(format!("\"{digest}\""), etag, "digest matches the ETag");
+            }
         });
     }
 
@@ -953,7 +1270,9 @@ mod smoke {
         rt().block_on(async {
             let (status, _) = get(&router, "/", None).await;
             assert_eq!(status, StatusCode::OK, "health stays pre-auth");
-            for uri in ["/interface", "/openapi.json", "/orders_daily@2"] {
+            // The document is the map — same auth tier as the data, exactly
+            // authorize() (ADR 0012 §4). No lower "docs" tier.
+            for uri in ["/context", "/openapi.json", "/orders_daily@2"] {
                 let (status, body) = get(&router, uri, None).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
             }

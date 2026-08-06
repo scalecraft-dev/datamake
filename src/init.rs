@@ -265,7 +265,7 @@ A [datamk](https://github.com/scalecraft/datamk) cell.
 
 ```
 datamk run     -f cell.yaml          # execute the pipeline -> snapshot -> verify
-datamk serve   -f cell.yaml          # GET /orders_daily@2 , /openapi.json , /interface
+datamk serve   -f cell.yaml          # GET /orders_daily@2 , /openapi.json , /context
 datamk release -f cell.yaml          # pin the current snapshot as the supported contract
 datamk deploy  -f cell.yaml -p prod  # run the Builder + Server on an orchestrator
 ```

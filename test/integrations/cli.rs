@@ -729,3 +729,55 @@ fn attach_help_documents_download() {
         "expected the locality caveat, got: {help}"
     );
 }
+
+/// `datamk context` (ADR 0012 §4): the portable emission — no server, no
+/// port, no token. A direct-attach (local) profile is pinless, therefore
+/// draft, with the engine-emitted note and no fabricated provenance; the
+/// portable artifact carries `emitted_at` + the cell.yaml digest and never
+/// claims to serve rows itself.
+#[test]
+fn context_emits_a_draft_document_for_a_local_cell() {
+    let target = std::env::temp_dir().join(format!("datamk_it_context_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    let out = Command::new(bin())
+        .args(["init", "ctxcell", "-p"])
+        .arg(&target)
+        .output()
+        .expect("spawning datamk init");
+    assert!(out.status.success());
+
+    let out = run_ok(&target, &["context", "-f", "cell.yaml"]);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("context emits valid JSON on stdout");
+
+    assert_eq!(doc["datamk_context"], 1);
+    assert_eq!(doc["cell"], "ctxcell");
+    assert_eq!(doc["status"], "draft", "pinless => draft, by definition");
+    assert_eq!(doc["grain_verified"], false);
+    assert!(doc["observed"].is_null(), "no fabricated provenance: {doc}");
+    assert_eq!(doc["data"]["served_here"], false, "a file serves no rows");
+    let export = &doc["declared"]["exports"][0];
+    assert_eq!(export["route"], "orders_daily@2");
+    assert_eq!(export["grain"], serde_json::json!(["order_date", "region"]));
+    assert_eq!(
+        export["query"]["sample_request"],
+        "/orders_daily@2?limit=10"
+    );
+    assert!(doc["emitted_at"].is_string(), "{doc}");
+    assert_eq!(
+        doc["cell_yaml_digest"].as_str().map(str::len),
+        Some(64),
+        "sha256 of the emitted-from cell.yaml: {doc}"
+    );
+
+    // --out writes the same document to a file instead of stdout.
+    let out_path = target.join("context.json");
+    run_ok(
+        &target,
+        &["context", "-f", "cell.yaml", "--out", "context.json"],
+    );
+    let from_file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(from_file["cell"], "ctxcell");
+    let _ = std::fs::remove_dir_all(&target);
+}
