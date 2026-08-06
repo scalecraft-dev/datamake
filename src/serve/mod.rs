@@ -66,6 +66,18 @@ struct AppState {
     /// Newest lake snapshot time, cached at open and at swap — never queried
     /// on the request path.
     data_as_of: Mutex<Option<String>>,
+    /// The sorted route list the routes map was built from — kept so the
+    /// poller can re-run the swap-time probes against a fresh cell.
+    route_list: Vec<(String, Export)>,
+    /// Whether the data routes are mounted (`false` under `--no-data`,
+    /// ADR 0012 §4). Drives `data.served_here` honestly, by construction.
+    data_mounted: bool,
+    /// Profile-declared locations rows actually live when not served here.
+    channels: Vec<String>,
+    /// Swap-time probe results (ADR 0012 §5): computed at open and at swap
+    /// on the poller thread, never on the request path; omitted pieces stay
+    /// omitted rather than blocking serving.
+    probes: Mutex<indexmap::IndexMap<String, crate::context::ExportProbe>>,
 }
 
 #[derive(Default, Clone)]
@@ -146,9 +158,10 @@ pub async fn run(
     port: u16,
     poll_interval: u64,
     max_concurrency: usize,
+    no_data: bool,
 ) -> Result<()> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
-    let (state, store) = build_state(cell)?;
+    let (state, store) = build_state(cell, no_data)?;
 
     // Initial run-summary fetch (ADR 0012 §5): serve startup already talks to
     // the store (`engine::open` downloaded the artifact), so one more GET here
@@ -181,18 +194,25 @@ pub async fn run(
 /// in-process smoke tests can stand up the exact router `serve` binds,
 /// without a socket. Returns the store handle separately (published mode)
 /// so `run` can hand it to the poller.
-fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::store::Store>>)> {
+fn build_state(
+    cell: engine::Cell,
+    no_data: bool,
+) -> Result<(Arc<AppState>, Option<Arc<crate::store::Store>>)> {
     let published = load_published(&cell.dir);
+    let data_mounted = !no_data;
 
     // The one visibility-filtered route list (ADR 0012 §4): the router's
     // dispatch map, the OpenAPI doc, and the context document all derive
     // from this single call — never three independent predicates.
     let route_list = crate::context::discoverable_routes(&cell.def)?;
     let routes: HashMap<String, Export> = route_list.iter().cloned().collect();
-    let declared = crate::context::declared(&cell.def, &route_list, /* with_query */ true);
+    // Under --no-data the query block is omitted (it describes HTTP
+    // affordances that do not exist there — ADR 0012 §4).
+    let declared =
+        crate::context::declared(&cell.def, &route_list, /* with_query */ data_mounted);
     let data = crate::context::DataBlock {
-        served_here: true,
-        channels: Vec::new(),
+        served_here: data_mounted,
+        channels: cell.channels.clone(),
     };
     let digest = crate::context::interface_digest(&cell.def.cell, &declared, &data);
 
@@ -214,12 +234,23 @@ fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::s
 
     let data_as_of = query_data_as_of(&cell.conn);
     let direct_attach = cell.published.is_none();
+    // The open-time probe run (ADR 0012 §5) — same measurements the poller
+    // repeats at every swap. `--no-data` withholds the row-derived `values`
+    // lists; coverage and counts stay (aggregates that name no entity).
+    let probes = probe_exports(
+        &cell.conn,
+        &route_list,
+        &published,
+        /* include_values */ data_mounted,
+    );
 
     let state = Arc::new(AppState {
+        // Under --no-data the OpenAPI paths are empty: the spec describes
+        // the callable HTTP surface, and the data routes are not mounted.
         openapi: openapi::generate(
             &cell.def.cell,
             cell.def.description.as_deref(),
-            &route_list,
+            if data_mounted { &route_list } else { &[] },
             &digest,
         ),
         cell_name: cell.def.cell.clone(),
@@ -238,9 +269,161 @@ fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::s
         direct_attach,
         run_summary: Mutex::new(None),
         data_as_of: Mutex::new(data_as_of),
+        route_list,
+        data_mounted,
+        channels: cell.channels.clone(),
+        probes: Mutex::new(probes),
         cell: Mutex::new(cell),
     });
     Ok((state, store))
+}
+
+/// The swap-time probe (ADR 0012 §5): per export, the row count, min/max of
+/// date/timestamp-typed grain columns, distinct values of string grain
+/// columns (`LIMIT 51` — ≤50 listed as complete, more omitted as
+/// incomplete), and one real row's grain values joined into
+/// `example_request`. Runs on the freshly opened connection at open and at
+/// swap — never the request path — against the same rows each route serves
+/// (the pinned snapshot for supported routes). Every piece is best-effort:
+/// a failure omits that piece and never blocks serving.
+fn probe_exports(
+    conn: &duckdb::Connection,
+    route_list: &[(String, Export)],
+    published: &BTreeMap<String, i64>,
+    include_values: bool,
+) -> indexmap::IndexMap<String, crate::context::ExportProbe> {
+    use crate::context::{ColumnCoverage, ColumnValues, ExportProbe};
+
+    let mut out = indexmap::IndexMap::new();
+    for (route, export) in route_list {
+        let snapshot = if export.contract == Contract::Supported {
+            published.get(route).copied()
+        } else {
+            None
+        };
+        let at = match snapshot {
+            Some(id) => format!(" AT (VERSION => {id})"),
+            None => String::new(),
+        };
+        let source = export.source_object();
+        let mut probe = ExportProbe {
+            rows: conn
+                .prepare(&format!("SELECT count(*) FROM {source}{at}"))
+                .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+                .ok(),
+            ..ExportProbe::default()
+        };
+
+        for g in &export.grain {
+            let Some(spec) = export.schema.get(g) else {
+                continue; // no declared type — no typed probe to run
+            };
+            match spec.ty.to_lowercase().as_str() {
+                "date" | "timestamp" => {
+                    let minmax = conn
+                        .prepare(&format!(
+                            "SELECT CAST(min({g}) AS VARCHAR), CAST(max({g}) AS VARCHAR) \
+                             FROM {source}{at}"
+                        ))
+                        .and_then(|mut s| {
+                            s.query_row([], |r| {
+                                Ok((
+                                    r.get::<_, Option<String>>(0)?,
+                                    r.get::<_, Option<String>>(1)?,
+                                ))
+                            })
+                        })
+                        .ok();
+                    if let Some((Some(min), Some(max))) = minmax {
+                        probe
+                            .coverage
+                            .insert(g.clone(), ColumnCoverage { min, max });
+                    }
+                }
+                "string" | "varchar" | "text" if include_values => {
+                    let vals: Option<Vec<String>> = conn
+                        .prepare(&format!(
+                            "SELECT DISTINCT CAST({g} AS VARCHAR) FROM {source}{at} \
+                             WHERE {g} IS NOT NULL ORDER BY 1 LIMIT 51"
+                        ))
+                        .and_then(|mut s| {
+                            let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+                            rows.collect()
+                        })
+                        .ok();
+                    if let Some(vals) = vals {
+                        let complete = vals.len() <= 50;
+                        probe.values.insert(
+                            g.clone(),
+                            ColumnValues {
+                                values: complete.then_some(vals),
+                                complete,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // One REAL row's grain values, drawn jointly (never composed from the
+        // per-column values, which can name a combination that co-occurs
+        // nowhere). ORDER BY the grain so the example is stable across polls.
+        if include_values && !export.grain.is_empty() {
+            let cols = export
+                .grain
+                .iter()
+                .map(|g| format!("CAST({g} AS VARCHAR)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let order = export.grain.join(", ");
+            let row: Option<Vec<Option<String>>> = conn
+                .prepare(&format!(
+                    "SELECT {cols} FROM {source}{at} ORDER BY {order} LIMIT 1"
+                ))
+                .and_then(|mut s| {
+                    s.query_row([], |r| {
+                        (0..export.grain.len())
+                            .map(|i| r.get::<_, Option<String>>(i))
+                            .collect()
+                    })
+                })
+                .ok();
+            // Emitted only when every grain column got a value — never a
+            // placeholder, which an agent pastes literally.
+            if let Some(row) = row {
+                if row.iter().all(Option::is_some) {
+                    let params = export
+                        .grain
+                        .iter()
+                        .zip(&row)
+                        .map(|(g, v)| format!("{g}={}", percent_encode(v.as_deref().unwrap_or(""))))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    probe.example_request = Some(format!("/{route}?{params}&limit=10"));
+                }
+            }
+        }
+
+        out.insert(route.clone(), probe);
+    }
+    out
+}
+
+/// Minimal query-value percent-encoding: unreserved characters pass through,
+/// everything else is %XX-escaped — enough for grain values in an example
+/// URL, with no dependency.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Newest lake snapshot time — when the data actually last moved. Best-effort
@@ -371,9 +554,17 @@ fn spawn_poller(
                         .as_ref()
                         .and_then(|p| p.execution)
                         .unwrap_or(0);
-                    // Read the new lake's snapshot time before the swap — off
-                    // the request path, on the connection no request holds yet.
+                    // Read the new lake's snapshot time and re-run the probes
+                    // before the swap — off the request path, on the
+                    // connection no request holds yet (ADR 0012 §5).
                     let as_of = query_data_as_of(&new_cell.conn);
+                    let published = load_published(&new_cell.dir);
+                    let probes = probe_exports(
+                        &new_cell.conn,
+                        &state.route_list,
+                        &published,
+                        state.data_mounted,
+                    );
                     // Swap under the lock: in-flight requests finish on the old
                     // cell first (they hold the lock for the query's duration);
                     // dropping it reclaims its scratch artifact.
@@ -382,6 +573,7 @@ fn spawn_poller(
                         .execution
                         .store(n, std::sync::atomic::Ordering::Relaxed);
                     *state.data_as_of.lock().expect("data_as_of mutex poisoned") = as_of;
+                    *state.probes.lock().expect("probes mutex poisoned") = probes;
                     tracing::info!(execution = n, "swapped to newly published execution");
                 }
                 Err(e) => {
@@ -477,14 +669,22 @@ async fn context_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         }
     });
 
-    let doc = crate::context::assemble(
+    let probes = s.probes.lock().expect("probes mutex poisoned").clone();
+    let mut doc = crate::context::assemble(
         s.cell_name.clone(),
         s.declared.clone(),
         provenance,
         freshness,
-        /* served_here */ true,
+        probes,
+        /* served_here */ s.data_mounted,
+        s.channels.clone(),
         s.direct_attach,
     );
+    if !s.data_mounted {
+        // The same engine-emitted sentence the unmounted routes' 404 body
+        // carries (ADR 0012 §4).
+        doc.notes.push(crate::context::NOTE_NO_DATA.to_string());
+    }
     (StatusCode::OK, [(header::ETAG, etag)], Json(doc)).into_response()
 }
 
@@ -526,6 +726,16 @@ async fn serve_export(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    // --no-data (ADR 0012 §4): the data routes are simply not mounted.
+    // Unmounted routes return 404, not 403 — a 403 promises a door that
+    // exists — and the body carries the same engine-emitted sentence as the
+    // document's notes. No auth gate: there is no door to guard.
+    if !s.data_mounted {
+        return with_context_headers(
+            &s,
+            (StatusCode::NOT_FOUND, crate::context::NOTE_NO_DATA).into_response(),
+        );
+    }
     if let Err(resp) = authorize(&s, &headers) {
         return resp;
     }
@@ -1064,13 +1274,17 @@ mod smoke {
     /// Open the built cell read-only and stand up the exact router `serve`
     /// binds. `mutate` edits the parsed definition before state construction
     /// (how the auth tests flip `shareable`/`roles` without a second cell).
-    fn router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+    fn router_mode(no_data: bool, mutate: impl FnOnce(&mut engine::Cell)) -> Router {
         let scaffold = built_cell();
         let mut cell = engine::open(&scaffold.dir.join("cell.yaml"), "local", true)
             .expect("open built cell read-only");
         mutate(&mut cell);
-        let (state, _store) = build_state(cell).expect("build state");
+        let (state, _store) = build_state(cell, no_data).expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    fn router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        router_mode(false, mutate)
     }
 
     fn rt() -> tokio::runtime::Runtime {
@@ -1108,8 +1322,9 @@ mod smoke {
             assert_eq!(v["status"], "ok");
 
             // The context document (ADR 0012): a direct-attach (local) cell
-            // is pinless, therefore draft, with observed null and the
-            // engine-emitted note — never fabricated provenance.
+            // is pinless, therefore draft, with provenance null and the
+            // engine-emitted note — never fabricated. The probe measurements
+            // (machine facts from the attached catalog) are still present.
             let (status, body) = get(&router, "/context", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1117,7 +1332,7 @@ mod smoke {
             assert_eq!(v["cell"], "smoke");
             assert_eq!(v["status"], "draft");
             assert_eq!(v["grain_verified"], false);
-            assert!(v["observed"].is_null(), "{body}");
+            assert!(v["observed"]["provenance"].is_null(), "{body}");
             assert_eq!(v["declared"]["exports"][0]["route"], "orders_daily@2");
             assert_eq!(
                 v["declared"]["exports"][0]["query"]["sample_request"],
@@ -1291,6 +1506,90 @@ mod smoke {
                 let (status, body) = get(&router, uri, None).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
             }
+        });
+    }
+
+    /// ADR 0012 §5: the open-time probe measures the real rows — coverage
+    /// min/max on the date grain column, complete value lists on the string
+    /// grain column, and an example_request drawn jointly from one real row.
+    #[test]
+    fn context_carries_probe_measurements_from_the_real_rows() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let probe = &v["observed"]["exports"]["orders_daily@2"];
+            assert_eq!(probe["rows"], 4, "{body}");
+            assert_eq!(probe["coverage"]["order_date"]["min"], "2026-06-01");
+            assert_eq!(probe["coverage"]["order_date"]["max"], "2026-06-02");
+            assert_eq!(probe["values"]["region"]["complete"], true);
+            assert_eq!(
+                probe["values"]["region"]["values"],
+                serde_json::json!(["eu-west", "us-east", "us-west"])
+            );
+            // Drawn jointly from the first row in grain order — a combination
+            // that actually co-occurs. Pasting it must return exactly one row.
+            let example = probe["example_request"].as_str().unwrap();
+            assert_eq!(
+                example,
+                "/orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
+            );
+            let (status, rows) = get(&router, example, None).await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&rows).unwrap();
+            assert_eq!(rows.len(), 1, "the example request must hit a real row");
+        });
+    }
+
+    /// ADR 0012 §4: --no-data serves the map and withholds the rows — 404
+    /// (not 403) with the engine-emitted sentence on data routes, query
+    /// block and value lists omitted, coverage retained, channels surfaced.
+    #[test]
+    fn no_data_mode_serves_context_without_rows() {
+        let router = router_mode(true, |cell| {
+            cell.channels = vec!["warehouse: analytics.orders_daily".to_string()];
+        });
+        rt().block_on(async {
+            let (status, body) = get(&router, "/orders_daily@2", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(
+                body.contains("not served by this endpoint by design"),
+                "{body}"
+            );
+
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["data"]["served_here"], false);
+            assert_eq!(
+                v["data"]["channels"],
+                serde_json::json!(["warehouse: analytics.orders_daily"])
+            );
+            // The query block describes HTTP affordances that don't exist here.
+            assert!(v["declared"]["exports"][0].get("query").is_none(), "{body}");
+            let probe = &v["observed"]["exports"]["orders_daily@2"];
+            // Value lists are row-derived data — withheld. Coverage stays:
+            // an aggregate that names no entity.
+            assert!(probe.get("values").is_none(), "{body}");
+            assert!(probe.get("example_request").is_none(), "{body}");
+            assert_eq!(probe["coverage"]["order_date"]["min"], "2026-06-01");
+            assert_eq!(probe["rows"], 4);
+            // The same sentence as the 404 body rides notes[].
+            assert!(
+                v["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.as_str() == Some(crate::context::NOTE_NO_DATA)),
+                "{body}"
+            );
+
+            // OpenAPI describes the callable surface — no data paths here.
+            let (status, body) = get(&router, "/openapi.json", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(v["paths"].as_object().unwrap().is_empty(), "{body}");
         });
     }
 

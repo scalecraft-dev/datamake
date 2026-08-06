@@ -169,6 +169,52 @@ pub struct Observed {
     /// artifact — poll telemetry is a lie the instant the file is written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<FreshnessBlock>,
+    /// Swap-time probe results, per route (ADR 0012 §5) — measured against
+    /// the rows the route actually serves (pinned snapshot for supported
+    /// routes), never computed on the request path, omitted on failure.
+    /// These turn the worst agent failure — an empty result read as a
+    /// legitimate zero — into a diagnosable miss.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub exports: IndexMap<String, ExportProbe>,
+}
+
+/// What the swap-time probe measured for one export.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ExportProbe {
+    /// Total row count behind the route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<i64>,
+    /// min/max per date/timestamp-typed grain column — the aggregate that
+    /// turns an empty answer into a diagnosable miss, and it names no entity.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub coverage: IndexMap<String, ColumnCoverage>,
+    /// Distinct values per low-cardinality string grain column (`LIMIT 51`):
+    /// ≤50 back ⇒ listed with `complete: true`; 51 back ⇒ values omitted,
+    /// `complete: false`. Row-derived — omitted entirely under `--no-data`
+    /// (shipping them would exfiltrate a projection of the withheld rows).
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub values: IndexMap<String, ColumnValues>,
+    /// The grain-filtered sibling of `sample_request`, drawn jointly from
+    /// ONE real row — never composed from the per-column values
+    /// independently, which can name a combination that co-occurs nowhere
+    /// (manufacturing the exact empty-result-as-zero failure the probe
+    /// exists to kill). Emitted only when every grain column got a value;
+    /// never a placeholder, which an agent pastes literally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub example_request: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ColumnCoverage {
+    pub min: String,
+    pub max: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ColumnValues {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+    pub complete: bool,
 }
 
 /// The provenance fields admitted to the wire (ADR 0012 §5). Everything else
@@ -295,6 +341,13 @@ pub fn query_block(route: &str, export: &Export) -> QueryBlock {
 /// not "never existed" — so the status is asserted positively.
 pub const NOTE_NOTHING_BUILT: &str = "Nothing behind this document has been built or verified.";
 
+/// The engine-emitted sentence a `--no-data` endpoint serves — in the
+/// document's notes and in every unmounted data route's 404 body, the same
+/// text (ADR 0012 §4).
+pub const NOTE_NO_DATA: &str =
+    "Rows are not served by this endpoint by design. Fetch them via the locations listed \
+     in the context document's data.channels.";
+
 /// The engine-emitted note on a direct-attach (local catalog) document:
 /// pinless ⇒ draft by definition (ADR 0012 §4) — data may exist locally, but
 /// no published, verify-gated execution stands behind the document.
@@ -307,12 +360,15 @@ pub const NOTE_DIRECT_ATTACH: &str =
 /// handler works — its declared region and digest are precomputed at
 /// startup). `provenance` present ⇒ verified (its wire meaning — ADR 0012
 /// §5); absent ⇒ draft, with the matching engine note.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble(
     cell: String,
     declared: Declared,
     provenance: Option<Provenance>,
     freshness: Option<FreshnessBlock>,
+    probes: IndexMap<String, ExportProbe>,
     served_here: bool,
+    channels: Vec<String>,
     direct_attach: bool,
 ) -> ContextDocument {
     let verified = provenance.is_some();
@@ -337,17 +393,18 @@ pub fn assemble(
         },
         grain_verified: verified,
         declared,
-        observed: if provenance.is_some() || freshness.is_some() {
+        observed: if provenance.is_some() || freshness.is_some() || !probes.is_empty() {
             Some(Observed {
                 provenance,
                 freshness,
+                exports: probes,
             })
         } else {
             None
         },
         data: DataBlock {
             served_here,
-            channels: Vec::new(),
+            channels,
         },
         notes,
         emitted_at: None,
@@ -374,7 +431,9 @@ pub fn build(
         declared(def, routes, with_query),
         provenance,
         freshness,
+        IndexMap::new(),
         served_here,
+        Vec::new(),
         direct_attach,
     )
 }
@@ -465,6 +524,7 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
         /* served_here */ false, // a file serves no rows
         direct_attach,
     );
+    doc.data.channels = loaded.bindings.channels.clone();
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
     doc.cell_yaml_digest = Some(sha256_hex(
         &std::fs::read(file).with_context(|| format!("reading {}", file.display()))?,

@@ -929,6 +929,13 @@ pub struct Bindings {
     /// Required only when `access.roles` is set.
     #[serde(default)]
     pub principals: Option<String>,
+    /// Where rows actually live when this endpoint doesn't serve them
+    /// (`serve --no-data`, ADR 0012 §4): free-form operator hints (a share
+    /// name, an internal how-to URL) surfaced verbatim in the context
+    /// document's `data.channels`. Environment, which is why it binds here
+    /// and never in `cell.yaml`. Empty stays empty — never fabricated.
+    #[serde(default)]
+    pub channels: Vec<String>,
     /// Locations of upstream cell dependencies (referenced by name from `sources`).
     #[serde(default)]
     pub cells: IndexMap<String, CellLocation>,

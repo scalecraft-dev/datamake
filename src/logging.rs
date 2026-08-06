@@ -379,6 +379,7 @@ mod tests {
             port: 8080,
             poll_interval: 15,
             max_concurrency: crate::serve::DEFAULT_MAX_CONCURRENCY,
+            no_data: false,
         });
 
         assert_eq!(command_name(&run), Some("run"));

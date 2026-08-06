@@ -92,6 +92,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 a.port,
                 a.poll_interval,
                 a.max_concurrency,
+                a.no_data,
             )
             .await
         }

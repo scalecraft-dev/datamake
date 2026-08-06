@@ -225,4 +225,11 @@ pub struct ServeArgs {
     /// limiting (docs/guides/serving.md).
     #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_CONCURRENCY)]
     pub max_concurrency: usize,
+    /// Serve the context document without mounting the data routes (ADR
+    /// 0012): agents learn what exports mean, but rows never leave — for
+    /// estates where consumers fetch data through existing warehouse grants.
+    /// Unmounted routes return 404; the profile's `channels:` list tells
+    /// callers where rows actually live.
+    #[arg(long)]
+    pub no_data: bool,
 }
