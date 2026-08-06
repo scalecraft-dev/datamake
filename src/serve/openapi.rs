@@ -7,7 +7,14 @@ use serde_json::{json, Map, Value};
 /// single source of truth, so the spec is derived, never hand-annotated.
 /// `version` is the context document's interface digest (ADR 0012 §7) — it
 /// moves when the interface moves, not when data refreshes under it.
-pub fn generate(cell: &str, routes: &[(String, Export)], version: &str) -> Value {
+/// `description` is the cell's declared one-liner (ADR 0012 §3) when the
+/// author wrote one.
+pub fn generate(
+    cell: &str,
+    description: Option<&str>,
+    routes: &[(String, Export)],
+    version: &str,
+) -> Value {
     let mut paths = Map::new();
     for (route, export) in routes {
         paths.insert(format!("/{route}"), path_item(export));
@@ -17,7 +24,7 @@ pub fn generate(cell: &str, routes: &[(String, Export)], version: &str) -> Value
         "info": {
             "title": cell,
             "version": version,
-            "description": "Generated from the cell interface"
+            "description": description.unwrap_or("Generated from the cell interface")
         },
         "paths": Value::Object(paths)
     })
@@ -43,7 +50,7 @@ fn path_item(export: &Export) -> Value {
         let schema = export
             .schema
             .get(g)
-            .map(|ty| openapi_type(ty))
+            .map(|spec| openapi_type(&spec.ty))
             .unwrap_or_else(|| json!({}));
         params.push(json!({ "name": g, "in": "query",
                             "description": "Grain filter — exact equality only.",
@@ -51,8 +58,18 @@ fn path_item(export: &Export) -> Value {
     }
 
     let mut props = Map::new();
-    for (col, ty) in &export.schema {
-        props.insert(col.clone(), openapi_type(ty));
+    for (col, spec) in &export.schema {
+        let mut prop = openapi_type(&spec.ty);
+        // The meaning fields (ADR 0012 §3) ride the standard `description`
+        // slot plus an x- extension for the structured unit — the context
+        // document stays the primary surface; this keeps the two consistent.
+        if let Some(d) = &spec.description {
+            prop["description"] = json!(d);
+        }
+        if let Some(u) = &spec.unit {
+            prop["x-datamk-unit"] = json!(u);
+        }
+        props.insert(col.clone(), prop);
     }
 
     json!({
@@ -97,17 +114,18 @@ fn openapi_type(ty: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CellDef, Contract, Export, Visibility};
+    use crate::config::{CellDef, ColumnSpec, Contract, Export, Visibility};
     use indexmap::IndexMap;
 
     fn export_with(name: &str, version: &str, visibility: Visibility) -> Export {
         let mut schema = IndexMap::new();
-        schema.insert("order_date".to_string(), "date".to_string());
-        schema.insert("revenue".to_string(), "decimal".to_string());
+        schema.insert("order_date".to_string(), ColumnSpec::bare("date"));
+        schema.insert("revenue".to_string(), ColumnSpec::bare("decimal"));
         Export {
             name: name.to_string(),
             version: version.to_string(),
             source: None,
+            description: None,
             grain: vec!["order_date".to_string()],
             schema,
             freshness: None,
@@ -142,6 +160,7 @@ mod tests {
     fn generate_emits_a_path_per_discoverable_export() {
         let def = CellDef {
             cell: "orders".to_string(),
+            description: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![
@@ -152,7 +171,7 @@ mod tests {
         };
         // The same shared route list `serve` and `/context` read (ADR 0012 §4).
         let routes = crate::context::discoverable_routes(&def).unwrap();
-        let doc = generate(&def.cell, &routes, "digest123");
+        let doc = generate(&def.cell, def.description.as_deref(), &routes, "digest123");
         assert_eq!(doc["openapi"], "3.1.0");
         assert_eq!(doc["info"]["title"], "orders");
         // ADR 0012 §7: the version is the interface digest, not "0.0.0".

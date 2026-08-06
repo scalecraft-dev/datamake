@@ -616,6 +616,7 @@ mod tests {
         sources.insert(name.to_string(), src);
         CellDef {
             cell: "c".to_string(),
+            description: None,
             sources,
             transforms: vec![],
             interface: vec![] as Vec<Export>,
@@ -1433,6 +1434,7 @@ mod tests {
         std::env::set_var("DATAMK_TEST_REGION", "us-west-2");
         let def = CellDef {
             cell: "c".into(),
+            description: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![] as Vec<Export>,
@@ -1467,6 +1469,7 @@ mod tests {
         std::env::set_var("DATAMK_TEST_GCS_KEY", "HMACKEY");
         let def = CellDef {
             cell: "c".into(),
+            description: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![] as Vec<Export>,

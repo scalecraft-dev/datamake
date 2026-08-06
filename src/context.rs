@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{CellDef, Contract, Export, Source, Visibility};
+use crate::config::{CellDef, ColumnSpec, Contract, Export, Source, Visibility};
 use crate::engine::run_summary::RunSummary;
 
 /// The document-schema version (`datamk_context`). An integer, distinct from
@@ -80,6 +80,10 @@ pub enum Status {
 /// nominal one-hop upstream edges.
 #[derive(Debug, Clone, Serialize)]
 pub struct Declared {
+    /// The cell's one-line description (ADR 0012 §3) — an author claim,
+    /// which is why it lives here and not at the top level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub exports: Vec<DeclaredExport>,
     /// `{ref, version}` from `cell` sources — never the upstream `table`
     /// (the upstream owner's to disclose, on its own document, under its own
@@ -94,16 +98,45 @@ pub struct DeclaredExport {
     /// The serving route key (`name@major`).
     pub route: String,
     pub contract: Contract,
+    /// What one row means (ADR 0012 §3) — required once `contract:
+    /// supported` (the `verify` lint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
     pub grain: Vec<String>,
-    /// Declared column -> type, in declared order.
-    pub schema: IndexMap<String, String>,
+    /// Declared column -> spec, in declared order. Always the object shape
+    /// here — the string-or-mapping union is authoring ergonomics for
+    /// `cell.yaml`; an emitted document has no reason to make a consumer
+    /// handle two shapes.
+    pub schema: IndexMap<String, ColumnDoc>,
     /// The served HTTP affordances, exactly (ADR 0012 §2). Omitted where the
     /// data routes are not mounted (`--no-data`) — it describes affordances
     /// that do not exist there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<QueryBlock>,
+}
+
+/// One declared column as the document emits it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ColumnDoc {
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// Structured unit token (`USD`, `ms`) — never prose (ADR 0012 §3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl From<&ColumnSpec> for ColumnDoc {
+    fn from(spec: &ColumnSpec) -> Self {
+        ColumnDoc {
+            ty: spec.ty.clone(),
+            unit: spec.unit.clone(),
+            description: spec.description.clone(),
+        }
+    }
 }
 
 /// The closed query grammar, restated as data. Every value here is derived
@@ -210,9 +243,14 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)], with_query: bool) ->
             version: e.version.clone(),
             route: route.clone(),
             contract: e.contract,
+            description: e.description.clone(),
             freshness: e.freshness.clone(),
             grain: e.grain.clone(),
-            schema: e.schema.clone(),
+            schema: e
+                .schema
+                .iter()
+                .map(|(col, spec)| (col.clone(), ColumnDoc::from(spec)))
+                .collect(),
             query: with_query.then(|| query_block(route, e)),
         })
         .collect();
@@ -231,7 +269,11 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)], with_query: bool) ->
     upstreams.sort_by(|a, b| (&a.reference, a.version).cmp(&(&b.reference, b.version)));
     upstreams.dedup_by(|a, b| a.reference == b.reference && a.version == b.version);
 
-    Declared { exports, upstreams }
+    Declared {
+        description: def.description.clone(),
+        exports,
+        upstreams,
+    }
 }
 
 /// The served affordances for one export — derived from the exact constants
@@ -448,6 +490,7 @@ mod tests {
         serde_yaml::from_str(
             r#"
 cell: orders
+description: Daily order revenue by region.
 sources:
   raw: ./data/*.parquet
   upstream_flights:
@@ -457,11 +500,15 @@ sources:
 interface:
   - name: orders_daily
     version: 2.1.0
+    description: One row per (order_date, region) with the summed order revenue.
     grain: [order_date, region]
     schema:
       order_date: date
       region: string
-      revenue: decimal
+      revenue:
+        type: decimal
+        unit: USD
+        description: Gross order revenue, before refunds.
     freshness: daily
     contract: supported
   - name: internal
@@ -511,21 +558,31 @@ interface:
   "status": "verified",
   "grain_verified": true,
   "declared": {
+    "description": "Daily order revenue by region.",
     "exports": [
       {
         "name": "orders_daily",
         "version": "2.1.0",
         "route": "orders_daily@2",
         "contract": "supported",
+        "description": "One row per (order_date, region) with the summed order revenue.",
         "freshness": "daily",
         "grain": [
           "order_date",
           "region"
         ],
         "schema": {
-          "order_date": "date",
-          "region": "string",
-          "revenue": "decimal"
+          "order_date": {
+            "type": "date"
+          },
+          "region": {
+            "type": "string"
+          },
+          "revenue": {
+            "type": "decimal",
+            "unit": "USD",
+            "description": "Gross order revenue, before refunds."
+          }
         },
         "query": {
           "filters": [

@@ -216,7 +216,12 @@ fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::s
     let direct_attach = cell.published.is_none();
 
     let state = Arc::new(AppState {
-        openapi: openapi::generate(&cell.def.cell, &route_list, &digest),
+        openapi: openapi::generate(
+            &cell.def.cell,
+            cell.def.description.as_deref(),
+            &route_list,
+            &digest,
+        ),
         cell_name: cell.def.cell.clone(),
         routes,
         published,
@@ -713,13 +718,23 @@ mod tests {
 
     fn export() -> Export {
         let mut schema = IndexMap::new();
-        schema.insert("order_date".to_string(), "date".to_string());
-        schema.insert("region".to_string(), "string".to_string());
-        schema.insert("revenue".to_string(), "decimal".to_string());
+        schema.insert(
+            "order_date".to_string(),
+            crate::config::ColumnSpec::bare("date"),
+        );
+        schema.insert(
+            "region".to_string(),
+            crate::config::ColumnSpec::bare("string"),
+        );
+        schema.insert(
+            "revenue".to_string(),
+            crate::config::ColumnSpec::bare("decimal"),
+        );
         Export {
             name: "orders_daily".to_string(),
             version: "2.1.0".to_string(),
             source: Some("orders_daily".to_string()),
+            description: None,
             grain: vec!["order_date".to_string(), "region".to_string()],
             schema,
             freshness: None,

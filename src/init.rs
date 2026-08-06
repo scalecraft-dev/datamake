@@ -42,8 +42,9 @@ fn write(path: &Path, contents: &str) -> Result<()> {
 fn cell_yaml(name: &str) -> String {
     format!(
         r#"cell: {name}
+description: Daily order revenue by region (demo scaffold data)   # one line; ships in /context + openapi
 
-# sources:                        # external inputs, bound as TEMP VIEWs before transforms.
+# sources:                      # external inputs, bound as TEMP VIEWs before transforms.
 #   raw_orders: ${{ORDERS_PATH:-s3://acme-lake/orders/*.parquet}}   # DuckDB auto-detects format
 #   crm_accounts:                 # a warehouse table via a named connection
 #     connection: crm             # -> profiles/<name>.yaml `connections.crm`
@@ -85,11 +86,16 @@ interface:                        # the export list - the public surface, single
   - name: orders_daily
     version: 2.1.0                # semver; route keys on MAJOR -> GET /orders_daily@2
     source: orders_daily          # physical object in the lake (defaults to name)
+    description: One row per (order_date, region) with the summed order revenue.  # what one row
+                                  # means; required once contract: supported (ADR 0012)
     grain: [order_date, region]   # filterable query params + uniqueness-checked by `verify`
-    schema:
-      order_date: date
+    schema:                       # value is a bare type, or {{type, unit, description}} for
+      order_date: date            # columns whose meaning agents would otherwise guess wrong
       region: string
-      revenue: decimal
+      revenue:
+        type: decimal
+        unit: USD                 # structured token, not prose - the #1 silent-wrong-number source
+        description: Sum of order amounts for the day/region; gross, before refunds.
     freshness: daily
     visibility: discoverable      # private | discoverable
     contract: experimental        # experimental | supported  (a reviewed edit; `release` then pins it)

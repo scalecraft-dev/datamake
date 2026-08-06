@@ -12,6 +12,17 @@ pub struct Published {
     pub snapshot_id: i64,
     /// route (e.g. `orders_daily@2`) -> pinned snapshot id
     pub routes: BTreeMap<String, i64>,
+    /// route -> full semver at release time (ADR 0012 §3 ratchet check 3):
+    /// what lets the next `release` see that meaning changed while the
+    /// version didn't. Defaults keep pre-ADR-0012 manifests parsing.
+    #[serde(default)]
+    pub versions: BTreeMap<String, String>,
+    /// route -> digest of the export's meaning prose (description + per-column
+    /// unit/description). A changed digest without a version bump is at
+    /// minimum a warning — a change in meaning is MAJOR, and silent
+    /// meaning-edits are the exact betrayal ARCHITECTURE.md §141-143 names.
+    #[serde(default)]
+    pub descriptions: BTreeMap<String, String>,
 }
 
 impl Published {
