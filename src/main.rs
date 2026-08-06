@@ -84,7 +84,16 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Verify(a) => verify::run(&a.file, &a.profile),
         Command::Release(a) => release::run(&a.file, &a.profile),
         Command::Deploy(a) => deploy::run(&a).await,
-        Command::Serve(a) => serve::run(&a.file, &a.profile, a.port, a.poll_interval).await,
+        Command::Serve(a) => {
+            serve::run(
+                &a.file,
+                &a.profile,
+                a.port,
+                a.poll_interval,
+                a.max_concurrency,
+            )
+            .await
+        }
         Command::Status(a) => ops::status(&a.file, &a.profile),
         Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution, a.download),
         Command::Rollback(a) => ops::rollback(&a.file, &a.profile, a.execution),

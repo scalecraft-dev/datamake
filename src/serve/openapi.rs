@@ -28,12 +28,28 @@ pub fn generate(def: &CellDef) -> Value {
 fn path_item(export: &Export) -> Value {
     let mut params = vec![
         json!({ "name": "limit", "in": "query",
-                "schema": { "type": "integer", "maximum": 1000, "default": 100 } }),
+                "description": "Rows per page; values above the maximum are clamped.",
+                "schema": { "type": "integer",
+                            "maximum": super::MAX_LIMIT,
+                            "default": super::DEFAULT_LIMIT } }),
         json!({ "name": "offset", "in": "query",
-                "schema": { "type": "integer", "default": 0 } }),
+                "description": "Rows to skip; requests beyond the maximum are rejected (400).",
+                "schema": { "type": "integer",
+                            "maximum": super::MAX_OFFSET,
+                            "default": 0 } }),
     ];
     for g in &export.grain {
-        params.push(json!({ "name": g, "in": "query", "schema": { "type": "string" } }));
+        // ADR 0012 §7: grain params are typed from the declared schema, not
+        // hardcoded `string`. A grain column with no declared type gets an
+        // empty schema — no claim — never a fabricated one.
+        let schema = export
+            .schema
+            .get(g)
+            .map(|ty| openapi_type(ty))
+            .unwrap_or_else(|| json!({}));
+        params.push(json!({ "name": g, "in": "query",
+                            "description": "Grain filter — exact equality only.",
+                            "schema": schema }));
     }
 
     let mut props = Map::new();
@@ -45,6 +61,8 @@ fn path_item(export: &Export) -> Value {
         "get": {
             "summary": format!("{} v{}", export.name, export.version),
             "parameters": params,
+            // The real response surface (ADR 0012 §7) — what serve_export and
+            // authorize() actually return, not just the happy path.
             "responses": {
                 "200": {
                     "description": "rows",
@@ -52,7 +70,12 @@ fn path_item(export: &Export) -> Value {
                         "type": "array",
                         "items": { "type": "object", "properties": Value::Object(props) }
                     }}}
-                }
+                },
+                "400": { "description": "unknown or invalid query parameter (only grain columns, limit, and offset are accepted — exact equality only)" },
+                "401": { "description": "missing or unknown bearer token (cell has access.roles)" },
+                "403": { "description": "cell is not shareable, or the token's roles do not include an allowed role" },
+                "404": { "description": "no such export route" },
+                "500": { "description": "query execution failed" }
             }
         }
     })
@@ -66,7 +89,10 @@ fn openapi_type(ty: &str) -> Value {
         "bool" | "boolean" => json!({ "type": "boolean" }),
         "date" => json!({ "type": "string", "format": "date" }),
         "timestamp" => json!({ "type": "string", "format": "date-time" }),
-        _ => json!({ "type": "string" }),
+        // ADR 0012 §7: an unknown declared type must not degrade to a
+        // fabricated `string` — emit no type claim at all, and carry the
+        // declared name so a reader can still see what the author wrote.
+        _ => json!({ "x-datamk-declared-type": ty }),
     }
 }
 
@@ -106,8 +132,12 @@ mod tests {
             openapi_type("timestamp"),
             json!({ "type": "string", "format": "date-time" })
         );
-        // Unknown types degrade to string rather than erroring.
-        assert_eq!(openapi_type("blob"), json!({ "type": "string" }));
+        // ADR 0012 §7: unknown types emit no type claim — never a fabricated
+        // `string` — and carry the declared name for the reader.
+        assert_eq!(
+            openapi_type("blob"),
+            json!({ "x-datamk-declared-type": "blob" })
+        );
     }
 
     #[test]
@@ -140,5 +170,32 @@ mod tests {
         assert!(names.contains(&"offset"));
         // Grain columns become query params.
         assert!(names.contains(&"order_date"));
+
+        // ADR 0012 §7: the grain param is typed from the declared schema
+        // (`order_date: date`), not hardcoded `string`.
+        let order_date = params.iter().find(|p| p["name"] == "order_date").unwrap();
+        assert_eq!(
+            order_date["schema"],
+            json!({ "type": "string", "format": "date" })
+        );
+
+        // The real error surface is documented alongside the rows.
+        let responses = &doc["paths"]["/orders_daily@2"]["get"]["responses"];
+        for code in ["200", "400", "401", "403", "404", "500"] {
+            assert!(responses.get(code).is_some(), "missing response {code}");
+        }
+    }
+
+    #[test]
+    fn grain_param_without_a_declared_type_makes_no_type_claim() {
+        let mut e = export_with("orders_daily", "2.1.0", Visibility::Discoverable);
+        e.grain = vec!["undeclared_col".to_string()];
+        let item = path_item(&e);
+        let params = item["get"]["parameters"].as_array().unwrap();
+        let p = params
+            .iter()
+            .find(|p| p["name"] == "undeclared_col")
+            .unwrap();
+        assert_eq!(p["schema"], json!({}));
     }
 }

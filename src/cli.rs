@@ -201,4 +201,10 @@ pub struct ServeArgs {
     /// direct-attach (local catalog) mode.
     #[arg(long, default_value_t = 15)]
     pub poll_interval: u64,
+    /// Maximum concurrent in-flight requests; requests over the cap are shed
+    /// immediately with 503 instead of queueing without bound. A global cap,
+    /// not per-client fairness — put a reverse proxy in front for real rate
+    /// limiting (docs/guides/serving.md).
+    #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_CONCURRENCY)]
+    pub max_concurrency: usize,
 }

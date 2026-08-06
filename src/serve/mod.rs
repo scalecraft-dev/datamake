@@ -17,6 +17,15 @@ use crate::engine;
 
 const MAX_LIMIT: usize = 1000;
 const DEFAULT_LIMIT: usize = 100;
+/// Cap on `offset` (ADR 0012 §7): parsed-but-uncapped offsets let a paginating
+/// caller walk arbitrarily deep scans. Requests beyond the cap are rejected
+/// (400), never silently clamped — a clamped offset would return a page the
+/// caller didn't ask for, which reads as data, not as an error.
+const MAX_OFFSET: usize = 1_000_000;
+/// Default for `--max-concurrency`: requests over this are shed with 503
+/// rather than queued without bound — agents fan out and retry tirelessly
+/// (ADR 0012 §7). Real per-client rate limiting belongs to a reverse proxy.
+pub const DEFAULT_MAX_CONCURRENCY: usize = 64;
 
 struct AppState {
     /// The opened cell (connection + published-mode state). Behind a Mutex so
@@ -114,8 +123,40 @@ pub(crate) fn parse_principals(raw: &str) -> Result<HashMap<String, Vec<String>>
 }
 
 /// Serve the declared interface as REST + OpenAPI (the Server workload).
-pub async fn run(file: &Path, profile: &str, port: u16, poll_interval: u64) -> Result<()> {
+pub async fn run(
+    file: &Path,
+    profile: &str,
+    port: u16,
+    poll_interval: u64,
+    max_concurrency: usize,
+) -> Result<()> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
+    let (state, store) = build_state(cell)?;
+
+    if let Some(store) = store {
+        spawn_poller(
+            state.clone(),
+            store,
+            file.to_path_buf(),
+            profile.to_string(),
+            poll_interval.max(1),
+        );
+    }
+
+    let app = app(state, max_concurrency);
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!(%addr, "serving cell");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Build the serving state from an opened cell. Split from `run` so the
+/// in-process smoke tests can stand up the exact router `serve` binds,
+/// without a socket. Returns the store handle separately (published mode)
+/// so `run` can hand it to the poller.
+fn build_state(cell: engine::Cell) -> Result<(Arc<AppState>, Option<Arc<crate::store::Store>>)> {
     let published = load_published(&cell.dir);
 
     let mut routes = HashMap::new();
@@ -156,29 +197,34 @@ pub async fn run(file: &Path, profile: &str, port: u16, poll_interval: u64) -> R
         }),
         cell: Mutex::new(cell),
     });
+    Ok((state, store))
+}
 
-    if let Some(store) = store {
-        spawn_poller(
-            state.clone(),
-            store,
-            file.to_path_buf(),
-            profile.to_string(),
-            poll_interval.max(1),
-        );
-    }
-
-    let app = Router::new()
+/// The router `serve` binds, wrapped in the throttle stack (ADR 0012 §7):
+/// a global concurrency cap with load-shed. Requests over the cap get an
+/// immediate 503 instead of queueing without bound — the clone-shared
+/// semaphore makes the cap global across connections. Per-client fairness
+/// is a reverse proxy's job (docs/guides/serving.md), not this socket's.
+fn app(state: Arc<AppState>, max_concurrency: usize) -> Router {
+    Router::new()
         .route("/", get(health))
         .route("/interface", get(interface))
         .route("/openapi.json", get(openapi_doc))
         .route("/:route", get(serve_export))
-        .with_state(state);
-
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!(%addr, "serving cell");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(
+                    |_: tower::BoxError| async {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "server at capacity — retry with backoff",
+                        )
+                    },
+                ))
+                .load_shed()
+                .concurrency_limit(max_concurrency.max(1)),
+        )
+        .with_state(state)
 }
 
 /// The fetch-and-swap poller (ADR 0004 §6): re-read `LATEST` every interval;
@@ -314,6 +360,14 @@ async fn serve_export(
         None => return (StatusCode::NOT_FOUND, format!("no export '{route}'")).into_response(),
     };
 
+    // ADR 0012 §7: unknown or invalid query params are a 400, never silently
+    // dropped — an ignored `?revenue=999` returns unfiltered rows the caller
+    // will confidently read as a filtered subset.
+    let read = match validate_params(&export, &params) {
+        Ok(r) => r,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+
     // Supported contracts serve a pinned snapshot; experimental tracks latest.
     let snapshot = if export.contract == Contract::Supported {
         s.published.get(&route).copied()
@@ -321,7 +375,7 @@ async fn serve_export(
         None
     };
 
-    let sql = build_query(&export, &params, snapshot);
+    let sql = build_query(&export, &read, snapshot);
 
     let s2 = s.clone();
     let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
@@ -343,10 +397,87 @@ async fn serve_export(
     }
 }
 
+/// A request's validated read parameters. Filters carry the *declared grain
+/// order* regardless of the order params arrived in, so the emitted WHERE is
+/// deterministic for a given filter set.
+#[derive(Debug)]
+struct ReadParams {
+    /// grain column -> escaped-later value, in declared grain order.
+    filters: Vec<(String, String)>,
+    limit: usize,
+    offset: usize,
+}
+
+/// Reject anything the closed query grammar doesn't accept (ADR 0012 §7):
+/// unknown parameter names (400, not silently ignored), non-integer
+/// `limit`/`offset`, and an offset beyond `MAX_OFFSET`. An over-`MAX_LIMIT`
+/// limit is clamped, not rejected — the caps ship in the served affordances,
+/// and a clamped page is still exactly the page asked for, just shorter.
+fn validate_params(
+    export: &Export,
+    params: &HashMap<String, String>,
+) -> std::result::Result<ReadParams, String> {
+    for k in params.keys() {
+        if k != "limit" && k != "offset" && !export.grain.iter().any(|g| g == k) {
+            let grain = if export.grain.is_empty() {
+                "no grain filters".to_string()
+            } else {
+                format!("grain filters ({})", export.grain.join(", "))
+            };
+            return Err(format!(
+                "unknown query parameter '{k}' — this export accepts {grain}, plus `limit` \
+                 and `offset` (exact equality only; no ranges, no operators, no non-grain \
+                 columns)"
+            ));
+        }
+    }
+
+    let limit = match params.get("limit") {
+        None => DEFAULT_LIMIT,
+        Some(v) => v
+            .parse::<usize>()
+            .map_err(|_| {
+                format!("`limit` must be an integer between 0 and {MAX_LIMIT}, got '{v}'")
+            })?
+            .min(MAX_LIMIT),
+    };
+    let offset = match params.get("offset") {
+        None => 0,
+        Some(v) => {
+            let n = v.parse::<usize>().map_err(|_| {
+                format!("`offset` must be an integer between 0 and {MAX_OFFSET}, got '{v}'")
+            })?;
+            if n > MAX_OFFSET {
+                return Err(format!(
+                    "`offset` {n} exceeds the maximum {MAX_OFFSET} — filter by grain columns \
+                     instead of paginating this deep"
+                ));
+            }
+            n
+        }
+    };
+
+    let filters = export
+        .grain
+        .iter()
+        .filter_map(|g| params.get(g).map(|v| (g.clone(), v.clone())))
+        .collect();
+
+    Ok(ReadParams {
+        filters,
+        limit,
+        offset,
+    })
+}
+
 /// Build the read query for an export. Only declared columns and grain columns
 /// reach the SQL (both come from the cell definition, not user input); grain
-/// filter *values* are escaped. Pagination is capped.
-fn build_query(export: &Export, params: &HashMap<String, String>, snapshot: Option<i64>) -> String {
+/// filter *values* are escaped. The subquery is ordered before LIMIT/OFFSET
+/// (ADR 0012 §7): limit/offset over nondeterministic order silently skips and
+/// double-counts rows for any paginating caller. Sort key: the declared grain
+/// (unique, per `verify`); a grainless export falls back to DuckDB's
+/// `ORDER BY ALL` — every column, still deterministic.
+fn build_query(export: &Export, read: &ReadParams, snapshot: Option<i64>) -> String {
     let cols = if export.schema.is_empty() {
         "*".to_string()
     } else {
@@ -358,31 +489,29 @@ fn build_query(export: &Export, params: &HashMap<String, String>, snapshot: Opti
         None => String::new(),
     };
 
-    let mut wheres = Vec::new();
-    for g in &export.grain {
-        if let Some(v) = params.get(g) {
-            wheres.push(format!("{g} = '{}'", v.replace('\'', "''")));
-        }
-    }
+    let wheres: Vec<String> = read
+        .filters
+        .iter()
+        .map(|(g, v)| format!("{g} = '{}'", v.replace('\'', "''")))
+        .collect();
     let where_clause = if wheres.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", wheres.join(" AND "))
     };
 
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_LIMIT)
-        .min(MAX_LIMIT);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
+    let order_by = if export.grain.is_empty() {
+        "ALL".to_string()
+    } else {
+        export.grain.join(", ")
+    };
 
     format!(
         "SELECT to_json(t) AS j FROM \
-         (SELECT {cols} FROM {source}{at}{where_clause} LIMIT {limit} OFFSET {offset}) t"
+         (SELECT {cols} FROM {source}{at}{where_clause} ORDER BY {order_by} \
+         LIMIT {limit} OFFSET {offset}) t",
+        limit = read.limit,
+        offset = read.offset,
     )
 }
 
@@ -418,9 +547,18 @@ mod tests {
         }
     }
 
+    /// validate-then-build, exactly as `serve_export` composes them.
+    fn q(e: &Export, params: &HashMap<String, String>, snapshot: Option<i64>) -> String {
+        build_query(
+            e,
+            &validate_params(e, params).expect("params must validate"),
+            snapshot,
+        )
+    }
+
     #[test]
     fn selects_declared_columns_in_order() {
-        let sql = build_query(&export(), &HashMap::new(), None);
+        let sql = q(&export(), &HashMap::new(), None);
         assert!(
             sql.contains("SELECT order_date, region, revenue FROM orders_daily"),
             "got: {sql}"
@@ -431,15 +569,34 @@ mod tests {
     fn empty_schema_selects_star() {
         let mut e = export();
         e.schema = IndexMap::new();
-        let sql = build_query(&e, &HashMap::new(), None);
+        let sql = q(&e, &HashMap::new(), None);
         assert!(sql.contains("SELECT * FROM orders_daily"), "got: {sql}");
     }
 
     #[test]
     fn defaults_to_limit_100_offset_0_and_no_where() {
-        let sql = build_query(&export(), &HashMap::new(), None);
+        let sql = q(&export(), &HashMap::new(), None);
         assert!(sql.contains("LIMIT 100 OFFSET 0"), "got: {sql}");
         assert!(!sql.contains("WHERE"), "got: {sql}");
+    }
+
+    // ADR 0012 §7: pagination must be deterministic — the subquery orders by
+    // the declared grain before LIMIT/OFFSET applies.
+    #[test]
+    fn pagination_orders_by_the_declared_grain() {
+        let sql = q(&export(), &HashMap::new(), None);
+        assert!(
+            sql.contains("ORDER BY order_date, region LIMIT"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn grainless_export_orders_by_all() {
+        let mut e = export();
+        e.grain = vec![];
+        let sql = q(&e, &HashMap::new(), None);
+        assert!(sql.contains("ORDER BY ALL LIMIT"), "got: {sql}");
     }
 
     #[test]
@@ -447,7 +604,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("order_date".to_string(), "2026-06-01".to_string());
         params.insert("region".to_string(), "us-east".to_string());
-        let sql = build_query(&export(), &params, None);
+        let sql = q(&export(), &params, None);
         assert!(sql.contains("order_date = '2026-06-01'"), "got: {sql}");
         assert!(sql.contains("region = 'us-east'"), "got: {sql}");
         assert!(sql.contains(" WHERE "), "got: {sql}");
@@ -457,19 +614,29 @@ mod tests {
     fn grain_filter_values_are_quote_escaped() {
         let mut params = HashMap::new();
         params.insert("region".to_string(), "o'brien".to_string());
-        let sql = build_query(&export(), &params, None);
+        let sql = q(&export(), &params, None);
         // Single quotes doubled — no SQL injection through grain values.
         assert!(sql.contains("region = 'o''brien'"), "got: {sql}");
     }
 
+    // ADR 0012 §7 (behavior change): a non-grain param used to be silently
+    // ignored — unfiltered rows a caller confidently reads as a filtered
+    // subset. Now it is rejected before any SQL is built.
     #[test]
-    fn non_grain_params_are_ignored_in_where() {
+    fn non_grain_params_are_rejected() {
         let mut params = HashMap::new();
         params.insert("revenue".to_string(), "999".to_string()); // declared but not grain
+        let err = validate_params(&export(), &params).unwrap_err();
+        assert!(
+            err.contains("unknown query parameter 'revenue'"),
+            "got: {err}"
+        );
+        assert!(err.contains("order_date, region"), "got: {err}");
+
+        let mut params = HashMap::new();
         params.insert("evil".to_string(), "1; DROP TABLE x".to_string());
-        let sql = build_query(&export(), &params, None);
-        assert!(!sql.contains("WHERE"), "got: {sql}");
-        assert!(!sql.contains("DROP TABLE"), "got: {sql}");
+        let err = validate_params(&export(), &params).unwrap_err();
+        assert!(err.contains("unknown query parameter 'evil'"), "got: {err}");
     }
 
     #[test]
@@ -477,27 +644,60 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), "999999".to_string());
         params.insert("offset".to_string(), "50".to_string());
-        let sql = build_query(&export(), &params, None);
+        let sql = q(&export(), &params, None);
         assert!(
             sql.contains(&format!("LIMIT {MAX_LIMIT} OFFSET 50")),
             "got: {sql}"
         );
     }
 
+    // ADR 0012 §7 (behavior change): an unparseable limit used to silently
+    // fall back to the default; now it is a 400-shaped validation error.
     #[test]
-    fn invalid_limit_falls_back_to_default() {
+    fn invalid_limit_is_rejected() {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), "not-a-number".to_string());
-        let sql = build_query(&export(), &params, None);
-        assert!(
-            sql.contains(&format!("LIMIT {DEFAULT_LIMIT}")),
-            "got: {sql}"
+        let err = validate_params(&export(), &params).unwrap_err();
+        assert!(err.contains("`limit` must be an integer"), "got: {err}");
+    }
+
+    #[test]
+    fn offset_beyond_the_cap_is_rejected() {
+        let mut params = HashMap::new();
+        params.insert("offset".to_string(), (MAX_OFFSET + 1).to_string());
+        let err = validate_params(&export(), &params).unwrap_err();
+        assert!(err.contains("exceeds the maximum"), "got: {err}");
+
+        let mut params = HashMap::new();
+        params.insert("offset".to_string(), MAX_OFFSET.to_string());
+        assert_eq!(
+            validate_params(&export(), &params).unwrap().offset,
+            MAX_OFFSET,
+            "the cap itself is legal"
         );
     }
 
     #[test]
+    fn invalid_offset_is_rejected() {
+        let mut params = HashMap::new();
+        params.insert("offset".to_string(), "-1".to_string());
+        let err = validate_params(&export(), &params).unwrap_err();
+        assert!(err.contains("`offset` must be an integer"), "got: {err}");
+    }
+
+    #[test]
+    fn filters_follow_declared_grain_order_not_param_order() {
+        let mut params = HashMap::new();
+        params.insert("region".to_string(), "us-east".to_string());
+        params.insert("order_date".to_string(), "2026-06-01".to_string());
+        let read = validate_params(&export(), &params).unwrap();
+        let cols: Vec<&str> = read.filters.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(cols, vec!["order_date", "region"]);
+    }
+
+    #[test]
     fn snapshot_pins_a_version() {
-        let sql = build_query(&export(), &HashMap::new(), Some(42));
+        let sql = q(&export(), &HashMap::new(), Some(42));
         assert!(
             sql.contains("orders_daily AT (VERSION => 42)"),
             "got: {sql}"
@@ -506,7 +706,7 @@ mod tests {
 
     #[test]
     fn no_snapshot_means_no_version_clause() {
-        let sql = build_query(&export(), &HashMap::new(), None);
+        let sql = q(&export(), &HashMap::new(), None);
         assert!(!sql.contains("VERSION =>"), "got: {sql}");
     }
 
@@ -556,9 +756,232 @@ mod tests {
     fn built_query_never_opens_a_transaction() {
         let mut params = HashMap::new();
         params.insert("region".to_string(), "us-east".to_string());
-        let sql = build_query(&export(), &params, Some(7));
+        let sql = q(&export(), &params, Some(7));
         let upper = sql.to_uppercase();
         assert!(!upper.contains("BEGIN"), "query must not BEGIN: {sql}");
         assert!(!upper.contains("COMMIT"), "query must not COMMIT: {sql}");
+    }
+}
+
+/// In-process HTTP smoke tests of the serve surface (ADR 0012 §7) — the first
+/// tests that drive the actual router. A real cell (the `init` scaffold, which
+/// runs with zero external setup) is built once with `engine::run`, then the
+/// exact router `serve` binds is driven with `tower::ServiceExt::oneshot` — no
+/// socket, no port. Engine work happens on the test thread (the engine is
+/// sync); only the request dispatch needs a runtime.
+#[cfg(test)]
+mod smoke {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    struct Scaffold {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Scaffold {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Scaffold + build the init cell once per test binary run.
+    fn built_cell() -> &'static Scaffold {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Scaffold> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::init::run(crate::cli::InitArgs {
+                name: "smoke".to_string(),
+                path: Some(dir.clone()),
+            })
+            .expect("init scaffold");
+            crate::engine::run(
+                &dir.join("cell.yaml"),
+                "local",
+                None,
+                crate::engine::RunOptions::default(),
+            )
+            .expect("build the scaffold cell");
+            Scaffold { dir }
+        })
+    }
+
+    /// Open the built cell read-only and stand up the exact router `serve`
+    /// binds. `mutate` edits the parsed definition before state construction
+    /// (how the auth tests flip `shareable`/`roles` without a second cell).
+    fn router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        let scaffold = built_cell();
+        let mut cell = engine::open(&scaffold.dir.join("cell.yaml"), "local", true)
+            .expect("open built cell read-only");
+        mutate(&mut cell);
+        let (state, _store) = build_state(cell).expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    async fn get(router: &Router, uri: &str, bearer: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::builder().uri(uri);
+        if let Some(t) = bearer {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[test]
+    fn open_cell_serves_health_interface_openapi_and_rows() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["cell"], "smoke");
+            assert_eq!(v["status"], "ok");
+
+            let (status, body) = get(&router, "/interface", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["exports"], serde_json::json!(["orders_daily@2"]));
+
+            let (status, body) = get(&router, "/openapi.json", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(v["paths"]["/orders_daily@2"].is_object(), "{body}");
+
+            let (status, body) = get(&router, "/orders_daily@2", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            assert!(!rows.is_empty(), "scaffold cell must serve rows");
+            assert!(rows[0].get("order_date").is_some(), "{body}");
+            assert!(rows[0].get("revenue").is_some(), "{body}");
+        });
+    }
+
+    // ADR 0012 §7: limit/offset pagination must stitch together without
+    // skipping or double-counting — only true with a deterministic ORDER BY.
+    #[test]
+    fn pagination_is_deterministic_and_stitches_exactly() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (_, all) = get(&router, "/orders_daily@2", None).await;
+            let all: Vec<serde_json::Value> = serde_json::from_str(&all).unwrap();
+            assert!(all.len() >= 3, "scaffold should have several grain rows");
+
+            let mut stitched = Vec::new();
+            for page in 0..all.len() {
+                let (status, body) = get(
+                    &router,
+                    &format!("/orders_daily@2?limit=1&offset={page}"),
+                    None,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+                assert_eq!(rows.len(), 1, "one row per page: {body}");
+                stitched.extend(rows);
+            }
+            assert_eq!(stitched, all, "page-by-page must equal the single read");
+        });
+    }
+
+    #[test]
+    fn grain_filter_narrows_and_unknown_params_are_400() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(
+                &router,
+                "/orders_daily@2?order_date=2026-06-01&region=us-east",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            assert_eq!(rows.len(), 1, "{body}");
+            assert_eq!(rows[0]["region"], "us-east");
+
+            // The exact false-confidence case the ADR names: a filter on a
+            // declared-but-non-grain column must fail, not silently return
+            // unfiltered rows.
+            let (status, body) = get(&router, "/orders_daily@2?revenue=999", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("unknown query parameter 'revenue'"), "{body}");
+
+            let (status, body) = get(&router, "/orders_daily@2?limit=abc", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+            let (status, body) = get(
+                &router,
+                &format!("/orders_daily@2?offset={}", MAX_OFFSET + 1),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+            let (status, _) = get(&router, "/no_such@1", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        });
+    }
+
+    #[test]
+    fn unshareable_cell_denies_everything_but_health() {
+        let router = router_with(|cell| {
+            cell.def.access.shareable = false;
+        });
+        rt().block_on(async {
+            let (status, _) = get(&router, "/", None).await;
+            assert_eq!(status, StatusCode::OK, "health stays pre-auth");
+            for uri in ["/interface", "/openapi.json", "/orders_daily@2"] {
+                let (status, body) = get(&router, uri, None).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            }
+        });
+    }
+
+    #[test]
+    fn role_gated_cell_requires_a_known_token_with_the_role() {
+        let scaffold = built_cell();
+        let principals = scaffold.dir.join("principals.json");
+        std::fs::write(
+            &principals,
+            r#"{ "good": ["analyst"], "other": ["viewer"] }"#,
+        )
+        .unwrap();
+        let router = router_with(|cell| {
+            cell.def.access.roles = vec!["analyst".to_string()];
+            cell.principals = Some(principals.to_string_lossy().into_owned());
+        });
+        rt().block_on(async {
+            let (status, _) = get(&router, "/orders_daily@2", None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "no token");
+            let (status, _) = get(&router, "/orders_daily@2", Some("bogus")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "unknown token");
+            let (status, _) = get(&router, "/orders_daily@2", Some("other")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "wrong role");
+            let (status, body) = get(&router, "/orders_daily@2", Some("good")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        });
     }
 }

@@ -100,11 +100,17 @@ pub fn check(conn: &Connection, def: &CellDef) -> Result<()> {
                     "export '{}': declared column '{col}' missing from source '{source}'",
                     export.name
                 ),
+                // ADR 0012 §7 (breaking change, promoted from a warning): a
+                // declared type asserted to a machine must be true — agents
+                // consume the interface as fact, so a lying type is a silent
+                // wrong number, not a nuisance log line.
                 Some((_, actual_ty)) if !type_compatible(declared_ty, actual_ty) => {
-                    tracing::warn!(
-                        export = %export.name, column = %col,
-                        declared = %declared_ty, actual = %actual_ty,
-                        "type mismatch"
+                    bail!(
+                        "export '{}': declared type '{declared_ty}' for column '{col}' does \
+                         not match actual type '{actual_ty}' in source '{source}' — fix the \
+                         declared schema or the transform so the interface tells the truth \
+                         (previously a warning; promoted to an error by ADR 0012)",
+                        export.name
                     );
                 }
                 Some(_) => {}
@@ -493,6 +499,51 @@ interface:
             .to_string();
         assert!(err.contains("is not unique"), "got: {err}");
         assert!(!err.contains("replay-safe"), "got: {err}");
+    }
+
+    // ADR 0012 §7: a declared-type mismatch is a hard verify error, not a
+    // warning — the breaking-change promotion, pinned end to end against a
+    // real table.
+    #[test]
+    fn declared_type_mismatch_is_a_hard_error() {
+        let (conn, _dir) = attach_lake("type-mismatch");
+        conn.execute_batch("CREATE TABLE t AS SELECT 1 AS id, 'x' AS label;")
+            .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: t\n\
+             \x20   version: 1.0.0\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             \x20     label: decimal\n",
+        )
+        .unwrap();
+        let err = check(&conn, &def).unwrap_err().to_string();
+        assert!(err.contains("declared type 'decimal'"), "got: {err}");
+        assert!(err.contains("column 'label'"), "got: {err}");
+        assert!(
+            err.contains("promoted to an error by ADR 0012"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn matching_declared_types_still_verify_cleanly() {
+        let (conn, _dir) = attach_lake("type-match");
+        conn.execute_batch("CREATE TABLE t AS SELECT 1::INTEGER AS id, 'x' AS label;")
+            .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: t\n\
+             \x20   version: 1.0.0\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             \x20     label: string\n",
+        )
+        .unwrap();
+        check(&conn, &def).expect("compatible declared types must pass");
     }
 
     #[test]

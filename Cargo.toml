@@ -56,6 +56,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures = "0.3"                                       # drive object_store's list streams
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.7"
+# Minimal serve throttling (ADR 0012 §7): a global concurrency cap with
+# load-shed -> 503. "util" also powers the in-process serve smoke tests
+# (tower::ServiceExt::oneshot).
+tower = { version = "0.4", features = ["limit", "load-shed", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
