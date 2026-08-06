@@ -1,6 +1,9 @@
 # ADR 0012 — The context document: cells describe themselves to agents
 
-- **Status:** Accepted — 2026-08-05, premise checks run (results under Premises)
+- **Status:** Accepted — 2026-08-05, premise checks run (results under Premises).
+  Implemented — 2026-08-06, all five PRs on `adr-0012-context-document`
+  (prerequisites; document + `/context` + `datamk context`; meaning fields +
+  ratchet; probes + `--no-data`; mesh emission).
 - **Date:** 2026-08-04
 - **Deciders:** Datamake team
 - **Author:** @scottypate

@@ -60,6 +60,10 @@ axum = "0.7"
 # load-shed -> 503. "util" also powers the in-process serve smoke tests
 # (tower::ServiceExt::oneshot).
 tower = { version = "0.4", features = ["limit", "load-shed", "util"] }
+# The mesh emitter's fan-out (ADR 0012 §6): plain blocking GETs of each
+# cell's /context to copy its summary into the manifest. Small on purpose —
+# rustls (no native-tls system deps), and no async runtime coupling.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

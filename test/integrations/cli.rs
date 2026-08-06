@@ -781,3 +781,89 @@ fn context_emits_a_draft_document_for_a_local_cell() {
     assert_eq!(from_file["cell"], "ctxcell");
     let _ = std::fs::remove_dir_all(&target);
 }
+
+/// `datamk mesh emit` against a live cell (ADR 0012 §6): every field beyond
+/// {name, url, auth_hint} is copied from the cell's own context document —
+/// description, exports summary, and the interface digest (the /context
+/// ETag) — and a fetch miss leaves a bare {name, url} entry, fabricating
+/// nothing.
+#[test]
+fn mesh_emit_copies_the_context_summary_from_a_live_cell() {
+    let target = std::env::temp_dir().join(format!("datamk_it_mesh_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    let out = Command::new(bin())
+        .args(["init", "meshcell", "-p"])
+        .arg(&target)
+        .output()
+        .expect("spawning datamk init");
+    assert!(out.status.success());
+    run_ok(&target, &["run", "-f", "cell.yaml"]);
+
+    let port = 18632u16;
+    let mut serve = Command::new(bin())
+        .current_dir(&target)
+        .args(["serve", "-f", "cell.yaml", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning datamk serve");
+    let base = format!("http://127.0.0.1:{port}");
+    let mut ready = false;
+    for _ in 0..50 {
+        if ureq::get(&base).call().is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "serve did not become ready");
+
+    std::fs::write(
+        target.join("mesh_cells.yaml"),
+        format!(
+            "cells:\n  - name: meshcell\n    url: {base}\n    auth_hint: meshcell-token\n  - name: unreachable\n    url: http://127.0.0.1:1\n"
+        ),
+    )
+    .unwrap();
+    let out = run(&target, &["mesh", "emit", "--cells", "mesh_cells.yaml"]);
+    let _ = serve.kill();
+    let _ = serve.wait();
+    assert!(
+        out.status.success(),
+        "mesh emit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout is the manifest JSON, uncorrupted by log lines (they go to
+    // stderr) — piping `datamk mesh emit | jq` must work.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is pure manifest JSON");
+    assert_eq!(manifest["datamk_mesh"], 1);
+    let cells = manifest["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 2);
+
+    let live = &cells[0];
+    assert_eq!(live["name"], "meshcell");
+    assert_eq!(
+        live["description"],
+        "Daily order revenue by region (demo scaffold data)"
+    );
+    assert_eq!(live["exports"][0]["name"], "orders_daily");
+    assert_eq!(live["exports"][0]["version"], "2.1.0");
+    assert_eq!(live["exports"][0]["contract"], "experimental");
+    assert_eq!(
+        live["context_digest"].as_str().map(str::len),
+        Some(64),
+        "the /context ETag digest is stamped on the entry: {live}"
+    );
+    assert_eq!(live["auth_hint"], "meshcell-token");
+
+    // The unreachable cell keeps its bare {name, url} — nothing fabricated.
+    let miss = &cells[1];
+    assert_eq!(miss["name"], "unreachable");
+    assert!(miss.get("description").is_none(), "{miss}");
+    assert!(miss.get("exports").is_none(), "{miss}");
+    assert!(miss.get("context_digest").is_none(), "{miss}");
+
+    let _ = std::fs::remove_dir_all(&target);
+}

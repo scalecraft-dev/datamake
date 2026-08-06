@@ -72,6 +72,10 @@ pub enum Command {
     /// and (published profiles) verified provenance. Same JSON `serve`
     /// hosts at GET /context.
     Context(ContextArgs),
+    /// Mesh-level tooling (ADR 0012): emit the static manifest that tells an
+    /// agent which cells exist. A document an operator hosts anywhere —
+    /// never a registry service, never served by `serve`.
+    Mesh(MeshArgs),
     /// Roll back the served DATA to an earlier execution by repointing LATEST.
     /// (To roll back a version/code change, use your orchestrator's rollout undo.)
     Rollback(RollbackArgs),
@@ -101,6 +105,42 @@ pub struct AttachArgs {
     /// executions; re-run to refresh. Delete .cell/attach/ to reclaim space.
     #[arg(long)]
     pub download: bool,
+}
+
+#[derive(Args)]
+pub struct MeshArgs {
+    #[command(subcommand)]
+    pub command: MeshCommand,
+}
+
+#[derive(Subcommand)]
+pub enum MeshCommand {
+    /// Build the mesh manifest: name the cells (--cells file, or --store
+    /// census + --url-template), fetch each cell's /context, and copy its
+    /// routing summary — every field beyond {name, url} comes from the
+    /// cell's own document, never typed by hand.
+    Emit(MeshEmitArgs),
+}
+
+#[derive(Args)]
+pub struct MeshEmitArgs {
+    /// Hand-authored cells file: `cells: [{name, url, auth_hint?,
+    /// bearer_env?}]`. `bearer_env` names an env var holding a token the
+    /// emitter uses to fetch that cell's context — a variable NAME; no
+    /// token ever appears in a file.
+    #[arg(long)]
+    pub cells: Option<PathBuf>,
+    /// Name census over a shared parent prefix (S3/GCS only), e.g.
+    /// s3://bucket/cells — lists immediate child prefixes as cell names.
+    /// Cannot produce serving URLs; pair with --url-template.
+    #[arg(long)]
+    pub store: Option<String>,
+    /// URL per cell for the census, e.g. "https://{name}.data.internal".
+    #[arg(long)]
+    pub url_template: Option<String>,
+    /// Write the manifest to a file instead of stdout
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Args)]
