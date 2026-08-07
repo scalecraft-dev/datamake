@@ -1,10 +1,12 @@
 mod cli;
 mod config;
+mod context;
 mod deploy;
 mod engine;
 mod init;
 mod logging;
 mod manifest;
+mod mesh;
 mod ops;
 mod release;
 mod serve;
@@ -84,9 +86,28 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Verify(a) => verify::run(&a.file, &a.profile),
         Command::Release(a) => release::run(&a.file, &a.profile),
         Command::Deploy(a) => deploy::run(&a).await,
-        Command::Serve(a) => serve::run(&a.file, &a.profile, a.port, a.poll_interval).await,
+        Command::Serve(a) => {
+            serve::run(
+                &a.file,
+                &a.profile,
+                a.port,
+                a.poll_interval,
+                a.max_concurrency,
+                a.no_data,
+            )
+            .await
+        }
         Command::Status(a) => ops::status(&a.file, &a.profile),
         Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution, a.download),
+        Command::Context(a) => context::emit(&a.file, &a.profile, a.out.as_deref()),
+        Command::Mesh(a) => match a.command {
+            cli::MeshCommand::Emit(e) => mesh::emit(
+                e.cells.as_deref(),
+                e.store.as_deref(),
+                e.url_template.as_deref(),
+                e.out.as_deref(),
+            ),
+        },
         Command::Rollback(a) => ops::rollback(&a.file, &a.profile, a.execution),
         Command::Publish(a) => {
             eprintln!("publish has been renamed to `release` (it pins the supported snapshot).");

@@ -16,6 +16,9 @@ pub struct ResolvedBindings {
     pub sources: IndexMap<String, ResolvedSource>,
     /// Resolved path to the token->roles file, if configured.
     pub principals: Option<String>,
+    /// Operator hints for where rows live when not served over HTTP
+    /// (ADR 0012 §4) — pass-through environment strings, env-expanded.
+    pub channels: Vec<String>,
 }
 
 /// A source with env references expanded.
@@ -337,6 +340,11 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
         gcs,
         sources,
         principals,
+        channels: b
+            .channels
+            .iter()
+            .map(|c| expand(c))
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -601,6 +609,7 @@ mod tests {
         let mut cells = IndexMap::new();
         cells.insert(cell.to_string(), loc);
         Bindings {
+            channels: vec![],
             catalog: Some("./cat.ducklake".to_string()),
             storage: "./data".to_string(),
             s3: None,
@@ -616,6 +625,7 @@ mod tests {
         sources.insert(name.to_string(), src);
         CellDef {
             cell: "c".to_string(),
+            description: None,
             sources,
             transforms: vec![],
             interface: vec![] as Vec<Export>,
@@ -627,6 +637,7 @@ mod tests {
     fn resolve_passes_through_a_raw_source() {
         let def = cell_with_source("raw", Source::Raw("s3://bucket/x.parquet".to_string()));
         let b = Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -687,6 +698,7 @@ mod tests {
             },
         );
         let b = Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -722,6 +734,7 @@ mod tests {
             }),
         );
         let b = Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -776,6 +789,7 @@ mod tests {
             }),
         );
         let b = Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -821,6 +835,7 @@ mod tests {
             },
         );
         let b = Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -846,6 +861,7 @@ mod tests {
             }),
         );
         Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -985,6 +1001,7 @@ mod tests {
             }),
         );
         Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -1100,6 +1117,7 @@ mod tests {
             }),
         );
         Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -1155,6 +1173,7 @@ mod tests {
             }),
         );
         Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: None,
@@ -1433,12 +1452,14 @@ mod tests {
         std::env::set_var("DATAMK_TEST_REGION", "us-west-2");
         let def = CellDef {
             cell: "c".into(),
+            description: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![] as Vec<Export>,
             access: Default::default(),
         };
         let b = Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
             s3: Some(S3Binding {
@@ -1467,12 +1488,14 @@ mod tests {
         std::env::set_var("DATAMK_TEST_GCS_KEY", "HMACKEY");
         let def = CellDef {
             cell: "c".into(),
+            description: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![] as Vec<Export>,
             access: Default::default(),
         };
         let b = Bindings {
+            channels: vec![],
             catalog: Some("c".into()),
             storage: "gs://bkt/cells/c".into(),
             s3: None,

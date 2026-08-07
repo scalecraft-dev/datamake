@@ -67,6 +67,15 @@ pub enum Command {
     /// Print ready-to-run SQL that attaches the cell's catalog in DuckDB
     /// (read-only). Pipe it: duckdb -c "$(datamk attach -p prod) SELECT ..."
     Attach(AttachArgs),
+    /// Emit the cell's context document (ADR 0012) — the interface made
+    /// machine-readable for agents: exports, grain, schema, query grammar,
+    /// and (published profiles) verified provenance. Same JSON `serve`
+    /// hosts at GET /context.
+    Context(ContextArgs),
+    /// Mesh-level tooling (ADR 0012): emit the static manifest that tells an
+    /// agent which cells exist. A document an operator hosts anywhere —
+    /// never a registry service, never served by `serve`.
+    Mesh(MeshArgs),
     /// Roll back the served DATA to an earlier execution by repointing LATEST.
     /// (To roll back a version/code change, use your orchestrator's rollout undo.)
     Rollback(RollbackArgs),
@@ -96,6 +105,55 @@ pub struct AttachArgs {
     /// executions; re-run to refresh. Delete .cell/attach/ to reclaim space.
     #[arg(long)]
     pub download: bool,
+}
+
+#[derive(Args)]
+pub struct MeshArgs {
+    #[command(subcommand)]
+    pub command: MeshCommand,
+}
+
+#[derive(Subcommand)]
+pub enum MeshCommand {
+    /// Build the mesh manifest: name the cells (--cells file, or --store
+    /// census + --url-template), fetch each cell's /context, and copy its
+    /// routing summary — every field beyond {name, url} comes from the
+    /// cell's own document, never typed by hand.
+    Emit(MeshEmitArgs),
+}
+
+#[derive(Args)]
+pub struct MeshEmitArgs {
+    /// Hand-authored cells file: `cells: [{name, url, auth_hint?,
+    /// bearer_env?}]`. `bearer_env` names an env var holding a token the
+    /// emitter uses to fetch that cell's context — a variable NAME; no
+    /// token ever appears in a file.
+    #[arg(long)]
+    pub cells: Option<PathBuf>,
+    /// Name census over a shared parent prefix (S3/GCS only), e.g.
+    /// s3://bucket/cells — lists immediate child prefixes as cell names.
+    /// Cannot produce serving URLs; pair with --url-template.
+    #[arg(long)]
+    pub store: Option<String>,
+    /// URL per cell for the census, e.g. "https://{name}.data.internal".
+    #[arg(long)]
+    pub url_template: Option<String>,
+    /// Write the manifest to a file instead of stdout
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct ContextArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml)
+    #[arg(short, long, default_value = "local")]
+    pub profile: String,
+    /// Write the document to a file instead of stdout
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -201,4 +259,17 @@ pub struct ServeArgs {
     /// direct-attach (local catalog) mode.
     #[arg(long, default_value_t = 15)]
     pub poll_interval: u64,
+    /// Maximum concurrent in-flight requests; requests over the cap are shed
+    /// immediately with 503 instead of queueing without bound. A global cap,
+    /// not per-client fairness — put a reverse proxy in front for real rate
+    /// limiting (docs/guides/serving.md).
+    #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_CONCURRENCY)]
+    pub max_concurrency: usize,
+    /// Serve the context document without mounting the data routes (ADR
+    /// 0012): agents learn what exports mean, but rows never leave — for
+    /// estates where consumers fetch data through existing warehouse grants.
+    /// Unmounted routes return 404; the profile's `channels:` list tells
+    /// callers where rows actually live.
+    #[arg(long)]
+    pub no_data: bool,
 }

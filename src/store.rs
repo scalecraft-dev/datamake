@@ -277,6 +277,33 @@ impl Store {
         })
     }
 
+    /// One-level delimited listing (ADR 0012 §6): the immediate child
+    /// prefixes under this store's prefix, collapsed to their final path
+    /// segment — the mesh emitter's *name census*. Unlike `list_names`,
+    /// never recursive: a census over `s3://bucket/cells/` must see
+    /// `orders`, `flights` — not a pile of indistinguishable `LATEST`
+    /// leaves. Works only where cells share a parent prefix by convention,
+    /// and only on object stores (`for_storage` accepts no local scheme);
+    /// it can never produce a serving `url` — the store knows where data
+    /// lives, never where `serve` is reachable.
+    pub fn list_child_names(&self) -> Result<Vec<String>> {
+        let prefix = if self.prefix.as_ref().is_empty() {
+            None
+        } else {
+            Some(self.prefix.clone())
+        };
+        self.block_on(async {
+            let listing = self.inner.list_with_delimiter(prefix.as_ref()).await?;
+            let mut names: Vec<String> = listing
+                .common_prefixes
+                .iter()
+                .filter_map(|p| p.parts().last().map(|part| part.as_ref().to_string()))
+                .collect();
+            names.sort();
+            Ok(names)
+        })
+    }
+
     /// GET a small object. `Ok(None)` on not-found.
     pub fn get(&self, rel: &str) -> Result<Option<Vec<u8>>> {
         let key = self.key(rel);
@@ -551,6 +578,26 @@ mod tests {
         let s = Store::in_memory();
         assert_eq!(s.latest().unwrap(), None);
         assert!(s.list_executions().unwrap().is_empty());
+    }
+
+    // ADR 0012 §6: the mesh name census — one level deep, final segments
+    // only. `list_names` (recursive, collapsed) would return a pile of
+    // indistinguishable `LATEST` leaves here; the delimited listing must
+    // return exactly the child cell names.
+    #[test]
+    fn list_child_names_is_one_level_deep_and_returns_cell_names() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let parent = Store::new(mem, "cells");
+        parent.put("orders/LATEST", b"00000003".to_vec()).unwrap();
+        parent
+            .put("orders/catalog/executions/00000003.ducklake", b"c".to_vec())
+            .unwrap();
+        parent.put("flights/LATEST", b"00000001".to_vec()).unwrap();
+        assert_eq!(
+            parent.list_child_names().unwrap(),
+            vec!["flights".to_string(), "orders".to_string()],
+            "immediate child prefixes only, sorted, final segment only"
+        );
     }
 
     #[test]

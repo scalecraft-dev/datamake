@@ -87,6 +87,9 @@ pub fn check(conn: &Connection, def: &CellDef) -> Result<()> {
     // source is incremental and whether any export declares a grain are both
     // static, contract-only facts.
     warn_no_grain_backstop(def);
+    // ADR 0012 §3 ratchet: the promotion gesture is where meaning becomes
+    // mandatory — an experimental export needs nothing.
+    check_supported_have_descriptions(def)?;
 
     for export in &def.interface {
         let source = export.source_object();
@@ -94,17 +97,24 @@ pub fn check(conn: &Connection, def: &CellDef) -> Result<()> {
             format!("describing source '{source}' for export '{}'", export.name)
         })?;
 
-        for (col, declared_ty) in &export.schema {
+        for (col, spec) in &export.schema {
+            let declared_ty = &spec.ty;
             match actual.iter().find(|(c, _)| c.eq_ignore_ascii_case(col)) {
                 None => bail!(
                     "export '{}': declared column '{col}' missing from source '{source}'",
                     export.name
                 ),
+                // ADR 0012 §7 (breaking change, promoted from a warning): a
+                // declared type asserted to a machine must be true — agents
+                // consume the interface as fact, so a lying type is a silent
+                // wrong number, not a nuisance log line.
                 Some((_, actual_ty)) if !type_compatible(declared_ty, actual_ty) => {
-                    tracing::warn!(
-                        export = %export.name, column = %col,
-                        declared = %declared_ty, actual = %actual_ty,
-                        "type mismatch"
+                    bail!(
+                        "export '{}': declared type '{declared_ty}' for column '{col}' does \
+                         not match actual type '{actual_ty}' in source '{source}' — fix the \
+                         declared schema or the transform so the interface tells the truth \
+                         (previously a warning; promoted to an error by ADR 0012)",
+                        export.name
                     );
                 }
                 Some(_) => {}
@@ -142,6 +152,31 @@ pub fn check(conn: &Connection, def: &CellDef) -> Result<()> {
         }
 
         tracing::info!(export = %export.name, version = %export.version, "interface ok");
+    }
+    Ok(())
+}
+
+/// ADR 0012 §3 ratchet check 4: an export with `contract: supported` must
+/// carry a non-empty description — friction lands exactly on the deliberate
+/// promotion gesture, and nowhere else. Pure contract fact, checked on every
+/// run/verify; a supported export an agent cannot orient on is a promotion
+/// that didn't finish.
+fn check_supported_have_descriptions(def: &CellDef) -> Result<()> {
+    for export in &def.interface {
+        if export.contract == crate::config::Contract::Supported
+            && export
+                .description
+                .as_deref()
+                .is_none_or(|d| d.trim().is_empty())
+        {
+            bail!(
+                "export '{}': `contract: supported` requires a non-empty `description` — \
+                 one or two sentences saying what one row means (ADR 0012 §3). Supported is \
+                 the deliberate promotion gesture; a supported export without meaning is a \
+                 promotion that didn't finish.",
+                export.name
+            );
+        }
     }
     Ok(())
 }
@@ -493,6 +528,115 @@ interface:
             .to_string();
         assert!(err.contains("is not unique"), "got: {err}");
         assert!(!err.contains("replay-safe"), "got: {err}");
+    }
+
+    // ADR 0012 §3 ratchet check 4: supported => non-empty description; the
+    // friction lands exactly on the deliberate promotion gesture —
+    // experimental exports need nothing.
+    #[test]
+    fn supported_export_without_a_description_fails_the_lint() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    contract: supported\n",
+        )
+        .unwrap();
+        let err = check_supported_have_descriptions(&def)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires a non-empty `description`"),
+            "got: {err}"
+        );
+
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    contract: supported\n    description: \"   \"\n",
+        )
+        .unwrap();
+        assert!(
+            check_supported_have_descriptions(&def).is_err(),
+            "whitespace-only description must not satisfy the lint"
+        );
+    }
+
+    #[test]
+    fn experimental_exports_need_no_description_and_described_supported_pass() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ninterface:\n  - name: a\n    version: 1.0.0\n  - name: b\n    version: 1.0.0\n    contract: supported\n    description: One row per thing.\n",
+        )
+        .unwrap();
+        check_supported_have_descriptions(&def).expect("lint must pass");
+    }
+
+    // ADR 0012 §3 ratchet check 2 (orphan-kill, by construction): a
+    // description rides the schema entry, so describing a column the source
+    // no longer has IS the existing declared-column-missing hard error —
+    // rename/drop kills the orphaned sentence.
+    #[test]
+    fn described_column_missing_from_the_source_is_still_a_hard_error() {
+        let (conn, _dir) = attach_lake("orphan-desc");
+        conn.execute_batch("CREATE TABLE t AS SELECT 1 AS id;")
+            .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: t\n\
+             \x20   version: 1.0.0\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             \x20     dropped_col:\n\
+             \x20       type: decimal\n\
+             \x20       description: A sentence about a column that no longer exists.\n",
+        )
+        .unwrap();
+        let err = check(&conn, &def).unwrap_err().to_string();
+        assert!(
+            err.contains("declared column 'dropped_col' missing"),
+            "got: {err}"
+        );
+    }
+
+    // ADR 0012 §7: a declared-type mismatch is a hard verify error, not a
+    // warning — the breaking-change promotion, pinned end to end against a
+    // real table.
+    #[test]
+    fn declared_type_mismatch_is_a_hard_error() {
+        let (conn, _dir) = attach_lake("type-mismatch");
+        conn.execute_batch("CREATE TABLE t AS SELECT 1 AS id, 'x' AS label;")
+            .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: t\n\
+             \x20   version: 1.0.0\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             \x20     label: decimal\n",
+        )
+        .unwrap();
+        let err = check(&conn, &def).unwrap_err().to_string();
+        assert!(err.contains("declared type 'decimal'"), "got: {err}");
+        assert!(err.contains("column 'label'"), "got: {err}");
+        assert!(
+            err.contains("promoted to an error by ADR 0012"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn matching_declared_types_still_verify_cleanly() {
+        let (conn, _dir) = attach_lake("type-match");
+        conn.execute_batch("CREATE TABLE t AS SELECT 1::INTEGER AS id, 'x' AS label;")
+            .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: t\n\
+             \x20   version: 1.0.0\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             \x20     label: string\n",
+        )
+        .unwrap();
+        check(&conn, &def).expect("compatible declared types must pass");
     }
 
     #[test]

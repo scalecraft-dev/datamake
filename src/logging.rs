@@ -201,8 +201,12 @@ fn open_file_log(
 /// file's path when one was opened, for `main`'s success/failure
 /// discoverability lines (`log: <path>` / `See the full run log: <path>`).
 pub fn init(command: &Command, log_dir_arg: Option<&Path>, log_keep: u32) -> Option<PathBuf> {
-    let console_layer =
-        tracing_subscriber::fmt::layer().with_filter(EnvFilter::new(base_directives()));
+    // Console logs go to stderr: stdout belongs to data. `attach` pipes SQL,
+    // `context` and `mesh emit` pipe JSON (ADR 0012) — a warning interleaved
+    // into any of those would corrupt the very artifact being emitted.
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(EnvFilter::new(base_directives()));
 
     match open_file_log(command, log_dir_arg, log_keep) {
         Some((path, file)) => {
@@ -378,6 +382,8 @@ mod tests {
             profile: "local".into(),
             port: 8080,
             poll_interval: 15,
+            max_concurrency: crate::serve::DEFAULT_MAX_CONCURRENCY,
+            no_data: false,
         });
 
         assert_eq!(command_name(&run), Some("run"));

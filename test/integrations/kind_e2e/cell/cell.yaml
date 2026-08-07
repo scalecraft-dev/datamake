@@ -11,6 +11,7 @@ interface:
   - name: orders_daily
     version: 2.1.0
     source: orders_daily
+    description: One row per (order_date, region) with the summed order revenue.
     grain: [order_date, region]
     schema:
       order_date: date

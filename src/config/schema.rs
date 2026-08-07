@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -7,6 +7,11 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CellDef {
     pub cell: String,
+    /// One line: what this data product is (ADR 0012 §3). Ships in the
+    /// context document and as `/openapi.json`'s `info.description`.
+    /// Length-capped at parse time (`validate_prose`).
+    #[serde(default)]
+    pub description: Option<String>,
     /// External inputs, bound as session-local TEMP VIEWs before transforms run.
     /// A source is either a raw path/URI or a reference to another cell's table.
     #[serde(default)]
@@ -45,12 +50,19 @@ pub struct Export {
     /// private internals and the public name.
     #[serde(default)]
     pub source: Option<String>,
+    /// One or two sentences: what one row means (ADR 0012 §3). Required
+    /// (non-empty) once the export is `contract: supported` — the lint
+    /// lands on the deliberate promotion gesture, enforced by `verify`.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Grain columns: exposed as equality filters and uniqueness-checked by `verify`.
     #[serde(default)]
     pub grain: Vec<String>,
-    /// Declared column -> type. Order is preserved (IndexMap).
+    /// Declared column -> spec. Order is preserved (IndexMap). The value is
+    /// either a bare type string (`region: string` — every pre-ADR-0012 cell
+    /// parses as-is) or a mapping `{type, unit, description}` (ADR 0012 §3).
     #[serde(default)]
-    pub schema: IndexMap<String, String>,
+    pub schema: IndexMap<String, ColumnSpec>,
     #[serde(default)]
     pub freshness: Option<String>,
     #[serde(default)]
@@ -78,6 +90,120 @@ impl Export {
     pub fn route(&self) -> Result<String> {
         Ok(format!("{}@{}", self.name, self.major()?))
     }
+}
+
+/// One declared column: its type, and optionally its meaning (ADR 0012 §3).
+/// Exactly two meaning fields, admitted under the rationing rule — not
+/// machine-derivable AND wrongness produces a confidently wrong number:
+/// `unit` (structured, e.g. `USD` — the #1 silent-wrong-number source) and
+/// `description` (non-obvious columns only). Prose that lives beside the
+/// schema it describes, versions with it, and ships in the same artifact has
+/// no independent lifecycle to rot on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnSpec {
+    /// The declared type — the same strings the bare shape always accepted.
+    pub ty: String,
+    /// Structured unit token (`USD`, `ms`, `rows`) — never prose.
+    pub unit: Option<String>,
+    pub description: Option<String>,
+}
+
+impl ColumnSpec {
+    /// A bare type with no meaning fields — what every pre-ADR-0012 schema
+    /// entry parses to.
+    pub fn bare(ty: &str) -> Self {
+        ColumnSpec {
+            ty: ty.to_string(),
+            unit: None,
+            description: None,
+        }
+    }
+}
+
+/// Dispatch on YAML shape, per the `Source` precedent — not
+/// `#[serde(untagged)]`, which swallows field-level errors behind "data did
+/// not match any variant". A string is a bare type; a mapping is
+/// `{type, unit, description}` with unknown fields denied (a typo'd
+/// `descripton:` must fail loud, not silently drop the sentence).
+impl<'de> Deserialize<'de> for ColumnSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(s) => Ok(ColumnSpec::bare(&s)),
+            serde_yaml::Value::Mapping(map) => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Helper {
+                    #[serde(rename = "type")]
+                    ty: String,
+                    #[serde(default)]
+                    unit: Option<String>,
+                    #[serde(default)]
+                    description: Option<String>,
+                }
+                let h: Helper = serde_yaml::from_value(serde_yaml::Value::Mapping(map))
+                    .map_err(|e| D::Error::custom(rewrite_column_error(&e.to_string())))?;
+                Ok(ColumnSpec {
+                    ty: h.ty,
+                    unit: h.unit,
+                    description: h.description,
+                })
+            }
+            other => Err(D::Error::custom(format!(
+                "a schema column must be a type string (`region: string`) or a mapping \
+                 `{{ type, unit, description }}`, got {}",
+                yaml_kind(&other)
+            ))),
+        }
+    }
+}
+
+/// Round-trip cleanly: a spec with no meaning fields serializes back to the
+/// bare string it was authored as; only a spec carrying meaning becomes a
+/// mapping.
+impl Serialize for ColumnSpec {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap as _;
+        if self.unit.is_none() && self.description.is_none() {
+            return serializer.serialize_str(&self.ty);
+        }
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", &self.ty)?;
+        if let Some(u) = &self.unit {
+            map.serialize_entry("unit", u)?;
+        }
+        if let Some(d) = &self.description {
+            map.serialize_entry("description", d)?;
+        }
+        map.end()
+    }
+}
+
+/// Name the valid keys instead of serde's generic "expected one of" list.
+fn rewrite_column_error(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("unknown field `") {
+        if let Some(end) = rest.find('`') {
+            let field = &rest[..end];
+            return format!(
+                "unknown field `{field}` in a schema column — a column mapping has `type`, \
+                 and optional `unit` and `description`."
+            );
+        }
+    }
+    if raw.starts_with("missing field `type`") {
+        return "a schema column mapping is missing required field `type` — the declared \
+                type, e.g. `type: decimal`."
+            .to_string();
+    }
+    format!("schema column: {raw}")
 }
 
 /// Whether an export appears in the discoverable catalog. Decoupled from `Contract`.
@@ -803,6 +929,13 @@ pub struct Bindings {
     /// Required only when `access.roles` is set.
     #[serde(default)]
     pub principals: Option<String>,
+    /// Where rows actually live when this endpoint doesn't serve them
+    /// (`serve --no-data`, ADR 0012 §4): free-form operator hints (a share
+    /// name, an internal how-to URL) surfaced verbatim in the context
+    /// document's `data.channels`. Environment, which is why it binds here
+    /// and never in `cell.yaml`. Empty stays empty — never fabricated.
+    #[serde(default)]
+    pub channels: Vec<String>,
     /// Locations of upstream cell dependencies (referenced by name from `sources`).
     #[serde(default)]
     pub cells: IndexMap<String, CellLocation>,
@@ -899,8 +1032,70 @@ impl CellDef {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading cell definition {}", path.display()))?;
-        serde_yaml::from_str(&raw)
-            .with_context(|| format!("parsing cell definition {}", path.display()))
+        let def: CellDef = serde_yaml::from_str(&raw)
+            .with_context(|| format!("parsing cell definition {}", path.display()))?;
+        def.validate_prose()
+            .with_context(|| format!("validating cell definition {}", path.display()))?;
+        Ok(def)
+    }
+
+    /// ADR 0012 §3: prose is length-capped at parse time — the meaning
+    /// fields are one-line-to-two-sentence orientation, not documentation
+    /// pages, and the caps are also the injection-surface bound (ADR 0012
+    /// §8: cell prose is the first untrusted author text to land in a
+    /// trusted agent context).
+    pub fn validate_prose(&self) -> Result<()> {
+        const CELL_DESC_MAX: usize = 200;
+        const DESC_MAX: usize = 500;
+        const UNIT_MAX: usize = 16;
+
+        if let Some(d) = &self.description {
+            if d.chars().count() > CELL_DESC_MAX {
+                bail!(
+                    "cell `description` is {} characters (max {CELL_DESC_MAX}) — one line: \
+                     what this data product is.",
+                    d.chars().count()
+                );
+            }
+            if d.contains('\n') {
+                bail!("cell `description` must be a single line.");
+            }
+        }
+        for export in &self.interface {
+            if let Some(d) = &export.description {
+                if d.chars().count() > DESC_MAX {
+                    bail!(
+                        "export '{}': `description` is {} characters (max {DESC_MAX}) — one \
+                         or two sentences: what one row means.",
+                        export.name,
+                        d.chars().count()
+                    );
+                }
+            }
+            for (col, spec) in &export.schema {
+                if let Some(u) = &spec.unit {
+                    if u.chars().count() > UNIT_MAX || u.chars().any(char::is_whitespace) {
+                        bail!(
+                            "export '{}', column '{col}': `unit` must be a structured token \
+                             like `USD` or `ms` (max {UNIT_MAX} characters, no whitespace), \
+                             got '{u}' — prose belongs in `description`.",
+                            export.name
+                        );
+                    }
+                }
+                if let Some(d) = &spec.description {
+                    if d.chars().count() > DESC_MAX {
+                        bail!(
+                            "export '{}', column '{col}': `description` is {} characters \
+                             (max {DESC_MAX}).",
+                            export.name,
+                            d.chars().count()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -926,12 +1121,108 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             source: source.map(str::to_string),
+            description: None,
             grain: vec![],
             schema: IndexMap::new(),
             freshness: None,
             visibility: Visibility::default(),
             contract: Contract::default(),
         }
+    }
+
+    // --- ADR 0012 §3: the meaning fields and the two-shape schema value ---
+
+    #[test]
+    fn schema_value_bare_string_parses_as_before() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    schema:\n      region: string\n",
+        )
+        .unwrap();
+        assert_eq!(
+            def.interface[0].schema.get("region"),
+            Some(&ColumnSpec::bare("string"))
+        );
+    }
+
+    #[test]
+    fn schema_value_mapping_parses_type_unit_description() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    schema:\n      revenue:\n        type: decimal\n        unit: USD\n        description: Gross revenue.\n",
+        )
+        .unwrap();
+        let spec = def.interface[0].schema.get("revenue").unwrap();
+        assert_eq!(spec.ty, "decimal");
+        assert_eq!(spec.unit.as_deref(), Some("USD"));
+        assert_eq!(spec.description.as_deref(), Some("Gross revenue."));
+    }
+
+    #[test]
+    fn schema_value_typo_field_errors_naming_the_valid_fields() {
+        let err = serde_yaml::from_str::<CellDef>(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    schema:\n      revenue:\n        type: decimal\n        descripton: oops\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `descripton`"), "got: {err}");
+        assert!(err.contains("`type`"), "got: {err}");
+        assert!(err.contains("`description`"), "got: {err}");
+    }
+
+    #[test]
+    fn schema_value_mapping_missing_type_errors_with_the_fix() {
+        let err = serde_yaml::from_str::<CellDef>(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    schema:\n      revenue:\n        unit: USD\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing required field `type`"), "got: {err}");
+    }
+
+    #[test]
+    fn column_spec_roundtrips_bare_as_string_and_enriched_as_mapping() {
+        let bare = ColumnSpec::bare("date");
+        assert_eq!(serde_yaml::to_string(&bare).unwrap().trim(), "date");
+        let rich = ColumnSpec {
+            ty: "decimal".to_string(),
+            unit: Some("USD".to_string()),
+            description: None,
+        };
+        let yaml = serde_yaml::to_string(&rich).unwrap();
+        let back: ColumnSpec = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back, rich);
+    }
+
+    fn def_with_prose(cell_desc: &str, unit: &str) -> CellDef {
+        serde_yaml::from_str(&format!(
+            "cell: c\ndescription: \"{cell_desc}\"\ninterface:\n  - name: e\n    version: 1.0.0\n    schema:\n      revenue:\n        type: decimal\n        unit: \"{unit}\"\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn prose_caps_reject_an_overlong_cell_description() {
+        let def = def_with_prose(&"x".repeat(201), "USD");
+        let err = def.validate_prose().unwrap_err().to_string();
+        assert!(err.contains("cell `description`"), "got: {err}");
+        assert!(err.contains("max 200"), "got: {err}");
+    }
+
+    #[test]
+    fn prose_caps_reject_a_prose_shaped_unit() {
+        let def = def_with_prose("fine", "US dollars");
+        let err = def.validate_prose().unwrap_err().to_string();
+        assert!(
+            err.contains("`unit` must be a structured token"),
+            "got: {err}"
+        );
+        assert!(err.contains("prose belongs in `description`"), "got: {err}");
+    }
+
+    #[test]
+    fn prose_caps_accept_the_intended_shapes() {
+        def_with_prose("Daily orders by region.", "USD")
+            .validate_prose()
+            .expect("well-shaped prose must pass");
     }
 
     #[test]

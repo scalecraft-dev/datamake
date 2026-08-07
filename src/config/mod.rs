@@ -18,7 +18,7 @@ pub use bindings::{
 pub use bindings::Redacted;
 pub use deploy::{DeployConfig, Target};
 pub use schema::{
-    resolve_transforms, Bindings, CellDef, Contract, Export, MaterializeStrategy,
+    resolve_transforms, Bindings, CellDef, ColumnSpec, Contract, Export, MaterializeStrategy,
     ResolvedTransform, Source, Visibility,
 };
 
