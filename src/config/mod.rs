@@ -18,8 +18,8 @@ pub use bindings::{
 pub use bindings::Redacted;
 pub use deploy::{DeployConfig, Target};
 pub use schema::{
-    resolve_transforms, Bindings, CellDef, ColumnSpec, Contract, Export, MaterializeStrategy,
-    ResolvedTransform, Source, Visibility,
+    is_all_never, never_backed_tables, resolve_transforms, Bindings, CellDef, ColumnSpec, Contract,
+    Export, MaterializeStrategy, ResolvedTransform, Source, Visibility,
 };
 
 /// A cell parsed and resolved against a profile — **without a database

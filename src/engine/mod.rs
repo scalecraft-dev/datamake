@@ -528,6 +528,26 @@ pub fn run(
     let cell = open(file, profile, false)?;
     tracing::info!(cell = %cell.def.cell, profile, "running pipeline");
 
+    // Issue #6 (virtual cells foundation): a cell whose every transform is
+    // `materialize: never` produces no snapshot at all — spiked and
+    // confirmed (`spike_a_transaction_that_only_creates_a_temp_view_
+    // advances_no_snapshot`): a transaction that only creates TEMP views
+    // never advances DuckLake's snapshot history. Without this refusal,
+    // published mode would still call `publish_execution` and write a
+    // `RunSummary` claiming a real build stands behind an unchanged
+    // artifact — the exact invariant break the team review flagged. Refused
+    // before BEGIN (before even the store probe below, which is pure
+    // overhead for a cell this command can never build), not caught after
+    // the fact.
+    if crate::config::is_all_never(&cell.transforms) {
+        anyhow::bail!(
+            "cell '{}' has no materializing transforms (every transform is `materialize: \
+             never`) — there is no snapshot to commit. Run `datamk verify` to check the \
+             contract, and `datamk context` to emit the document.",
+            cell.def.cell
+        );
+    }
+
     // The authoritative conditional-PUT probe (ADR 0004 §3) runs HERE, before
     // any work — in the process that publishes, with the connectivity pods
     // actually have. The deploy host's probe is best-effort (it may not reach
@@ -679,8 +699,14 @@ pub fn run(
 
     tracing::info!("verifying interface");
     // Verify gates publish (ADR 0004 §4): a failed contract check must never
-    // enter published history.
-    crate::verify::check(&cell.conn, &cell.def)?;
+    // enter published history. Still on the same connection the `never`
+    // transforms above bound their TEMP VIEWs into, pre-DETACH — a
+    // never-backed export's contract IS checked here (spike:
+    // `spike_temp_view_resolves_unqualified_ahead_of_use_lake`), unlike a
+    // standalone `datamk verify` run afterward (see `verify::check`'s doc
+    // comment).
+    let never_tables = crate::config::never_backed_tables(&cell.transforms);
+    crate::verify::check(&cell.conn, &cell.def, &never_tables)?;
 
     // --verify-replay (ADR 0005 §2 item 1): after COMMIT and after
     // verify::check, before compact()/DETACH — pinned ordering. It needs the
@@ -806,6 +832,10 @@ fn execute_transform(
             &entry.table,
             full_refresh,
         ),
+        // `never` (issue #6) is its own shape, same reason `replace` is: no
+        // staging, no key, no guards — plus, unlike every other strategy,
+        // no `lake` catalog mutation at all.
+        MaterializeStrategy::Never => execute_never(conn, dir, &entry.sql, &entry.table),
     }
 }
 
@@ -863,6 +893,37 @@ fn execute_replace(conn: &Connection, dir: &Path, sql_path: &str, table: &str) -
 
     let artifact = write_eject_artifact(dir, table, &[], &[stmt])?;
     log_eject_notice(table, &artifact);
+    Ok(())
+}
+
+/// `materialize: never` (issue #6, virtual cells foundation): bind the
+/// transform's SELECT as a session-local `TEMP VIEW` and stop — the `lake`
+/// catalog is never touched, so this transform contributes nothing to the
+/// snapshot this run produces (spike:
+/// `spike_a_transaction_that_only_creates_a_temp_view_advances_no_snapshot`
+/// confirms a transaction that only does this advances no DuckLake
+/// snapshot). Downstream transforms in the same run read the view by name
+/// exactly like any materialized table — TEMP views resolve unqualified
+/// regardless of `USE lake` being the session's active default catalog
+/// (spike: `spike_temp_view_resolves_unqualified_ahead_of_use_lake`). No
+/// staging, no key, no guards, no schema-drift check — same shape as
+/// `execute_replace` for the same reasons, minus the one thing `replace`
+/// still does that this doesn't: no eject artifact. ADR 0008 §7's artifact
+/// documents DML that ran *against the lake*, runnable by hand there; a
+/// `never` transform ran nothing against the lake to eject.
+fn execute_never(conn: &Connection, dir: &Path, sql_path: &str, table: &str) -> Result<()> {
+    let table_q = quote_ident(table);
+    let select_path = dir.join(sql_path);
+    let select_text = std::fs::read_to_string(&select_path)
+        .with_context(|| format!("reading transform {}", select_path.display()))?;
+    let stmt = format!("CREATE OR REPLACE TEMP VIEW {table_q} AS ({select_text});");
+    tracing::info!(table = %table, sql = %stmt, "materialize: never");
+    conn.execute_batch(&stmt).with_context(|| {
+        composition_error_context(
+            &format!("binding '{table}' as a session view (materialize: never) from '{sql_path}'"),
+            &select_text,
+        )
+    })?;
     Ok(())
 }
 
@@ -987,6 +1048,10 @@ fn execute_materialize(
             MaterializeStrategy::Replace => unreachable!(
                 "execute_transform routes `replace` to execute_replace, never here — replace \
                  takes no key and needs none of this function's staging/guards"
+            ),
+            MaterializeStrategy::Never => unreachable!(
+                "execute_transform routes `never` to execute_never, never here — never takes no \
+                 key and writes nothing to the lake at all"
             ),
         };
         tracing::info!(table = %table, strategy = %strategy, sql = %stmt, "materialize: strategy");
@@ -4079,6 +4144,94 @@ mod tests {
         eprintln!("rows matching table_catalog = 'lake' for 't': {catalog_lake_count}");
     }
 
+    // --- Issue #6 (virtual cells foundation): `materialize: never` spikes --
+    //
+    // Two empirical questions the `Never` engine arm depends on, answered
+    // here before it was written, same discipline as the rollback/read-only
+    // probes above:
+    //   1. Does a `BEGIN...COMMIT` transaction that touches no `lake` object
+    //      (only creates a session-local TEMP VIEW) still advance the
+    //      DuckLake snapshot history?
+    //   2. With `USE lake;` active, does an unqualified `FROM <name>`
+    //      resolve a same-named TEMP VIEW ahead of (or at all, alongside) the
+    //      `lake` schema, both inside and outside an open transaction?
+
+    #[test]
+    fn spike_a_transaction_that_only_creates_a_temp_view_advances_no_snapshot() {
+        let (conn, _dir) = probe_attach("spike-empty-txn");
+
+        conn.execute_batch("CREATE TABLE t AS SELECT * FROM range(3) tbl(id);")
+            .expect("create baseline table t (establishes snapshot 1+)");
+        let baseline_snapshot = max_snapshot_id(&conn);
+
+        conn.execute_batch("BEGIN;").expect("begin");
+        conn.execute_batch(
+            "CREATE OR REPLACE TEMP VIEW \"never_tbl\" AS SELECT * FROM (VALUES (1)) AS s(x);",
+        )
+        .expect("create temp view inside the transaction");
+        conn.execute_batch("COMMIT;").expect("commit");
+
+        let after_snapshot = max_snapshot_id(&conn);
+        assert_eq!(
+            after_snapshot, baseline_snapshot,
+            "a transaction that only creates a TEMP VIEW (memory catalog, not `lake`) must not \
+             advance the DuckLake snapshot history — TEMP objects are outside DuckLake's MVCC \
+             entirely, confirming a `Never` transform is safe to run inside the same BEGIN...COMMIT \
+             as materializing transforms without itself committing a snapshot"
+        );
+
+        // A run whose *entire* transaction is like this (all-never cell) is
+        // refused before BEGIN by `run` itself (see the all-never guard) —
+        // this probe only proves the mechanism, not the policy.
+    }
+
+    #[test]
+    fn spike_temp_view_resolves_unqualified_ahead_of_use_lake() {
+        let (conn, _dir) = probe_attach("spike-temp-resolution");
+
+        // A `lake` table and a same-session TEMP VIEW with *different* names
+        // — the realistic shape (every transform's table name is unique by
+        // construction, ADR 0008 §2) — read back correctly regardless of
+        // `USE lake;` being the active default catalog.
+        conn.execute_batch("CREATE TABLE materialized_tbl AS SELECT 1 AS id;")
+            .expect("create a real lake table");
+        conn.execute_batch(
+            "CREATE OR REPLACE TEMP VIEW \"never_tbl\" AS SELECT * FROM (VALUES (42)) AS s(id);",
+        )
+        .expect("create temp view with USE lake active");
+
+        let from_lake: i64 = conn
+            .query_row("SELECT id FROM materialized_tbl", [], |r| r.get(0))
+            .expect("unqualified read of the lake table");
+        assert_eq!(from_lake, 1);
+
+        let from_temp: i64 = conn
+            .query_row("SELECT id FROM never_tbl", [], |r| r.get(0))
+            .expect(
+                "unqualified read of the TEMP VIEW must resolve even though the session's \
+                 default catalog is `lake`, not `temp`/`memory` — DuckDB's search_path checks \
+                 the temp schema for an unqualified name regardless of the active default \
+                 database",
+            );
+        assert_eq!(from_temp, 42);
+
+        // A downstream transform reading a never-backed table mid-transaction
+        // (the MIXED-cell shape): open a transaction, read the TEMP VIEW as
+        // if it were any other declared table, same as `execute_transform`
+        // would for `FROM never_tbl` in a later transform's SELECT.
+        conn.execute_batch("BEGIN;").expect("begin");
+        conn.execute_batch("CREATE TABLE downstream AS SELECT id * 2 AS doubled FROM never_tbl;")
+            .expect(
+                "a materializing transform reading a never-backed TEMP VIEW mid-transaction \
+                 must resolve it exactly like any other unqualified table reference",
+            );
+        let doubled: i64 = conn
+            .query_row("SELECT doubled FROM downstream", [], |r| r.get(0))
+            .expect("read the downstream table created from the never-backed view");
+        assert_eq!(doubled, 84);
+        conn.execute_batch("COMMIT;").expect("commit");
+    }
+
     // --- ADR 0008 (declarative incremental materialization) MERGE gate ---
     //
     // §5b names an explicit pre-adoption gate: MERGE has never been
@@ -4782,6 +4935,180 @@ mod tests {
         );
     }
 
+    // --- issue #6: `materialize: never` -------------------------------------
+
+    #[test]
+    fn materialize_never_writes_no_lake_table_but_a_downstream_transform_reads_it_in_run() {
+        // MIXED cell (the shape the ADR 0012/issue #6 review required): a
+        // real `stg` table, a `never` transform over PII the cell must not
+        // hold, and a normal `replace` rollup reading the never-backed view
+        // downstream — same transaction, same run.
+        let cell = materialize_test_cell(
+            "mat-never-mixed",
+            "  - sql/stg.sql\n  - sql: sql/virtual_pii.sql\n    materialize: never\n  - sql/agg.sql\n",
+            &[
+                (
+                    "stg.sql",
+                    "SELECT * FROM (VALUES (1, 'alice@x.com', 10), (2, 'bob@x.com', 20)) \
+                     AS t(id, email, amount)",
+                ),
+                ("virtual_pii.sql", "SELECT id, email, amount FROM stg"),
+                (
+                    "agg.sql",
+                    "SELECT count(*) AS n, sum(amount) AS total FROM virtual_pii",
+                ),
+            ],
+        );
+        run_transforms(&cell, false)
+            .expect("a never transform must not block the transaction it runs inside");
+
+        // The lake contains only the materialized tables — `virtual_pii`
+        // never reached the DuckLake catalog (spike:
+        // `spike_a_transaction_that_only_creates_a_temp_view_advances_no_
+        // snapshot`).
+        let lake_tables: Vec<String> = {
+            let mut stmt = cell
+                .conn
+                .prepare(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = 'lake' ORDER BY table_name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<duckdb::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            lake_tables,
+            vec!["agg".to_string(), "stg".to_string()],
+            "virtual_pii must never reach the lake catalog — only materialized tables do: \
+             {lake_tables:?}"
+        );
+
+        // Downstream `agg` (a normal `replace` table) read the never-backed
+        // view exactly like any materialized table, in the same transaction
+        // (spike: `spike_temp_view_resolves_unqualified_ahead_of_use_lake`).
+        let (n, total): (i64, f64) = cell
+            .conn
+            .query_row("SELECT n, total FROM agg", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(n, 2, "agg must see both rows virtual_pii exposed");
+        assert_eq!(
+            total, 30.0,
+            "agg's aggregate must reflect virtual_pii's rows"
+        );
+    }
+
+    #[test]
+    fn run_refuses_an_all_never_cell_before_begin() {
+        // The invariant the team review flagged: without this refusal,
+        // `run` on an all-never cell would proceed through an empty-of-lake
+        // -writes transaction (spiked: it creates no snapshot at all) and,
+        // in published mode, still call `publish_execution` and write a
+        // `RunSummary` claiming a verified build stands behind an unchanged
+        // artifact. Refused before BEGIN instead.
+        let dir = probe_scratch_dir("run-all-never-refusal");
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: virtual_only\n\
+             transforms:\n\
+             \x20 - sql: sql/pii.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: pii\n\
+             \x20   version: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/pii.sql"),
+            "SELECT * FROM (VALUES (1, 'a')) AS t(id, val)",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+
+        let err = run(&dir.join("cell.yaml"), "local", None, RunOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cell 'virtual_only' has no materializing transforms"),
+            "got: {err}"
+        );
+        assert!(err.contains("materialize: never"), "got: {err}");
+        assert!(err.contains("there is no snapshot to commit"), "got: {err}");
+        assert!(err.contains("datamk verify"), "got: {err}");
+        assert!(err.contains("datamk context"), "got: {err}");
+    }
+
+    #[test]
+    fn run_builds_a_mixed_cell_normally_committing_only_the_materializing_tables() {
+        // The mixed-cell counterpart to the all-never refusal above: a cell
+        // with at least one materializing transform must run to completion
+        // (through the real `run()` entry point, verify included), and the
+        // resulting snapshot must contain only the materialized table.
+        let dir = probe_scratch_dir("run-mixed-cell-normal");
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: mixed\n\
+             transforms:\n\
+             \x20 - sql/stg.sql\n\
+             \x20 - sql: sql/virtual_pii.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: stg\n\
+             \x20   version: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/stg.sql"),
+            "SELECT * FROM (VALUES (1, 'a')) AS t(id, val)",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM stg").unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+
+        run(&dir.join("cell.yaml"), "local", None, RunOptions::default())
+            .expect("a mixed cell (at least one materializing transform) must run to completion");
+
+        // Read back through a fresh connection, the way `verify`/`serve`
+        // would — proves the snapshot itself, not just the run's own
+        // session state.
+        let cell = open(&dir.join("cell.yaml"), "local", true).expect("reopen the built cell");
+        let lake_tables: Vec<String> = {
+            let mut stmt = cell
+                .conn
+                .prepare(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = 'lake' ORDER BY table_name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<duckdb::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            lake_tables,
+            vec!["stg".to_string()],
+            "the committed snapshot must contain only the materializing table, never \
+             virtual_pii: {lake_tables:?}"
+        );
+    }
+
     // --- ADR 0008: the uniform naming invariant (raw-path tests removed) ---
     //
     // `check_uniform_naming` (the raw-entry post-run catalog-diff check) and
@@ -4937,8 +5264,12 @@ mod tests {
         );
 
         // Green: `datamk verify`'s actual check, not just "it ran".
-        crate::verify::check(&cell.conn, &cell.def)
-            .expect("bootstrap output must verify cleanly against the declared interface");
+        crate::verify::check(
+            &cell.conn,
+            &cell.def,
+            &crate::config::never_backed_tables(&cell.transforms),
+        )
+        .expect("bootstrap output must verify cleanly against the declared interface");
 
         // Second delivery: an update to key 1 (upsert must replace, not
         // duplicate) plus a brand-new key 3. Simulates what the next run's
@@ -4983,8 +5314,12 @@ mod tests {
             "one group per distinct region across all 3 accumulated rows"
         );
 
-        crate::verify::check(&cell.conn, &cell.def)
-            .expect("post-accumulation output must still verify cleanly");
+        crate::verify::check(
+            &cell.conn,
+            &cell.def,
+            &crate::config::never_backed_tables(&cell.transforms),
+        )
+        .expect("post-accumulation output must still verify cleanly");
     }
 
     #[test]

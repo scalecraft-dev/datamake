@@ -46,8 +46,11 @@ pub struct Export {
     pub name: String,
     /// Semantic version. The route keys on MAJOR (e.g. `name@2`).
     pub version: String,
-    /// Physical object in the lake (defaults to `name`). The seam between
-    /// private internals and the public name.
+    /// The transform table this export reads (defaults to `name`). The seam
+    /// between private internals and the public name. Usually a lake object,
+    /// but not always: a `materialize: never` transform's table is a
+    /// session-local view, never written to the lake (issue #6) — `verify`
+    /// still checks the export against it, but `serve` doesn't route it.
     #[serde(default)]
     pub source: Option<String>,
     /// One or two sentences: what one row means (ADR 0012 §3). Required
@@ -540,16 +543,19 @@ pub(crate) fn is_valid_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// One of the three closed declarative materialization strategies (ADR 0008
-/// §3) — every value replay-safe by construction, never by author
-/// discipline. `append`/`upsert` require `key:` and are replay-safe
-/// *unconditionally* (reconciled against existing state, invariant under
-/// whether the SELECT yields a delta or a complete relation). `replace`
-/// forbids `key:` (nothing to reconcile against) and is replay-safe only
-/// *structurally* — the engine admits it solely in cells with no incremental
-/// source (`resolve_declarative_transforms`'s incremental-source gate,
-/// `config::mod::load`), never by trusting the SELECT is a complete
-/// relation.
+/// One of the four closed declarative materialization strategies (ADR 0008
+/// §3; `never` added by issue #6, "virtual cells foundation") — every value
+/// replay-safe by construction, never by author discipline. `append`/`upsert`
+/// require `key:` and are replay-safe *unconditionally* (reconciled against
+/// existing state, invariant under whether the SELECT yields a delta or a
+/// complete relation). `replace` forbids `key:` (nothing to reconcile
+/// against) and is replay-safe only *structurally* — the engine admits it
+/// solely in cells with no incremental source (`resolve_declarative_
+/// transforms`'s incremental-source gate, `config::mod::load`), never by
+/// trusting the SELECT is a complete relation. `never` also forbids `key:`
+/// (nothing is ever stored, so there is nothing to reconcile) and commits
+/// nothing at all — the engine binds it as a session-local view and stops
+/// (`engine::execute_never`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MaterializeStrategy {
@@ -566,6 +572,15 @@ pub enum MaterializeStrategy {
     /// replace accumulated history with the delta — this ADR's founding
     /// incident.
     Replace,
+    /// Commit nothing (issue #6): bind the SELECT as a session-local
+    /// `TEMP VIEW` and stop — no `lake` catalog mutation, no snapshot, no
+    /// stored rows. No `key:` — there is no stored row to reconcile a key
+    /// against. The contract (interface, grain, verify) still applies to the
+    /// view; only the storage decision is different. An export sourced from
+    /// a `never` table is described in the context document but not routed
+    /// by `serve` (ADR 0012 §4's `channels` names where the rows actually
+    /// live).
+    Never,
 }
 
 impl std::fmt::Display for MaterializeStrategy {
@@ -574,6 +589,7 @@ impl std::fmt::Display for MaterializeStrategy {
             MaterializeStrategy::Append => "append",
             MaterializeStrategy::Upsert => "upsert",
             MaterializeStrategy::Replace => "replace",
+            MaterializeStrategy::Never => "never",
         })
     }
 }
@@ -697,26 +713,41 @@ fn deserialize_materialize_entry(
     let materialize_raw = materialize.ok_or_else(|| {
         format!(
             "transform '{sql}': missing required field `materialize` — one of \
-             `append`/`upsert`/`replace`."
+             `append`/`upsert`/`replace`/`never`."
         )
     })?;
     let materialize = match materialize_raw.as_str() {
         "append" => MaterializeStrategy::Append,
         "upsert" => MaterializeStrategy::Upsert,
         "replace" => MaterializeStrategy::Replace,
+        "never" => MaterializeStrategy::Never,
+        // The most likely typo once `never` ships (issue #6): `view` is the
+        // issue's original proposal, rejected twice over — it's a warehouse
+        // noun for "an object I create" (the inverse of what this strategy
+        // does), and `SourceRunInfo.kind` already uses `"view"` to mean "read
+        // via the BigQuery jobs API" (`engine::run_summary`). Named ahead of
+        // the generic branch below so the author lands on `never` directly
+        // instead of guessing from a closed-set list.
+        "view" => {
+            return Err(format!(
+                "transform '{sql}': `materialize: view` is not a recognized strategy — datamk \
+                 creates no warehouse objects. Use `materialize: never` to leave the rows where \
+                 they are (the contract is still verified against them), or \
+                 `append`/`upsert`/`replace` to hold them."
+            ))
+        }
         other => {
             return Err(format!(
                 "transform '{sql}': `materialize: {other}` is not a recognized strategy — use \
-                 `append`, `upsert`, or `replace`."
+                 `append`, `upsert`, `replace`, or `never`."
             ))
         }
     };
 
     // `key:` is required for append/upsert (they reconcile against prior
-    // state by key) and forbidden for replace (ADR 0008 §3: replace
-    // rebuilds from scratch every run — there is no prior state to
-    // reconcile a key against, so a `key:` next to it is meaningless
-    // config, not harmless config).
+    // state by key) and forbidden for replace/never (ADR 0008 §3, issue #6:
+    // neither has a prior stored row to reconcile a key against, so a
+    // `key:` next to either is meaningless config, not harmless config).
     let key = match materialize {
         MaterializeStrategy::Replace => {
             if key.is_some() {
@@ -725,6 +756,17 @@ fn deserialize_materialize_entry(
                      replace rebuilds the table from scratch every run, so there is nothing to \
                      reconcile a key against. Remove `key:`, or use `materialize: \
                      upsert`/`append` if you need key-based reconciliation."
+                ));
+            }
+            Vec::new()
+        }
+        MaterializeStrategy::Never => {
+            if key.is_some() {
+                return Err(format!(
+                    "transform '{sql}': `key:` is not allowed with `materialize: never` — \
+                     nothing is written, so there is no stored row to reconcile a key against. \
+                     Remove `key:`, or use `materialize: upsert`/`append` if you want datamk to \
+                     hold the rows."
                 ));
             }
             Vec::new()
@@ -796,6 +838,31 @@ impl ResolvedTransform {
     pub fn file_path(&self) -> &str {
         &self.sql
     }
+}
+
+/// The table names of every `materialize: never` transform (issue #6) — the
+/// virtual-export set every consumer that must not treat a never-backed
+/// export as snapshot-backed derives from, once, here: `verify`'s grain
+/// inheritance, the context document's per-export `query` block, `serve`'s
+/// route mounting/openapi/probes, and `release`'s pin sites all call this
+/// rather than re-filtering `MaterializeStrategy::Never` independently.
+pub fn never_backed_tables(transforms: &[ResolvedTransform]) -> std::collections::HashSet<String> {
+    transforms
+        .iter()
+        .filter(|t| matches!(t.strategy, MaterializeStrategy::Never))
+        .map(|t| t.table.clone())
+        .collect()
+}
+
+/// Whether every transform in the cell is `materialize: never` — a
+/// contract-only cell with no snapshot to commit (issue #6). `false` for a
+/// cell with zero transforms at all (a raw-sourced export with no transform
+/// layer, unaffected by this feature and unchanged since before it).
+pub fn is_all_never(transforms: &[ResolvedTransform]) -> bool {
+    !transforms.is_empty()
+        && transforms
+            .iter()
+            .all(|t| matches!(t.strategy, MaterializeStrategy::Never))
 }
 
 /// Resolve-time validation for `transforms:` (ADR 0008): stem-derived table
@@ -1900,7 +1967,7 @@ cells:
             "got: {err}"
         );
         assert!(
-            err.contains("`append`, `upsert`, or `replace`"),
+            err.contains("`append`, `upsert`, `replace`, or `never`"),
             "got: {err}"
         );
     }
@@ -1930,6 +1997,67 @@ cells:
                 materialize: MaterializeStrategy::Replace,
                 key: vec![],
             }]
+        );
+    }
+
+    // --- issue #6 (virtual cells foundation): `materialize: never` --------
+
+    #[test]
+    fn materialize_entry_never_needs_no_key() {
+        let yaml = "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materialize: never\n";
+        let def: CellDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            def.transforms,
+            vec![TransformEntry::Materialize {
+                sql: "sql/fct.sql".into(),
+                materialize: MaterializeStrategy::Never,
+                key: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn materialize_entry_never_forbids_key() {
+        let yaml =
+            "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materialize: never\n    key: [id]\n";
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`key:` is not allowed with `materialize: never`"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("no stored row to reconcile a key against"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("materialize: upsert`/`append` if you want datamk to hold the rows"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn materialize_entry_view_typo_names_never_specifically() {
+        // The most likely typo the moment `never` ships (issue #6): `view`
+        // is the issue's original proposal, rejected — the error must steer
+        // the author to `never` by name, not just land them in the generic
+        // closed-set message.
+        let yaml = "cell: t\ntransforms:\n  - sql: sql/fct.sql\n    materialize: view\n";
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`materialize: view` is not a recognized strategy"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("datamk creates no warehouse objects"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("Use `materialize: never` to leave the rows where they are"),
+            "got: {err}"
         );
     }
 
@@ -2088,5 +2216,44 @@ cells:
         assert!(!is_valid_identifier("flight-id"));
         assert!(!is_valid_identifier("flight.id"));
         assert!(!is_valid_identifier(""));
+    }
+
+    // --- issue #6: `never_backed_tables` / `is_all_never` ------------------
+
+    fn never_entry(sql: &str) -> TransformEntry {
+        TransformEntry::Materialize {
+            sql: sql.to_string(),
+            materialize: MaterializeStrategy::Never,
+            key: vec![],
+        }
+    }
+
+    #[test]
+    fn never_backed_tables_names_only_never_strategy_tables() {
+        let entries = vec![
+            TransformEntry::Path("sql/stg.sql".into()),
+            never_entry("sql/virtual_pii.sql"),
+            materialize("sql/fct.sql", &["id"]),
+        ];
+        let resolved = resolve_transforms(&entries).unwrap();
+        let never = never_backed_tables(&resolved);
+        assert_eq!(never.len(), 1);
+        assert!(never.contains("virtual_pii"));
+        assert!(!never.contains("stg"));
+        assert!(!never.contains("fct"));
+    }
+
+    #[test]
+    fn is_all_never_true_only_when_every_transform_is_never() {
+        assert!(!is_all_never(&[])); // no transforms at all: not this feature's concern
+        let mixed = resolve_transforms(&[
+            never_entry("sql/a.sql"),
+            TransformEntry::Path("sql/b.sql".into()),
+        ])
+        .unwrap();
+        assert!(!is_all_never(&mixed));
+        let all_never =
+            resolve_transforms(&[never_entry("sql/a.sql"), never_entry("sql/b.sql")]).unwrap();
+        assert!(is_all_never(&all_never));
     }
 }

@@ -14,6 +14,7 @@ use anyhow::Result;
 use indexmap::IndexMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 use crate::config::{CellDef, ColumnSpec, Contract, Export, Source, Visibility};
 use crate::engine::run_summary::RunSummary;
@@ -269,6 +270,12 @@ pub struct UpstreamRef {
 /// the router's dispatch map, `openapi::generate`, and the `/context` builder
 /// all derive from this — never three independent re-applications of the
 /// predicate. Sorted by route key so every derived surface is deterministic.
+///
+/// **Declared, not mounted** (issue #6): every discoverable export, including
+/// one sourced from a `materialize: never` table — datamk owns its contract
+/// even where it doesn't own the rows, so a virtual export is still named,
+/// typed, and versioned here. Callers that need only the subset `serve`
+/// actually routes over HTTP call `mounted_routes` on this list.
 pub fn discoverable_routes(def: &CellDef) -> Result<Vec<(String, Export)>> {
     let mut routes = Vec::new();
     for export in &def.interface {
@@ -280,8 +287,34 @@ pub fn discoverable_routes(def: &CellDef) -> Result<Vec<(String, Export)>> {
     Ok(routes)
 }
 
-/// The declared region, built from the shared route list.
-pub fn declared(def: &CellDef, routes: &[(String, Export)], with_query: bool) -> Declared {
+/// The snapshot-backed subset of `routes` (issue #6): drops every export
+/// whose `source` resolves to a `materialize: never` table. This is the list
+/// `serve` mounts data routes from, `openapi::generate` builds paths from,
+/// and swap-time probes run against — every one of those is a claim (or a
+/// query) about rows that exist in the lake, which a never-backed export's
+/// table never does.
+pub fn mounted_routes(
+    routes: &[(String, Export)],
+    never_tables: &HashSet<String>,
+) -> Vec<(String, Export)> {
+    routes
+        .iter()
+        .filter(|(_, e)| !never_tables.contains(e.source_object()))
+        .cloned()
+        .collect()
+}
+
+/// The declared region, built from the shared route list. `never_tables`
+/// (issue #6) nulls a never-backed export's `query` block even when
+/// `with_query` is otherwise true — the affordance it would describe (a
+/// mounted HTTP route) doesn't exist for that export regardless of whether
+/// this surface is serving anyone else's rows.
+pub fn declared(
+    def: &CellDef,
+    routes: &[(String, Export)],
+    with_query: bool,
+    never_tables: &HashSet<String>,
+) -> Declared {
     let exports = routes
         .iter()
         .map(|(route, e)| DeclaredExport {
@@ -297,7 +330,8 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)], with_query: bool) ->
                 .iter()
                 .map(|(col, spec)| (col.clone(), ColumnDoc::from(spec)))
                 .collect(),
-            query: with_query.then(|| query_block(route, e)),
+            query: (with_query && !never_tables.contains(e.source_object()))
+                .then(|| query_block(route, e)),
         })
         .collect();
 
@@ -347,6 +381,21 @@ pub const NOTE_NOTHING_BUILT: &str = "Nothing behind this document has been buil
 pub const NOTE_NO_DATA: &str =
     "Rows are not served by this endpoint by design. Fetch them via the locations listed \
      in the context document's data.channels.";
+
+/// The engine-emitted body a never-backed export's data route serves
+/// (issue #6) — same shape as `NOTE_NO_DATA` (a whole cell dark under
+/// `--no-data`), but naming the export: this door is dark by declared
+/// design, not by an operator flag, and the caller needs to know which.
+/// Served post-`authorize()` only (`serve::serve_export_inner`) — a
+/// pre-auth 404 here would let an unauthenticated caller enumerate which
+/// exports are virtual just by probing routes.
+pub fn note_never_backed(route: &str) -> String {
+    format!(
+        "Rows for '{route}' are not served by this endpoint by design: this export is declared \
+         `materialize: never` — datamk owns its contract, not its rows. Fetch them via the \
+         locations listed in the context document's data.channels. See GET /context."
+    )
+}
 
 /// The engine-emitted note on a direct-attach (local catalog) document:
 /// pinless ⇒ draft by definition (ADR 0012 §4) — data may exist locally, but
@@ -420,6 +469,7 @@ pub fn assemble(
 pub fn build(
     def: &CellDef,
     routes: &[(String, Export)],
+    never_tables: &HashSet<String>,
     provenance: Option<Provenance>,
     freshness: Option<FreshnessBlock>,
     with_query: bool,
@@ -428,7 +478,7 @@ pub fn build(
 ) -> ContextDocument {
     assemble(
         def.cell.clone(),
-        declared(def, routes, with_query),
+        declared(def, routes, with_query, never_tables),
         provenance,
         freshness,
         IndexMap::new(),
@@ -496,6 +546,7 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
 
     let loaded = crate::config::load(file, profile)?;
     let routes = discoverable_routes(&loaded.def)?;
+    let never_tables = crate::config::never_backed_tables(&loaded.transforms);
     let direct_attach = loaded.bindings.catalog.is_some();
 
     let provenance = if direct_attach {
@@ -518,6 +569,7 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
     let mut doc = build(
         &loaded.def,
         &routes,
+        &never_tables,
         provenance,
         /* freshness */ None, // poll telemetry is a lie the instant the file is written
         /* with_query */ true,
@@ -585,6 +637,7 @@ interface:
         build(
             &def,
             &routes,
+            &HashSet::new(),
             Some(Provenance {
                 execution: 47,
                 snapshot_id: Some(12),
@@ -696,7 +749,16 @@ interface:
     fn draft_document_asserts_unbuilt_status_positively() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let doc = build(&def, &routes, None, None, true, true, false);
+        let doc = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            true,
+            true,
+            false,
+        );
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "draft");
         assert_eq!(v["grain_verified"], false);
@@ -708,7 +770,7 @@ interface:
     fn direct_attach_document_is_draft_with_the_direct_attach_note() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let doc = build(&def, &routes, None, None, true, true, true);
+        let doc = build(&def, &routes, &HashSet::new(), None, None, true, true, true);
         assert_eq!(doc.status, Status::Draft);
         assert_eq!(doc.notes, vec![NOTE_DIRECT_ATTACH.to_string()]);
     }
@@ -772,7 +834,16 @@ interface:
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
         let verified = sample_verified();
-        let draft = build(&def, &routes, None, None, true, true, false);
+        let draft = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            true,
+            true,
+            false,
+        );
         assert_eq!(
             digest_of(&verified),
             digest_of(&draft),
@@ -782,7 +853,16 @@ interface:
         let mut def2 = sample_def();
         def2.interface[0].grain.push("channel".to_string());
         let routes2 = discoverable_routes(&def2).unwrap();
-        let changed = build(&def2, &routes2, None, None, true, true, false);
+        let changed = build(
+            &def2,
+            &routes2,
+            &HashSet::new(),
+            None,
+            None,
+            true,
+            true,
+            false,
+        );
         assert_ne!(
             digest_of(&draft),
             digest_of(&changed),
@@ -796,7 +876,16 @@ interface:
     fn portable_shape_keeps_the_grammar_without_claiming_to_serve() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let mut doc = build(&def, &routes, None, None, true, false, true);
+        let mut doc = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            true,
+            false,
+            true,
+        );
         doc.emitted_at = Some("2026-08-06T00:00:00Z".to_string());
         doc.cell_yaml_digest = Some("abc123".to_string());
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();

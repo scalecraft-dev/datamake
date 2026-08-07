@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::config::{CellDef, MaterializeStrategy, ResolvedTransform};
@@ -33,10 +33,21 @@ pub(crate) fn apply_declarative_grain_inheritance(
     def: &mut CellDef,
     transforms: &[ResolvedTransform],
 ) -> Result<()> {
+    // Exhaustive, not `!matches!(.., Replace)` (issue #6 merge-blocker): a
+    // future strategy added to the enum without a matching arm here must
+    // fail to compile, not silently fall into "contributes grain like
+    // append/upsert" or "excluded like replace" by accident of the filter's
+    // polarity. `Never` contributes no grain — nothing is stored, so there
+    // is no key-bearing table to inherit from (same reason it's excluded
+    // from the truncation gate below).
     let keys_by_table: HashMap<&str, &[String]> = transforms
         .iter()
-        .filter(|t| !matches!(t.strategy, MaterializeStrategy::Replace))
-        .map(|t| (t.table.as_str(), t.key.as_slice()))
+        .filter_map(|t| match t.strategy {
+            MaterializeStrategy::Append | MaterializeStrategy::Upsert => {
+                Some((t.table.as_str(), t.key.as_slice()))
+            }
+            MaterializeStrategy::Replace | MaterializeStrategy::Never => None,
+        })
         .collect();
 
     for export in &mut def.interface {
@@ -72,12 +83,26 @@ pub(crate) fn apply_declarative_grain_inheritance(
 /// Verify a built cell against its declared interface (read-only).
 pub fn run(file: &Path, profile: &str) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
-    check(&cell.conn, &cell.def)
+    let never_tables = crate::config::never_backed_tables(&cell.transforms);
+    check(&cell.conn, &cell.def, &never_tables)
 }
 
 /// The interface must not lie: every declared column must exist with a compatible
 /// type, and every declared grain must exist and be unique in the actual output.
-pub fn check(conn: &Connection, def: &CellDef) -> Result<()> {
+///
+/// `never_tables` (issue #6): the set of `materialize: never` table names.
+/// Their session view exists only inside `datamk run` (bound by
+/// `execute_never`, pre-DETACH) — a standalone `datamk verify` opens no
+/// sources and runs no transforms (`engine::open` alone), so that view is
+/// absent from its session. Rather than let that surface as DuckDB's raw
+/// "table does not exist" (confusing, and indistinguishable from a genuinely
+/// broken cell), a never-backed export with no live binding here is skipped
+/// with an honest note: not verified, not broken — verified automatically as
+/// part of `datamk run`, which binds it before checking (see
+/// `crate::engine::run`, called at the same seam). Live-warehouse rebinding
+/// for a standalone check is tracked separately (issue #6 §Q1/Q4), not built
+/// here.
+pub fn check(conn: &Connection, def: &CellDef, never_tables: &HashSet<String>) -> Result<()> {
     // ADR 0005 §1: `__datamk_` is a reserved, enforced namespace — a table
     // matching it other than the watermark table itself is refused before
     // publish.
@@ -93,9 +118,23 @@ pub fn check(conn: &Connection, def: &CellDef) -> Result<()> {
 
     for export in &def.interface {
         let source = export.source_object();
-        let actual = describe(conn, source).with_context(|| {
-            format!("describing source '{source}' for export '{}'", export.name)
-        })?;
+        let actual = match describe(conn, source) {
+            Ok(actual) => actual,
+            Err(e) if never_tables.contains(source) => {
+                tracing::info!(
+                    export = %export.name, source, error = %e,
+                    "materialize: never — no live binding in this session (only bound during \
+                     `datamk run`, pre-DETACH); skipping. Not broken — verified automatically \
+                     as part of `datamk run`."
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("describing source '{source}' for export '{}'", export.name)
+                })
+            }
+        };
 
         for (col, spec) in &export.schema {
             let declared_ty = &spec.ty;
@@ -283,8 +322,19 @@ pub(crate) fn check_replace_incremental_gate(
         return Ok(());
     }
     for t in transforms {
-        if !matches!(t.strategy, MaterializeStrategy::Replace) {
-            continue; // upsert/append are delta consumers by design — not scanned.
+        // Exhaustive, not `!matches!(.., Replace)` (issue #6 merge-blocker):
+        // a future strategy added without a matching arm here must fail to
+        // compile, not silently join `replace` in this scan (which would
+        // misfire — the scan's whole premise is "rebuilds from scratch",
+        // untrue for append/upsert/never) or silently skip it (which would
+        // reopen guard 4c's blind spot). `never` writes nothing to the lake
+        // at all, so there is no truncation risk here to catch, same reason
+        // it contributes no grain above.
+        match t.strategy {
+            MaterializeStrategy::Replace => {}
+            MaterializeStrategy::Append
+            | MaterializeStrategy::Upsert
+            | MaterializeStrategy::Never => continue,
         }
         let sql_path = dir.join(&t.sql);
         let text = std::fs::read_to_string(&sql_path)
@@ -512,7 +562,7 @@ interface:
     #[test]
     fn grain_violation_names_the_incremental_cause_when_one_is_declared() {
         let (conn, _dir) = lake_with_duplicate_grain("grain-hint");
-        let err = check(&conn, &grain_violation_cell(true))
+        let err = check(&conn, &grain_violation_cell(true), &HashSet::new())
             .unwrap_err()
             .to_string();
         assert!(err.contains("grain"), "got: {err}");
@@ -523,7 +573,7 @@ interface:
     #[test]
     fn grain_violation_stays_plain_without_incremental_sources() {
         let (conn, _dir) = lake_with_duplicate_grain("grain-plain");
-        let err = check(&conn, &grain_violation_cell(false))
+        let err = check(&conn, &grain_violation_cell(false), &HashSet::new())
             .unwrap_err()
             .to_string();
         assert!(err.contains("is not unique"), "got: {err}");
@@ -587,7 +637,7 @@ interface:
              \x20       description: A sentence about a column that no longer exists.\n",
         )
         .unwrap();
-        let err = check(&conn, &def).unwrap_err().to_string();
+        let err = check(&conn, &def, &HashSet::new()).unwrap_err().to_string();
         assert!(
             err.contains("declared column 'dropped_col' missing"),
             "got: {err}"
@@ -612,7 +662,7 @@ interface:
              \x20     label: decimal\n",
         )
         .unwrap();
-        let err = check(&conn, &def).unwrap_err().to_string();
+        let err = check(&conn, &def, &HashSet::new()).unwrap_err().to_string();
         assert!(err.contains("declared type 'decimal'"), "got: {err}");
         assert!(err.contains("column 'label'"), "got: {err}");
         assert!(
@@ -636,7 +686,7 @@ interface:
              \x20     label: string\n",
         )
         .unwrap();
-        check(&conn, &def).expect("compatible declared types must pass");
+        check(&conn, &def, &HashSet::new()).expect("compatible declared types must pass");
     }
 
     #[test]
@@ -817,7 +867,50 @@ interface:
         apply_declarative_grain_inheritance(&mut def, &transforms).unwrap();
         assert_eq!(def.interface[0].grain, vec!["flight_id".to_string()]);
 
-        check(&conn, &def).expect("declarative export with inherited grain must verify cleanly");
+        check(&conn, &def, &HashSet::new())
+            .expect("declarative export with inherited grain must verify cleanly");
+    }
+
+    // --- issue #6: `materialize: never` and standalone `check` --------------
+
+    #[test]
+    fn check_skips_a_never_backed_export_with_no_live_binding_instead_of_erroring() {
+        // The session standalone `datamk verify` opens has no `virtual_pii`
+        // relation at all (no `run` ever bound it) — `check` must not
+        // surface DuckDB's raw "table does not exist" for a table this
+        // strategy legitimately never creates outside a run.
+        let (conn, _dir) = attach_lake("never-no-binding");
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\ninterface:\n  - name: virtual_pii\n    version: 1.0.0\n",
+        )
+        .unwrap();
+        let never_tables: HashSet<String> = ["virtual_pii".to_string()].into_iter().collect();
+        check(&conn, &def, &never_tables)
+            .expect("a never-backed export with no live binding must be skipped, not errored");
+    }
+
+    #[test]
+    fn check_still_validates_a_never_backed_export_when_its_view_is_bound() {
+        // The in-run shape (issue #6): once the `never` transform's TEMP
+        // VIEW exists in this session (what `execute_never` leaves behind,
+        // pre-DETACH), `check` validates it exactly like any other export —
+        // schema, grain existence, grain uniqueness — never_tables only
+        // changes behavior on a MISSING relation.
+        let (conn, _dir) = attach_lake("never-bound-and-checked");
+        conn.execute_batch(
+            "CREATE TEMP VIEW virtual_pii AS SELECT * FROM (VALUES (1), (1)) AS t(id);",
+        )
+        .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\ninterface:\n  - name: virtual_pii\n    version: 1.0.0\n    grain: [id]\n",
+        )
+        .unwrap();
+        let never_tables: HashSet<String> = ["virtual_pii".to_string()].into_iter().collect();
+        let err = check(&conn, &def, &never_tables).unwrap_err().to_string();
+        assert!(
+            err.contains("is not unique"),
+            "a bound never-backed view's grain violation must still be caught: got {err}"
+        );
     }
 
     // --- ADR 0008 decision 5: the no-grain warning as the removed-entry -----
@@ -1074,6 +1167,30 @@ interface:
     }
 
     #[test]
+    fn check_replace_incremental_gate_does_not_scan_never_models() {
+        // issue #6 exhaustive-match regression: `never` writes nothing to
+        // the lake at all — there is no truncation risk for guard 4c to
+        // catch — so it must be excluded from the scan exactly like
+        // upsert/append, never accidentally join `replace` in it.
+        let dir = gate_test_dir(
+            "not-scanned-never",
+            &format!(
+                "cell: t\n{}transforms:\n\
+                 \x20 - sql: sql/fct_events.sql\n\
+                 \x20   materialize: never\n",
+                incremental_events_source_yaml()
+            ),
+            &[("fct_events.sql", "SELECT * FROM events")],
+        );
+        let def: CellDef =
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("cell.yaml")).unwrap()).unwrap();
+        let transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
+        check_replace_incremental_gate(&def, &dir, &transforms)
+            .expect("never models reading the source directly are never scanned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn check_replace_incremental_gate_names_multiple_incremental_sources() {
         let dir = gate_test_dir(
             "multiple-sources",
@@ -1166,6 +1283,32 @@ interface:
         assert!(
             def.interface[0].grain.is_empty(),
             "replace has no key to inherit — grain must stay exactly as declared (empty)"
+        );
+    }
+
+    fn never_transform(table: &str) -> ResolvedTransform {
+        ResolvedTransform {
+            sql: format!("sql/{table}.sql"),
+            strategy: MaterializeStrategy::Never,
+            key: vec![],
+            table: table.to_string(),
+        }
+    }
+
+    #[test]
+    fn omitted_grain_over_a_never_table_is_not_inherited() {
+        // issue #6 exhaustive-match regression: `never` has no `key:` (same
+        // as `replace`), so the grain-inheritance filter must exclude it —
+        // not fall through to "contributes grain" by accident of the match
+        // arm ordering.
+        let mut def = cell_with_export(
+            "  - name: virtual_pii\n    version: 1.0.0\n    source: virtual_pii\n",
+        );
+        let transforms = vec![never_transform("virtual_pii")];
+        apply_declarative_grain_inheritance(&mut def, &transforms).unwrap();
+        assert!(
+            def.interface[0].grain.is_empty(),
+            "never has no key to inherit — grain must stay exactly as declared (empty)"
         );
     }
 

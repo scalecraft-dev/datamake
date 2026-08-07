@@ -85,7 +85,8 @@ transforms:                       # private; run in listed order, atomically -> 
 interface:                        # the export list - the public surface, single source of truth
   - name: orders_daily
     version: 2.1.0                # semver; route keys on MAJOR -> GET /orders_daily@2
-    source: orders_daily          # physical object in the lake (defaults to name)
+    source: orders_daily          # transform table this reads (defaults to name; a session
+                                   # view, not a lake table, if that transform is materialize: never)
     description: One row per (order_date, region) with the summed order revenue.  # what one row
                                   # means; required once contract: supported (ADR 0012)
     grain: [order_date, region]   # filterable query params + uniqueness-checked by `verify`
