@@ -71,10 +71,11 @@ silently drift from reality.
 OpenAPI: `GET /orders_daily@2?region=us-east`, `GET /openapi.json`. The query
 grammar is closed and deterministic — grain filters, ordered pages, unknown
 params are a `400`, never silently ignored
-([serving guide](docs/guides/serving.md)). Next on this surface:
-`GET /context`, the whole boundary — meaning included — as one document
-agents can trust, because the build verifies what it describes
-([ADR 0012](docs/adr/0012-cell-context-document.md)).
+([serving guide](docs/guides/serving.md)). And `GET /context` serves the
+whole boundary — meaning included — as one document agents can trust,
+because the build verifies what it describes
+([context guide](docs/guides/context.md),
+[ADR 0012](docs/adr/0012-cell-context-document.md)).
 
 **4. Release it.** Promote via PR (`contract: supported`), then `datamk release`
 pins the current snapshot. That frozen snapshot is what other cells — and other
@@ -127,7 +128,9 @@ Connector setup and per-warehouse behavior live in the guides:
 | `datamk run` | Execute the transforms, commit a snapshot, auto-verify. |
 | `datamk verify` | Machine-check actual output against the declared interface. |
 | `datamk release` | Pin the current snapshot as the supported contract. |
-| `datamk serve` | Serve the interface as REST + OpenAPI. |
+| `datamk serve` | Serve the interface as REST + OpenAPI + `/context`. |
+| `datamk context` | Emit the cell's context document — the interface made machine-readable for agents. |
+| `datamk mesh emit` | Emit the static manifest that tells an agent which cells exist. |
 | `datamk deploy` | Run the cell as managed workloads on an orchestrator. |
 | `datamk attach` | Print SQL that attaches the cell's catalog in DuckDB, read-only. |
 
