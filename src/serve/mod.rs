@@ -78,6 +78,13 @@ struct AppState {
     /// on the poller thread, never on the request path; omitted pieces stay
     /// omitted rather than blocking serving.
     probes: Mutex<indexmap::IndexMap<String, crate::context::ExportProbe>>,
+    /// Cell-source name -> upstream ref (issue #7), precomputed once —
+    /// structural, derived only from `cell.yaml`, so (like `declared`) it
+    /// never changes for the life of the process. The *values*
+    /// (`execution`/`data_as_of`) still ride the poller-refreshed
+    /// `run_summary` cache below, read fresh on every request — this map
+    /// only supplies the correlation key.
+    upstream_refs: Vec<(String, String)>,
 }
 
 #[derive(Default, Clone)]
@@ -215,6 +222,10 @@ fn build_state(
         channels: cell.channels.clone(),
     };
     let digest = crate::context::interface_digest(&cell.def.cell, &declared, &data);
+    // Issue #7: structural only (source name -> upstream ref) — the
+    // correlation key `context_doc` pairs against the poller-refreshed
+    // `run_summary` cache on every request, never precomputed values.
+    let upstream_refs = crate::context::cell_source_refs(&cell.def);
 
     let principals = load_principals(cell.principals.as_deref())?;
     if !cell.def.access.roles.is_empty() && principals.is_empty() {
@@ -273,6 +284,7 @@ fn build_state(
         data_mounted,
         channels: cell.channels.clone(),
         probes: Mutex::new(probes),
+        upstream_refs,
         cell: Mutex::new(cell),
     });
     Ok((state, store))
@@ -669,12 +681,25 @@ async fn context_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         }
     });
 
+    // Issue #7: `upstream_refs` is precomputed structure (never changes);
+    // the values ride the same poller-refreshed `run_summary` cache as
+    // `provenance`, gated by the same execution-match guard above.
+    let upstreams = s
+        .run_summary
+        .lock()
+        .expect("run_summary mutex poisoned")
+        .as_ref()
+        .filter(|summary| summary.execution == execution)
+        .map(|summary| crate::context::observed_upstreams_from(&s.upstream_refs, summary))
+        .unwrap_or_default();
+
     let probes = s.probes.lock().expect("probes mutex poisoned").clone();
     let mut doc = crate::context::assemble(
         s.cell_name.clone(),
         s.declared.clone(),
         provenance,
         freshness,
+        upstreams,
         probes,
         /* served_here */ s.data_mounted,
         s.channels.clone(),

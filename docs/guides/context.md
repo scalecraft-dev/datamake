@@ -52,7 +52,8 @@ whole point:
 - **`declared`** — author claims: exports, grain, schema with descriptions
   and units, the query grammar. What the author *says* the data means.
 - **`observed`** — machine facts: build provenance (execution, snapshot,
-  verify outcome, when the data actually last moved) and measurements probed
+  verify outcome, when the data actually last moved), the execution/freshness
+  actually attached for each upstream `cell` source, and measurements probed
   from the real rows. What the machine *measured*.
 
 An agent can never mistake a claim for a measurement. Absent facts are
@@ -86,13 +87,16 @@ omitted or `null` — never fabricated, never zeros.
         "sample_request": "/orders_daily@2?limit=10"
       }
     }],
-    "upstreams": []
+    "upstreams": [{ "ref": "flights", "version": null }]
   },
   "observed": {
     "provenance": {
       "execution": 47, "snapshot_id": 12, "verify_outcome": "passed",
       "finished_at": "2026-08-06T10:00:05Z", "data_as_of": "2026-08-06 10:00:04+00"
     },
+    "upstreams": [
+      { "ref": "flights", "execution": 41, "data_as_of": "2026-08-04 06:00:11+00" }
+    ],
     "exports": {
       "orders_daily@2": {
         "rows": 4,
@@ -126,6 +130,18 @@ A few parts earn special attention:
   verify-gated build — stands behind the document. A cell that has never
   been published serves `status: "draft"` with an engine note saying exactly
   that. Draft never wears the verified costume.
+- **`declared.upstreams` vs. `observed.upstreams`** close a real gap for
+  composed cells: `declared` carries only the author's pin (`version`,
+  usually `null` — most cells float on whatever `catalog/LATEST` points at
+  when they build), while `observed` carries what the Builder actually
+  attached — the resolved `execution` and the upstream's `data_as_of` at
+  that moment. A cell can be `status: "verified"`, built minutes ago, while
+  reading an upstream artifact that's days stale because *that* cell's build
+  has been failing; `observed.upstreams` is what makes that visible instead
+  of silent. `execution` is `null` for a direct-attach upstream (no
+  publish-store execution number exists to report) — never fabricated.
+  `datamk status` narrates the same measurement under `upstreams (at
+  LATEST):`.
 
 ## Author the meaning
 
