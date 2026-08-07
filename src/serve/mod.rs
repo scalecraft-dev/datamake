@@ -707,6 +707,14 @@ async fn context_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         s.cell_name.clone(),
         s.declared.clone(),
         provenance,
+        // Issue #6: `observed.source_check` is wired for the portable
+        // `datamk verify` -> `datamk context` CI path only in this slice —
+        // the Server stays credential-light and never performs a live
+        // warehouse check itself (Q1's whole point). Reading a persisted
+        // `.cell/source_check.json` here to surface it on the hosted
+        // `/context` too is a reasonable follow-up, deliberately deferred.
+        /* source_check */
+        None,
         freshness,
         probes,
         /* served_here */ s.data_mounted,

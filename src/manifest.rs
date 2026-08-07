@@ -44,3 +44,47 @@ impl Published {
         ids
     }
 }
+
+/// The live-verify source-check record (issue #6, live-verify core):
+/// `datamk verify` writes this (`.cell/source_check.json`, sibling of
+/// `published.json`) after successfully checking every `materialize: never`
+/// export against the live warehouse; `datamk context` reads it back to
+/// populate `observed.source_check` and derive the `verified_at_source`
+/// status.
+///
+/// `verify` and `context` run as separate processes, often in different CI
+/// steps — this file is the only thing that carries a passed live check
+/// from one to the other. `cell_yaml_digest` is the staleness key: `context`
+/// embeds this record only when it matches the current `cell.yaml`'s own
+/// digest (the same sha256 `context` stamps as `cell_yaml_digest` on every
+/// emitted document) — a config edit between the verify step and the
+/// context step must silently invalidate the record, never let a check of
+/// the *previous* contract ride along as if it covered the current one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceCheckRecord {
+    /// `"passed"` by construction: `verify` bails on any check failure
+    /// before ever reaching the write, same discipline as
+    /// `RunSummary.verify_outcome`.
+    pub outcome: String,
+    /// When the live check ran (RFC 3339, UTC).
+    pub checked_at: String,
+    /// When the checked data was last known-true, if a connector can supply
+    /// that cheaply and truthfully. `None` in this slice — no connector
+    /// currently threads one out of the bind path; never fabricated and
+    /// never defaulted to `checked_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_as_of: Option<String>,
+    pub datamk_version: String,
+    pub cell_yaml_digest: String,
+}
+
+impl SourceCheckRecord {
+    /// Read the record from a cell directory, if present and well-formed.
+    /// Callers still must compare `cell_yaml_digest` against the current
+    /// `cell.yaml` before trusting it — this only handles "the file exists
+    /// and parses," not "the file is fresh."
+    pub fn load(dir: &Path) -> Option<SourceCheckRecord> {
+        let raw = std::fs::read_to_string(dir.join(".cell").join("source_check.json")).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+}

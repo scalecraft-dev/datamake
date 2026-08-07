@@ -41,14 +41,21 @@ const SAMPLE_LIMIT: usize = 10;
 pub struct ContextDocument {
     pub datamk_context: u32,
     pub cell: String,
-    /// `draft` | `verified`. Verified means exactly one thing: real provenance
-    /// (a published, verify-gated execution) stands behind this document.
+    /// `draft` | `verified_at_source` | `verified`, weakest to strongest
+    /// (issue #6). `verified` means exactly one thing: real provenance (a
+    /// published, verify-gated execution) stands behind this document.
     /// Pinless ⇒ draft, by definition (ADR 0012 §4) — a direct-attach cell has
     /// no pin and no run summary, so it is draft even after a local build; the
-    /// engine-emitted note says why.
+    /// engine-emitted note says why. `verified_at_source` sits strictly
+    /// between the two: no execution, but a `datamk verify` live-checked
+    /// every `materialize: never` export against the live warehouse
+    /// (`observed.source_check`) — a claim about rows as of that check, not
+    /// about immutable rows that still exist. Distinct from `verified` on
+    /// purpose (issue #6 Q3): an agent that branches on `status` must opt in
+    /// to trusting a weaker guarantee, never inherit it silently.
     pub status: Status,
-    /// `false` unless a verified build stands behind the document — never
-    /// `null`, never `true` by assumption (ADR 0012 §2).
+    /// `false` unless a verified build or a live source check stands behind
+    /// the document — never `null`, never `true` by assumption (ADR 0012 §2).
     pub grain_verified: bool,
     /// Author claims: the interface exactly as `cell.yaml` declares it.
     pub declared: Declared,
@@ -73,6 +80,11 @@ pub struct ContextDocument {
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Draft,
+    /// Issue #6: `#[serde(rename)]` because `rename_all = "lowercase"` alone
+    /// would emit `verifiedatsource` (it lowercases, it does not
+    /// snake_case).
+    #[serde(rename = "verified_at_source")]
+    VerifiedAtSource,
     Verified,
 }
 
@@ -165,6 +177,16 @@ pub struct Observed {
     /// direct-attach cell writes no summary; that absence is served as-is,
     /// never as zeros (ADR 0012 §2).
     pub provenance: Option<Provenance>,
+    /// From `datamk verify`'s live-verify pass (issue #6): present iff a
+    /// fresh (digest-matched) `.cell/source_check.json` record exists.
+    /// `null` when no live check has run, or its record is stale (a
+    /// `cell.yaml` edit since the check — silently omitted, never emitted
+    /// stale). Independent of `provenance`: a cell can carry both (a mixed
+    /// cell with a published execution AND a separately live-checked
+    /// never-backed export), though `status` only reads `provenance` once
+    /// it's present (ADR 0012 §2 cell-level rule, issue #6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_check: Option<SourceCheck>,
     /// Hosted `/context` only, published mode only: the poll telemetry that
     /// makes bounded staleness visible (ADR 0004 §6). Never in the portable
     /// artifact — poll telemetry is a lie the instant the file is written.
@@ -238,6 +260,37 @@ pub struct Provenance {
     /// read cheaply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_as_of: Option<String>,
+}
+
+/// A live check of a `materialize: never` export against the warehouse
+/// (issue #6, live-verify core) — the fact behind `status: verified_at_source`.
+/// Deliberately not `Provenance`: there is no execution, no snapshot, no
+/// immutable rows behind this — just a machine check that passed as of
+/// `checked_at`. Built from `crate::manifest::SourceCheckRecord` (the
+/// `.cell/source_check.json` file `datamk verify` writes); the wire shape
+/// mirrors the record's admitted fields exactly, field-by-field the same
+/// discipline `Provenance` uses for `RunSummary`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCheck {
+    /// `"passed"` by construction — see `SourceCheckRecord`'s doc comment.
+    pub outcome: String,
+    pub checked_at: String,
+    /// Only when a connector can supply it cheaply and truthfully — omitted,
+    /// never fabricated, never defaulted to `checked_at` (ADR 0012 §2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_as_of: Option<String>,
+    pub datamk_version: String,
+}
+
+impl From<&crate::manifest::SourceCheckRecord> for SourceCheck {
+    fn from(r: &crate::manifest::SourceCheckRecord) -> Self {
+        SourceCheck {
+            outcome: r.outcome.clone(),
+            checked_at: r.checked_at.clone(),
+            data_as_of: r.data_as_of.clone(),
+            datamk_version: r.datamk_version.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -407,22 +460,34 @@ pub const NOTE_DIRECT_ATTACH: &str =
 
 /// Assemble a document from a prebuilt declared region (how the serve
 /// handler works — its declared region and digest are precomputed at
-/// startup). `provenance` present ⇒ verified (its wire meaning — ADR 0012
-/// §5); absent ⇒ draft, with the matching engine note.
+/// startup). Status is a ladder, weakest to strongest (issue #6 Q3):
+/// `provenance` present ⇒ `verified` (its wire meaning — ADR 0012 §5) —
+/// unchanged, and checked first, so a mixed cell's published execution
+/// (which already verified its never-backed exports live at build time, see
+/// `engine::run`) reads as the strongest claim it earns; else
+/// `source_check` present ⇒ `verified_at_source`; else `draft`, with the
+/// matching engine note.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble(
     cell: String,
     declared: Declared,
     provenance: Option<Provenance>,
+    source_check: Option<SourceCheck>,
     freshness: Option<FreshnessBlock>,
     probes: IndexMap<String, ExportProbe>,
     served_here: bool,
     channels: Vec<String>,
     direct_attach: bool,
 ) -> ContextDocument {
-    let verified = provenance.is_some();
+    let status = if provenance.is_some() {
+        Status::Verified
+    } else if source_check.is_some() {
+        Status::VerifiedAtSource
+    } else {
+        Status::Draft
+    };
     let mut notes = Vec::new();
-    if !verified {
+    if status == Status::Draft {
         notes.push(
             if direct_attach {
                 NOTE_DIRECT_ATTACH
@@ -435,16 +500,17 @@ pub fn assemble(
     ContextDocument {
         datamk_context: DATAMK_CONTEXT_VERSION,
         cell,
-        status: if verified {
-            Status::Verified
-        } else {
-            Status::Draft
-        },
-        grain_verified: verified,
+        status,
+        grain_verified: status != Status::Draft,
         declared,
-        observed: if provenance.is_some() || freshness.is_some() || !probes.is_empty() {
+        observed: if provenance.is_some()
+            || source_check.is_some()
+            || freshness.is_some()
+            || !probes.is_empty()
+        {
             Some(Observed {
                 provenance,
+                source_check,
                 freshness,
                 exports: probes,
             })
@@ -471,6 +537,7 @@ pub fn build(
     routes: &[(String, Export)],
     never_tables: &HashSet<String>,
     provenance: Option<Provenance>,
+    source_check: Option<SourceCheck>,
     freshness: Option<FreshnessBlock>,
     with_query: bool,
     served_here: bool,
@@ -480,6 +547,7 @@ pub fn build(
         def.cell.clone(),
         declared(def, routes, with_query, never_tables),
         provenance,
+        source_check,
         freshness,
         IndexMap::new(),
         served_here,
@@ -549,6 +617,14 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
     let never_tables = crate::config::never_backed_tables(&loaded.transforms);
     let direct_attach = loaded.bindings.catalog.is_some();
 
+    // Computed once, up front: it stamps every emitted document
+    // (`cell_yaml_digest`) and is the staleness key for the live-verify
+    // source-check record below (issue #6) — both need the exact same bytes,
+    // read once.
+    let cell_yaml_bytes =
+        std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    let cell_yaml_digest = sha256_hex(&cell_yaml_bytes);
+
     let provenance = if direct_attach {
         None
     } else {
@@ -566,11 +642,32 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
         }
     };
 
+    // Issue #6: `datamk verify` and `datamk context` run as separate
+    // processes (CI: verify against the live warehouse, then emit the
+    // document) — the record left under `.cell/source_check.json` is the
+    // only thing that carries a passed live check across that boundary.
+    // Embedded only when its digest still matches this `cell.yaml`; a
+    // config edit since the check ran makes the record stale, and a stale
+    // record is silently omitted, never emitted as if it still applied.
+    let source_check = crate::manifest::SourceCheckRecord::load(&loaded.dir).and_then(|r| {
+        if r.cell_yaml_digest == cell_yaml_digest {
+            Some(SourceCheck::from(&r))
+        } else {
+            tracing::info!(
+                "found .cell/source_check.json but its digest no longer matches cell.yaml — \
+                 the config changed since the last `datamk verify`; omitting observed.source_check \
+                 (re-run `datamk verify` for a current one)"
+            );
+            None
+        }
+    });
+
     let mut doc = build(
         &loaded.def,
         &routes,
         &never_tables,
         provenance,
+        source_check,
         /* freshness */ None, // poll telemetry is a lie the instant the file is written
         /* with_query */ true,
         /* served_here */ false, // a file serves no rows
@@ -578,9 +675,7 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
     );
     doc.data.channels = loaded.bindings.channels.clone();
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
-    doc.cell_yaml_digest = Some(sha256_hex(
-        &std::fs::read(file).with_context(|| format!("reading {}", file.display()))?,
-    ));
+    doc.cell_yaml_digest = Some(cell_yaml_digest);
 
     let json = serde_json::to_string_pretty(&doc)?;
     match out {
@@ -597,6 +692,7 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn sample_def() -> CellDef {
         serde_yaml::from_str(
@@ -647,6 +743,7 @@ interface:
                 datamk_version: "0.0.12".to_string(),
                 data_as_of: Some("2026-07-13 10:00:04+00".to_string()),
             }),
+            /* source_check */ None,
             Some(FreshnessBlock {
                 serving_execution: 47,
                 latest_seen: 47,
@@ -755,6 +852,7 @@ interface:
             &HashSet::new(),
             None,
             None,
+            None,
             true,
             true,
             false,
@@ -770,7 +868,17 @@ interface:
     fn direct_attach_document_is_draft_with_the_direct_attach_note() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let doc = build(&def, &routes, &HashSet::new(), None, None, true, true, true);
+        let doc = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            None,
+            true,
+            true,
+            true,
+        );
         assert_eq!(doc.status, Status::Draft);
         assert_eq!(doc.notes, vec![NOTE_DIRECT_ATTACH.to_string()]);
     }
@@ -840,6 +948,7 @@ interface:
             &HashSet::new(),
             None,
             None,
+            None,
             true,
             true,
             false,
@@ -850,6 +959,31 @@ interface:
             "observed/status/notes must not move the digest"
         );
 
+        // Issue #6: a populated `observed.source_check` (verified_at_source)
+        // must not move the digest either — `observed` never does, this
+        // field included.
+        let verified_at_source = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            Some(SourceCheck {
+                outcome: "passed".to_string(),
+                checked_at: "2026-08-07T10:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: "0.0.13".to_string(),
+            }),
+            None,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            digest_of(&draft),
+            digest_of(&verified_at_source),
+            "a populated observed.source_check must not move the digest"
+        );
+
         let mut def2 = sample_def();
         def2.interface[0].grain.push("channel".to_string());
         let routes2 = discoverable_routes(&def2).unwrap();
@@ -857,6 +991,7 @@ interface:
             &def2,
             &routes2,
             &HashSet::new(),
+            None,
             None,
             None,
             true,
@@ -882,6 +1017,7 @@ interface:
             &HashSet::new(),
             None,
             None,
+            None,
             true,
             false,
             true,
@@ -903,5 +1039,119 @@ interface:
         let routes = discoverable_routes(&def).unwrap();
         let keys: Vec<&str> = routes.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["orders_daily@2"]);
+    }
+
+    // --- issue #6, live-verify core: the `.cell/source_check.json` --------
+    // --- round trip ----------------------------------------------------
+
+    /// A fresh, on-disk all-`never` cell — `verify::run` and `context::emit`
+    /// driven for real (`config::load` + a real `.cell/` directory), same
+    /// pattern `release.rs`'s and `verify.rs`'s live-verify tests use, and
+    /// for the same reason: this round trip is specifically about the two
+    /// commands agreeing through a file on disk, which nothing in-memory
+    /// can stand in for.
+    fn all_never_cell_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-context-source-check-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: virtual_only\n\
+             transforms:\n\
+             \x20 - sql: sql/virtual_pii.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: virtual_pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM raw").unwrap();
+        std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn context_embeds_source_check_and_reports_verified_at_source_after_a_passing_live_verify() {
+        let dir = all_never_cell_dir("fresh");
+        let file = dir.join("cell.yaml");
+        crate::verify::run(&file, "local").expect("live-verify the all-never cell");
+        assert!(
+            dir.join(".cell/source_check.json").is_file(),
+            "verify must have written the source-check record"
+        );
+
+        let out = dir.join("context.json");
+        emit(&file, "local", Some(&out)).expect("emit the context document");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["status"], "verified_at_source");
+        assert_eq!(v["grain_verified"], true);
+        assert_eq!(v["observed"]["provenance"], serde_json::Value::Null);
+        assert_eq!(v["observed"]["source_check"]["outcome"], "passed");
+        assert!(
+            v["observed"]["source_check"]["checked_at"].is_string(),
+            "checked_at must be a real timestamp: {v}"
+        );
+        assert!(
+            v["observed"]["source_check"]["datamk_version"].is_string(),
+            "datamk_version must be present: {v}"
+        );
+        // ADR 0012 §2: never fabricated, never defaulted to checked_at — no
+        // connector in this slice supplies one, so it must be absent.
+        assert!(
+            v["observed"]["source_check"].get("data_as_of").is_none(),
+            "data_as_of must be omitted, not fabricated: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_omits_a_stale_source_check_record_and_falls_back_to_draft() {
+        // Issue #6: `verify` and `context` are separate processes; a
+        // `cell.yaml` edit between the two must silently invalidate the
+        // record rather than let a check of the *previous* contract ride
+        // along as if it still applied.
+        let dir = all_never_cell_dir("stale");
+        let file = dir.join("cell.yaml");
+        crate::verify::run(&file, "local").expect("live-verify the all-never cell");
+        assert!(dir.join(".cell/source_check.json").is_file());
+
+        // Edit cell.yaml after the check ran — the record's digest no
+        // longer matches.
+        let mut yaml = std::fs::read_to_string(&file).unwrap();
+        yaml.push_str("description: added after the live check ran\n");
+        std::fs::write(&file, yaml).unwrap();
+
+        let out = dir.join("context.json");
+        emit(&file, "local", Some(&out))
+            .expect("emit must still succeed, just without the stale record");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            v["status"], "draft",
+            "a stale source-check record must not promote status: {v}"
+        );
+        assert!(
+            v["observed"].is_null(),
+            "a stale source-check record must be omitted entirely, not emitted stale: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

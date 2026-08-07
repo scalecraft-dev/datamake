@@ -149,7 +149,23 @@ pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
     let loaded = crate::config::load(file, profile)?;
     let conn = open_duckdb(loaded.bindings.gcs.as_ref())?;
     let scratch = new_scratch_dir(&loaded.def.cell)?;
-    let published = setup(&conn, &loaded.bindings, &loaded.dir, read_only, &scratch)?;
+    // Issue #6 (live-verify core): an all-`never` cell has no snapshot and
+    // never will — `run` refuses to build one (the check near the top of
+    // `run`, above). A read-only open (standalone `verify`/`context`) of one
+    // must not hard-require a catalog that can never come to exist; `setup`
+    // tolerates a missing/unpublished catalog for exactly this case,
+    // attaching no `lake` at all rather than failing. Every other cell keeps
+    // today's behavior: a missing catalog is still a hard failure — a
+    // snapshot-backed export genuinely has nothing to check without one.
+    let tolerate_missing_catalog = read_only && crate::config::is_all_never(&loaded.transforms);
+    let published = setup(
+        &conn,
+        &loaded.bindings,
+        &loaded.dir,
+        read_only,
+        &scratch,
+        tolerate_missing_catalog,
+    )?;
     Ok(Cell {
         def: loaded.def,
         conn,
@@ -165,12 +181,18 @@ pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
     })
 }
 
+/// `tolerate_missing_catalog` (issue #6): when set, a catalog that does not
+/// exist yet (direct-attach) or has never been published (published mode) is
+/// not an error — `lake` is simply left unattached. Set only for a read-only
+/// open of an all-`never` cell (see `open` above), which never reads or
+/// writes `lake` at all, so there is nothing lost by proceeding without it.
 fn setup(
     conn: &Connection,
     b: &ResolvedBindings,
     dir: &Path,
     read_only: bool,
     scratch: &Path,
+    tolerate_missing_catalog: bool,
 ) -> Result<Option<PublishedState>> {
     // INSTALL fetches the extension from the registry on first run (needs network).
     // SET TimeZone: DuckDB's session zone follows the OS locale by default, so
@@ -226,13 +248,24 @@ fn setup(
         Some(c) => {
             let catalog = resolve_catalog(c, dir)?;
             load_catalog_extension(conn, &catalog)?;
-            conn.execute_batch(&format!(
+            let attach = conn.execute_batch(&format!(
                 "ATTACH 'ducklake:{catalog}' AS lake (DATA_PATH '{storage}'{ro}); USE lake;"
-            ))
-            .with_context(|| {
-                format!("attaching DuckLake (catalog={catalog}, storage={storage})")
-            })?;
-            Ok(None)
+            ));
+            match attach {
+                Ok(()) => Ok(None),
+                Err(e) if tolerate_missing_catalog => {
+                    tracing::info!(
+                        catalog = %catalog, error = %e,
+                        "no catalog to attach yet for this all-`materialize: never` cell — \
+                         proceeding without `lake` (a virtual cell's live-verify checks never \
+                         read or write it; issue #6)"
+                    );
+                    Ok(None)
+                }
+                Err(e) => Err(e).with_context(|| {
+                    format!("attaching DuckLake (catalog={catalog}, storage={storage})")
+                }),
+            }
         }
         // Published-artifact mode (ADR 0004): the catalog derives from
         // `storage` — fetch the artifact `LATEST` names, attach a private
@@ -250,6 +283,19 @@ fn setup(
             let data_path = format!("{storage}/data");
             let (local, execution) = match store.latest()? {
                 Some(n) => (store.download_execution(n, scratch)?, Some(n)),
+                // Issue #6: an all-`never` cell's `verify` never publishes,
+                // so `catalog/LATEST` never comes to exist — proceed with no
+                // `lake` attached rather than the usual "run the Builder
+                // first" refusal, which would be permanently, not just
+                // currently, true for this cell.
+                None if tolerate_missing_catalog => {
+                    tracing::info!(
+                        storage = %storage,
+                        "no published catalog yet for this all-`materialize: never` cell — \
+                         proceeding without `lake` (issue #6)"
+                    );
+                    return Ok(None);
+                }
                 None if read_only => anyhow::bail!(
                     "no published catalog for this cell yet (no catalog/LATEST under \
                      {storage}) — run the Builder (`datamk run`) first"
@@ -610,38 +656,7 @@ pub fn run(
 
     // Sources are session-local TEMP VIEWs: visible to transforms, never committed
     // to the catalog.
-    connectors::prepare(&cell.sources, &cell.dir)?;
-    // View-backed connection sources (BigQuery views/materialized
-    // views/external tables): classification is batched at most once per
-    // (connection, dataset) for this whole run, built up front from every
-    // declared source.
-    let mut classify_cache = ClassifyCache::new(&cell.sources);
-    let mut advances: Vec<WatermarkAdvance> = Vec::new();
-    // One entry per declared source regardless of kind — the published run
-    // summary's `sources` array (design doc: persistent run logs + a
-    // published run-summary). Collected unconditionally; only used when
-    // `cell.published` is `Some` below (direct-attach mode skips writing
-    // the summary entirely — no `catalog/` prefix exists to write it under).
-    let mut source_infos: Vec<SourceRunInfo> = Vec::new();
-    for (i, (name, src)) in cell.sources.iter().enumerate() {
-        let outcome = bind_source(
-            &cell.conn,
-            i,
-            name,
-            src,
-            &cell.dir,
-            cell.s3.as_ref(),
-            cell.gcs.as_ref(),
-            &cell.scratch,
-            opts.full_refresh,
-            &mut classify_cache,
-            &cell.def.cell,
-        )?;
-        if let Some(adv) = outcome.advance {
-            advances.push(adv);
-        }
-        source_infos.push(outcome.info);
-    }
+    let (advances, source_infos) = bind_sources(&cell, opts.full_refresh)?;
 
     // The shrink detector (ADR 0005 §2 item 2): truncation (`CREATE OR REPLACE
     // ... FROM <incremental view>`) is idempotent and invisible to
@@ -1884,6 +1899,81 @@ fn bind_source(
     Ok(BindOutcome { advance, info })
 }
 
+/// Bind every declared source as a session TEMP VIEW: `connectors::prepare`
+/// (ADC/key-file setup, process-global and cheap) plus the per-source
+/// `bind_source` loop. Extracted from `run` (issue #6, live-verify core) so
+/// a standalone `datamk verify` can reuse the identical bind path for a
+/// never-backed export's live check rather than a second, drifting one —
+/// same sources, same connectors, same narration (including the ADR 0007 §4
+/// dry-run preflight's bytes-scanned line, which is how live verify's cost
+/// gets narrated: nothing new to build, `bind_source` already does it).
+///
+/// Returns each source's watermark advance — `run` persists these
+/// (`persist_watermarks`, inside its transaction, before COMMIT); a
+/// **dry pass never does**, which is exactly what makes this safe to call
+/// against a read-only-attached `lake` (standalone `verify` opens one) — and
+/// each source's `SourceRunInfo`, threaded into the published run summary by
+/// `run` and simply discarded by a dry pass with no summary to write.
+pub(crate) fn bind_sources(
+    cell: &Cell,
+    full_refresh: bool,
+) -> Result<(Vec<WatermarkAdvance>, Vec<SourceRunInfo>)> {
+    connectors::prepare(&cell.sources, &cell.dir)?;
+    // View-backed connection sources (BigQuery views/materialized
+    // views/external tables): classification is batched at most once per
+    // (connection, dataset) for this whole call, built up front from every
+    // declared source.
+    let mut classify_cache = ClassifyCache::new(&cell.sources);
+    let mut advances: Vec<WatermarkAdvance> = Vec::new();
+    let mut source_infos: Vec<SourceRunInfo> = Vec::new();
+    for (i, (name, src)) in cell.sources.iter().enumerate() {
+        let outcome = bind_source(
+            &cell.conn,
+            i,
+            name,
+            src,
+            &cell.dir,
+            cell.s3.as_ref(),
+            cell.gcs.as_ref(),
+            &cell.scratch,
+            full_refresh,
+            &mut classify_cache,
+            &cell.def.cell,
+        )?;
+        if let Some(adv) = outcome.advance {
+            advances.push(adv);
+        }
+        source_infos.push(outcome.info);
+    }
+    Ok((advances, source_infos))
+}
+
+/// Execute every `materialize: never` transform's SELECT as a session TEMP
+/// VIEW, in declared order — "run everything minus BEGIN/COMMIT/lake
+/// writes" (issue #6, live-verify core). Declared order is dependency
+/// order, the same assumption `run`'s transform loop already makes: a
+/// `never` transform may read a now-bound source (via `bind_sources`, called
+/// first by every caller of this), an already-materialized lake table (built
+/// by an earlier `datamk run` — a mixed cell's snapshot-backed exports are
+/// unaffected and checked against the lake exactly as today), or an earlier
+/// `never` view created in this same pass.
+///
+/// Materializing transforms (`replace`/`upsert`/`append`) are deliberately
+/// **not** re-run here: their output already exists in the lake (an
+/// all-`never` cell has none to begin with — `run` refuses to build one, so
+/// there is nothing this function could re-run for it even if it wanted to).
+/// Re-running them would be pure waste in the mixed-cell case and a second,
+/// un-transacted write attempt against a connection standalone `verify`
+/// opens read-only in the all-`never` case.
+pub(crate) fn dry_run_never_transforms(cell: &Cell) -> Result<()> {
+    for t in &cell.transforms {
+        if matches!(t.strategy, MaterializeStrategy::Never) {
+            execute_never(&cell.conn, &cell.dir, &t.sql, &t.table)?;
+        }
+    }
+    Ok(())
+}
+
 /// The classification-denied fallback's safety net: probe the real table
 /// read pre-BEGIN so a genuine view fails at bind (with a rewritten,
 /// actionable error), instead of mid-transaction — the exact prod failure
@@ -2201,7 +2291,7 @@ impl fmt::Display for MarkValue {
 
 /// One source's watermark advance, computed pre-BEGIN and threaded by `run`
 /// into the transform transaction for the actual persist (§1 step 5).
-struct WatermarkAdvance {
+pub(crate) struct WatermarkAdvance {
     source: String,
     cursor: String,
     ty: CursorType,

@@ -81,27 +81,94 @@ pub(crate) fn apply_declarative_grain_inheritance(
 }
 
 /// Verify a built cell against its declared interface (read-only).
+///
+/// A cell with any `materialize: never` export needs more than the plain
+/// read-only open above: standalone `verify` binds no sources and runs no
+/// transforms by default, so a never-backed export's session view (only
+/// ever created by `datamk run`, pre-DETACH — see `engine::run`) does not
+/// exist yet. Issue #6 (live-verify core): bind every declared source
+/// exactly as `run` would (`engine::bind_sources`), then dry-run just the
+/// `never` transforms as session views, in declared order
+/// (`engine::dry_run_never_transforms`) — "run everything minus
+/// BEGIN/COMMIT/lake writes." Materializing transforms are never re-run: in
+/// a mixed cell their tables already exist in `lake`, checked there exactly
+/// as before. Skipped entirely for a cell with no never-backed exports — a
+/// snapshot-only cell's verify pays no network round trip (and no billed
+/// dry-run scan, ADR 0007 §4) it has never paid before.
+///
+/// On success, when a live check ran, `datamk context`'s
+/// `observed.source_check` needs a persisted record — `verify` and
+/// `context` are separate processes in CI, so the fact that a live check
+/// passed does not otherwise survive past this process exiting. Written to
+/// `.cell/source_check.json` (sibling of `.cell/published.json`, same
+/// serialization style), stamped with the current `cell.yaml` digest so a
+/// stale record (the config changed since this check ran) is detectable and
+/// silently omitted rather than misapplied — see `context::emit`.
 pub fn run(file: &Path, profile: &str) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
     let never_tables = crate::config::never_backed_tables(&cell.transforms);
-    check(&cell.conn, &cell.def, &never_tables)
+    if !never_tables.is_empty() {
+        engine::bind_sources(&cell, false)
+            .context("binding sources for live verify of materialize: never exports (issue #6)")?;
+        engine::dry_run_never_transforms(&cell)
+            .context("dry-running materialize: never transforms for live verify (issue #6)")?;
+    }
+    check(&cell.conn, &cell.def, &never_tables)?;
+    if !never_tables.is_empty() {
+        write_source_check_record(file, &cell.dir)
+            .context("writing the live-verify source-check record (.cell/source_check.json)")?;
+    }
+    Ok(())
+}
+
+/// Persist the live-verify source-check record (issue #6): outcome, when,
+/// which `datamk` built it, and the `cell.yaml` digest at check time — the
+/// same digest `datamk context` computes for `cell_yaml_digest`, so
+/// `context::emit` can tell a fresh record from a stale one without
+/// re-deriving anything. `outcome` is `"passed"` by construction, same
+/// discipline as `RunSummary.verify_outcome`: `check` above already bailed
+/// on any failure, so this only ever runs after every check passed.
+/// `data_as_of` stays `None` in this slice — no connector currently threads
+/// a cheap, truthful "as of" timestamp out of the bind path; fabricating one
+/// (or defaulting it to `checked_at`) is exactly what ADR 0012 §2 forbids.
+fn write_source_check_record(file: &Path, dir: &Path) -> Result<()> {
+    let path = dir.join(".cell").join("source_check.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let cell_yaml_digest = crate::context::sha256_hex(
+        &std::fs::read(file).with_context(|| format!("reading {}", file.display()))?,
+    );
+    let record = crate::manifest::SourceCheckRecord {
+        outcome: "passed".to_string(),
+        checked_at: crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()),
+        data_as_of: None,
+        datamk_version: env!("CARGO_PKG_VERSION").to_string(),
+        cell_yaml_digest,
+    };
+    std::fs::write(&path, serde_json::to_string_pretty(&record)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    tracing::info!(path = %path.display(), "live-verify source-check recorded");
+    Ok(())
 }
 
 /// The interface must not lie: every declared column must exist with a compatible
 /// type, and every declared grain must exist and be unique in the actual output.
 ///
 /// `never_tables` (issue #6): the set of `materialize: never` table names.
-/// Their session view exists only inside `datamk run` (bound by
-/// `execute_never`, pre-DETACH) — a standalone `datamk verify` opens no
-/// sources and runs no transforms (`engine::open` alone), so that view is
-/// absent from its session. Rather than let that surface as DuckDB's raw
-/// "table does not exist" (confusing, and indistinguishable from a genuinely
-/// broken cell), a never-backed export with no live binding here is skipped
-/// with an honest note: not verified, not broken — verified automatically as
-/// part of `datamk run`, which binds it before checking (see
-/// `crate::engine::run`, called at the same seam). Live-warehouse rebinding
-/// for a standalone check is tracked separately (issue #6 §Q1/Q4), not built
-/// here.
+/// Their session view is bound by `execute_never` — inside `datamk run`,
+/// pre-DETACH; inside a standalone `datamk verify`, by the live-verify bind
+/// pass at the top of `run` above (`engine::bind_sources` +
+/// `engine::dry_run_never_transforms`) — so by the time `check` runs here,
+/// every never-backed export named in `never_tables` is expected to already
+/// have a live view. `never_tables` exists only to make a missing one's
+/// error legible: describing a genuinely absent relation is otherwise
+/// indistinguishable from DuckDB's raw "table does not exist" regardless of
+/// cause, which is confusing for a strategy whose whole point is "no table,
+/// on purpose." A describe failure for a name in this set names the
+/// strategy and where the binding was supposed to happen instead of leaving
+/// the caller to guess.
 pub fn check(conn: &Connection, def: &CellDef, never_tables: &HashSet<String>) -> Result<()> {
     // ADR 0005 §1: `__datamk_` is a reserved, enforced namespace — a table
     // matching it other than the watermark table itself is refused before
@@ -121,13 +188,17 @@ pub fn check(conn: &Connection, def: &CellDef, never_tables: &HashSet<String>) -
         let actual = match describe(conn, source) {
             Ok(actual) => actual,
             Err(e) if never_tables.contains(source) => {
-                tracing::info!(
-                    export = %export.name, source, error = %e,
-                    "materialize: never — no live binding in this session (only bound during \
-                     `datamk run`, pre-DETACH); skipping. Not broken — verified automatically \
-                     as part of `datamk run`."
-                );
-                continue;
+                return Err(e).with_context(|| {
+                    format!(
+                        "export '{}': materialize: never — no live binding for '{source}' in \
+                         this session. Inside `datamk run`, `execute_never` binds this pre-\
+                         DETACH; inside standalone `datamk verify`, the live-verify bind pass \
+                         (issue #6) does — this failure means that pass didn't leave a '{source}' \
+                         view behind (a broken/renamed transform file, or no `never` transform \
+                         producing this table at all)",
+                        export.name
+                    )
+                })
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -874,19 +945,26 @@ interface:
     // --- issue #6: `materialize: never` and standalone `check` --------------
 
     #[test]
-    fn check_skips_a_never_backed_export_with_no_live_binding_instead_of_erroring() {
-        // The session standalone `datamk verify` opens has no `virtual_pii`
-        // relation at all (no `run` ever bound it) — `check` must not
-        // surface DuckDB's raw "table does not exist" for a table this
-        // strategy legitimately never creates outside a run.
+    fn check_names_the_strategy_when_a_never_backed_export_has_no_live_binding() {
+        // Issue #6 (live-verify core): `check` no longer silently skips a
+        // never-backed export with no live view — every caller (`run`,
+        // standalone `verify`) is now responsible for binding it first, so a
+        // missing view here is a genuine failure of that binding pass, not
+        // an expected absence. The error must still be legible, though — it
+        // names the strategy and where binding should have happened rather
+        // than surfacing DuckDB's raw "table does not exist".
         let (conn, _dir) = attach_lake("never-no-binding");
         let def: CellDef = serde_yaml::from_str(
             "cell: t\ninterface:\n  - name: virtual_pii\n    version: 1.0.0\n",
         )
         .unwrap();
         let never_tables: HashSet<String> = ["virtual_pii".to_string()].into_iter().collect();
-        check(&conn, &def, &never_tables)
-            .expect("a never-backed export with no live binding must be skipped, not errored");
+        let err = check(&conn, &def, &never_tables).unwrap_err().to_string();
+        assert!(
+            err.contains("materialize: never") && err.contains("no live binding"),
+            "a missing never-backed view must name the strategy and the gap, not just DuckDB's \
+             raw error: got {err}"
+        );
     }
 
     #[test]
@@ -911,6 +989,155 @@ interface:
             err.contains("is not unique"),
             "a bound never-backed view's grain violation must still be caught: got {err}"
         );
+    }
+
+    // --- issue #6, live-verify core: standalone `verify::run` end-to-end ----
+
+    /// A fresh, on-disk cell dir with `tag` keeping parallel tests apart —
+    /// the `release.rs` test pattern (a real `cell.yaml`/`profiles/local.yaml`
+    /// on disk, driven through the public command functions), used here
+    /// because the live-verify bind pass needs a real `config::load` +
+    /// `engine::open`, not the in-memory `attach_lake` fixture the `check`
+    /// unit tests above use.
+    fn live_verify_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-live-verify-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn write_csv(dir: &Path, name: &str, rows: &[(i64, &str)]) {
+        let mut body = "id,val\n".to_string();
+        for (id, val) in rows {
+            body.push_str(&format!("{id},{val}\n"));
+        }
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn standalone_verify_on_an_all_never_cell_binds_live_and_catches_a_broken_grain() {
+        // Issue #6: an all-`never` cell has no snapshot and can never build
+        // one (`run` refuses) — this is the case the whole live-verify slice
+        // exists for. Standalone `verify::run` must bind `data.csv` as a
+        // live source, dry-run the `never` transform as a session view, and
+        // run the real schema+grain checks against it — not skip.
+        let dir = live_verify_dir("all-never-clean");
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: virtual_only\n\
+             transforms:\n\
+             \x20 - sql: sql/virtual_pii.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: virtual_pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM raw").unwrap();
+        write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
+
+        let file = dir.join("cell.yaml");
+        run(&file, "local").expect("live-verify of a clean all-never cell must pass");
+        assert!(
+            dir.join(".cell/source_check.json").is_file(),
+            "a passing live check must leave a .cell/source_check.json record behind"
+        );
+
+        // Now break the grain at the source and confirm the live check
+        // actually catches it — not a stale skip, a real, running check.
+        write_csv(&dir, "data.csv", &[(1, "a"), (1, "b")]);
+        let err = run(&file, "local").unwrap_err().to_string();
+        assert!(
+            err.contains("is not unique"),
+            "a broken grain at the live source must fail verify with the usual grain-violation \
+             voice: got {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standalone_verify_on_a_mixed_cell_checks_the_never_export_live_and_the_materialized_export_against_the_lake(
+    ) {
+        // Issue #6: a mixed cell (one materializing transform, one `never`
+        // transform) must have BOTH halves checked by a standalone verify —
+        // the materialized export against the lake, exactly as before, and
+        // the never-backed export live, freshly bound.
+        let dir = live_verify_dir("mixed");
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: mixed\n\
+             transforms:\n\
+             \x20 - sql: sql/stg.sql\n\
+             \x20   materialize: replace\n\
+             \x20 - sql: sql/virtual_pii.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: stg\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20 - name: virtual_pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sql/stg.sql"), "SELECT * FROM raw").unwrap();
+        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM raw").unwrap();
+        write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
+
+        let file = dir.join("cell.yaml");
+        // The materializing half needs a real build first — unlike the
+        // all-never case, `run` does not refuse a mixed cell, and the
+        // materialized export genuinely has nothing to check without one.
+        crate::engine::run(&file, "local", None, crate::engine::RunOptions::default())
+            .expect("build the mixed cell");
+        run(&file, "local").expect("live-verify of a clean mixed cell must pass");
+
+        // Break the never-backed export live (the source, re-read fresh on
+        // every verify) without touching the lake at all.
+        write_csv(&dir, "data.csv", &[(1, "a"), (1, "b")]);
+        let err = run(&file, "local").unwrap_err().to_string();
+        assert!(
+            err.contains("export 'virtual_pii'") && err.contains("is not unique"),
+            "the never-backed export's live grain violation must be caught: got {err}"
+        );
+
+        // Restore the source, then corrupt the MATERIALIZED table directly
+        // in the lake (not through a transform — pinning that a standalone
+        // verify still checks the lake for the materializing half, exactly
+        // as it did before this feature).
+        write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
+        let cell = crate::engine::open(&file, "local", false)
+            .expect("re-open the lake, writable, to corrupt it directly");
+        cell.conn
+            .execute_batch("INSERT INTO stg VALUES (1, 'dup');")
+            .expect("insert a duplicate key directly into the materialized table");
+        drop(cell);
+        let err = run(&file, "local").unwrap_err().to_string();
+        assert!(
+            err.contains("export 'stg'") && err.contains("is not unique"),
+            "the materialized export's grain violation must still be caught against the lake: \
+             got {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- ADR 0008 decision 5: the no-grain warning as the removed-entry -----
