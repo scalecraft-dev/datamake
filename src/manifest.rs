@@ -23,6 +23,12 @@ pub struct Published {
     /// meaning-edits are the exact betrayal ARCHITECTURE.md §141-143 names.
     #[serde(default)]
     pub descriptions: BTreeMap<String, String>,
+    /// target (`"cell"` or route key) -> docs page fingerprint (ADR 0013 §5):
+    /// computed at release time from the same pages `declared.docs` names,
+    /// carried into `observed.docs` by both `serve` and `datamk context`.
+    /// Defaults keep pre-ADR-0013 manifests parsing.
+    #[serde(default)]
+    pub docs: BTreeMap<String, crate::context::DocsFingerprint>,
 }
 
 impl Published {

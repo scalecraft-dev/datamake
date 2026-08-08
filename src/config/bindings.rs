@@ -626,6 +626,7 @@ mod tests {
         CellDef {
             cell: "c".to_string(),
             description: None,
+            docs: None,
             sources,
             transforms: vec![],
             interface: vec![] as Vec<Export>,
@@ -1453,6 +1454,7 @@ mod tests {
         let def = CellDef {
             cell: "c".into(),
             description: None,
+            docs: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![] as Vec<Export>,
@@ -1489,6 +1491,7 @@ mod tests {
         let def = CellDef {
             cell: "c".into(),
             description: None,
+            docs: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![] as Vec<Export>,

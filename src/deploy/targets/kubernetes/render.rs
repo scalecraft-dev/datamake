@@ -260,6 +260,10 @@ fn render_configmap(input: &RenderInput) -> Result<ConfigMap> {
 fn artifact_files(art: &CellArtifact) -> Vec<&ArtifactFile> {
     let mut files = vec![&art.cell_yaml];
     files.extend(art.sql.iter());
+    // ADR 0013 §9: docs pages ship in the same ConfigMap as cell.yaml and
+    // the transform SQL — no independent lifecycle, and their sanitized
+    // keys go through the same collision guard below.
+    files.extend(art.docs.iter());
     if let Some(pin) = &art.published {
         files.push(pin);
     }
