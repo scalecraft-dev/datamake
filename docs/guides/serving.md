@@ -30,6 +30,30 @@ projections, no `order_by`, on this socket, in any version. A consumer that
 needs real SQL should attach the storage plane read-only (`datamk attach`)
 and run it with its own engine, credentials, and bill.
 
+## `/context`'s query grammar is closed too (ADR 0013)
+
+`GET /context` accepts exactly one query parameter:
+
+- **`include`** — a comma-separated list drawn from a closed vocabulary
+  (today: `docs`). `?include=docs` inlines every declared docs page's
+  content into the response; omit it for the default document (identity
+  and measurements only, no page content).
+
+Any other parameter name, an unrecognized `include` token, or an empty
+value (`?include=` or a trailing comma) is **400** — the same
+never-silently-ignored discipline as the data door. `?include=docs` on a
+cell with no `docs:` fields is a normal **200** with an empty `docs: {}`,
+not an error.
+
+The two variants carry different `ETag`s (the docs variant appends a
+content-hash suffix) so caching and `If-None-Match` work correctly per
+variant; `X-Datamk-Context-Digest`, `/openapi.json`'s `info.version`, and
+the mesh manifest's `context_digest` all stay pinned to the plain interface
+digest regardless of which variant produced them. Both `/context` and
+`/openapi.json` now send `Cache-Control: private` — `authorize()` is
+all-or-nothing, and a shared cache keyed on URI alone could otherwise hand
+a cached 200 to a caller with no token.
+
 ## Throttling
 
 `serve` applies one global concurrency cap (`--max-concurrency`, default

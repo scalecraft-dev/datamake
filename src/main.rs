@@ -99,7 +99,7 @@ async fn dispatch(command: Command) -> Result<()> {
         }
         Command::Status(a) => ops::status(&a.file, &a.profile),
         Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution, a.download),
-        Command::Context(a) => context::emit(&a.file, &a.profile, a.out.as_deref()),
+        Command::Context(a) => context::emit(&a.file, &a.profile, a.out.as_deref(), a.no_docs),
         Command::Mesh(a) => match a.command {
             cli::MeshCommand::Emit(e) => mesh::emit(
                 e.cells.as_deref(),

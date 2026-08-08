@@ -160,7 +160,10 @@ pub fn check(conn: &Connection, def: &CellDef) -> Result<()> {
 /// carry a non-empty description — friction lands exactly on the deliberate
 /// promotion gesture, and nowhere else. Pure contract fact, checked on every
 /// run/verify; a supported export an agent cannot orient on is a promotion
-/// that didn't finish.
+/// that didn't finish. ADR 0013 extends the message rather than adding a
+/// second check: a `docs:` page is additive prose, never a substitute — an
+/// agent reads `description` before it ever fetches a page, so `docs:`
+/// alone does not satisfy this lint. Setting both is correct, not an error.
 fn check_supported_have_descriptions(def: &CellDef) -> Result<()> {
     for export in &def.interface {
         if export.contract == crate::config::Contract::Supported
@@ -170,10 +173,11 @@ fn check_supported_have_descriptions(def: &CellDef) -> Result<()> {
                 .is_none_or(|d| d.trim().is_empty())
         {
             bail!(
-                "export '{}': `contract: supported` requires a non-empty `description` — \
-                 one or two sentences saying what one row means (ADR 0012 §3). Supported is \
-                 the deliberate promotion gesture; a supported export without meaning is a \
-                 promotion that didn't finish.",
+                "export '{}': `contract: supported` requires a non-empty `description` — a \
+                 `docs:` page does not satisfy it. One or two sentences: what one row means \
+                 (ADR 0012 §3). Supported is the deliberate promotion gesture; a supported \
+                 export without meaning is a promotion that didn't finish. Agents read \
+                 `description` before they fetch a page.",
                 export.name
             );
         }
@@ -555,6 +559,31 @@ interface:
             check_supported_have_descriptions(&def).is_err(),
             "whitespace-only description must not satisfy the lint"
         );
+    }
+
+    /// ADR 0013: `docs:` is additive, never a substitute — a supported
+    /// export with a `docs:` page but no `description` still fails the
+    /// lint, and the message says so explicitly.
+    #[test]
+    fn docs_page_does_not_satisfy_the_supported_description_lint() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    contract: supported\n    docs: docs/e.md\n",
+        )
+        .unwrap();
+        let err = check_supported_have_descriptions(&def)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a `docs:` page does not satisfy it"),
+            "got: {err}"
+        );
+
+        // Setting both is correct, not an error.
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    contract: supported\n    description: One row per thing.\n    docs: docs/e.md\n",
+        )
+        .unwrap();
+        check_supported_have_descriptions(&def).expect("description + docs together must pass");
     }
 
     #[test]

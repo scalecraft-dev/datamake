@@ -10,8 +10,9 @@ machine-readable — what `/openapi.json` is to an API, this is to a data
 product. It carries the schema *with meaning*, the exact query grammar the
 endpoint accepts, measurements probed from the real rows, and the build
 provenance that says whether the numbers can be trusted. An agent orients
-itself in one request; where the data can't be trusted yet, the document says
-so instead of letting the agent guess.
+itself in one request — one that can optionally carry the cell's long-form
+docs pages too (`?include=docs`, below) — where the data can't be trusted
+yet, the document says so instead of letting the agent guess.
 
 There is nothing separate to adopt or maintain. The document is a projection
 of the cell: write the cell and the context exists; build the cell and it
@@ -42,7 +43,9 @@ X-Datamk-Execution: 47                # published mode: the rows moved under you
 ```
 
 The digest is also `/context`'s `ETag` (send `If-None-Match` to get a 304)
-and `/openapi.json`'s `info.version`.
+and `/openapi.json`'s `info.version`. Requesting `?include=docs` (below)
+gets its own `ETag` variant, so caching stays correct per variant; the
+digest itself never moves for a prose-only change.
 
 ## What's inside
 
@@ -180,7 +183,87 @@ drift:
    release — a change in meaning is a MAJOR change.
 4. An export promoted to `contract: supported` **must** carry a non-empty
    description — `verify` fails otherwise. Friction lands exactly on the
-   deliberate promotion gesture; experimental exports need nothing.
+   deliberate promotion gesture; experimental exports need nothing. A
+   `docs:` page (below) does **not** satisfy this — an agent reads
+   `description` before it ever fetches a page.
+
+## Long-form docs pages
+
+The four meaning fields above are capped at a sentence or two on purpose —
+they're orientation, not documentation. When there's genuinely more to say
+(*why* a column behaves the way it does, not just what it's called), point
+at one long-form page per level, cell and export, additive to `description`:
+
+```yaml
+cell: orders
+description: Daily order revenue by region.
+docs: docs/overview.md                              # cell-level, optional
+
+interface:
+  - name: orders_daily
+    version: 2.1.0
+    description: One row per (order_date, region) with the summed order revenue.
+    docs: docs/orders_daily.md                       # export-level, optional
+```
+
+One relative path per level — no lists, no globs, no per-column docs, no
+remote URLs. Each page is capped at 64 KiB, 256 KiB total across the cell
+(the Kubernetes ConfigMap that ships cell content to a deployed Server is
+capped at 1 MiB, shared with `cell.yaml` and every transform's SQL) — an
+oversized, unreadable, empty, or non-UTF-8 page is a hard error at parse
+time, never a silent truncation.
+
+**There is no `/docs/:name` route.** Docs are delivered inline in the
+context document, on request:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://orders.data.internal/context?include=docs"
+```
+
+```json
+{
+  "...": "... every field the default document has, plus:",
+  "included": ["docs"],
+  "docs": {
+    "cell": {
+      "media_type": "text/markdown; charset=utf-8",
+      "content": "# Orders\n\n..."
+    },
+    "orders_daily@2": {
+      "media_type": "text/markdown; charset=utf-8",
+      "content": "# Orders daily\n\n..."
+    }
+  }
+}
+```
+
+The default `GET /context` (no `include`) never carries page content — only
+`declared.docs`, the identity of every declared page (`{target, path,
+media_type}`, no bytes) and `declared.include_request`, the affordance
+telling an agent how to ask for the rest. `included` is always present
+(`[]` on the default document, `["docs"]` once inlined) so an agent can
+tell "this server predates docs pages" (the field is absent) from "this
+cell just has none" (present, `docs` is `{}`). `?include=docs` on a
+docs-less cell is a normal **200** with empty pages, not an error.
+
+Docs content never moves `interface_digest` (the `ETag` on the default
+document, `/openapi.json`'s `info.version`, and the mesh manifest's
+`context_digest`) — a prose edit is not an interface change. Adding,
+removing, or renaming a declared page *is* an interface change (a new
+affordance to fetch, or one that's gone), so it does move the digest. The
+docs-inlined response carries its own `ETag`
+(`"<digest>~docs.<content hash>"`) so caching still works correctly per
+variant.
+
+Docs pages fold into the same anti-rot ratchet as the four meaning fields:
+they ship in the deploy artifact and move `content_hash` (a docs-only edit
+rolls the workload, the same as a schema edit), and `datamk release`'s
+meaning digest folds in docs content too, so editing only a page still
+draws the "changed meaning without a version bump" warning. See
+`docs/adr/0013-long-form-docs-pages.md` for the full design, including the
+path-resolution security story (the profile Secret mounts *inside* the
+cell directory, so "resolves under the cell dir" alone isn't a safe check).
 
 ## Point an agent at it
 
@@ -194,7 +277,9 @@ The document is designed to be an agent's first fetch. Three ways in:
   the agent's context (or commit it next to the consuming code). The
   portable artifact stamps `emitted_at` and a digest of the `cell.yaml` it
   came from, and never carries poll telemetry that would be stale the moment
-  the file is written.
+  the file is written. Unlike the served door, it inlines docs pages **by
+  default** (a file can't be re-requested with `?include=docs` the way a
+  live endpoint can); pass `--no-docs` for identity and fingerprints only.
 - **A fleet of cells**: emit a mesh manifest (below) so the agent can find
   *which* cell answers its question before making a single authenticated
   call.
@@ -218,8 +303,10 @@ The data routes are simply not mounted (404, not 403 — no door, no
 implication of one), while `/context` still serves the full declared meaning
 plus the aggregate measurements (row counts, date coverage). Row-derived
 value lists and example requests are withheld — shipping them would leak a
-projection of the withheld rows. Tell consumers where rows actually live via
-the profile:
+projection of the withheld rows. Docs pages stay available (`?include=docs`
+works exactly as it does with data mounted) — they're author-written prose,
+not derived from any row, and are exactly the orientation this mode's agents
+need most. Tell consumers where rows actually live via the profile:
 
 ```yaml
 # profiles/prod.yaml — environment, never cell.yaml

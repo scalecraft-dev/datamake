@@ -185,8 +185,17 @@ fn census_entries(prefix: &str, url_template: Option<&str>) -> Result<Vec<CellEn
 /// GET `<url>/context`. Returns the parsed document and the ETag (the
 /// interface digest). Best-effort: any failure returns `None` with a
 /// warning, and the manifest entry stays `{name, url}` — never fabricated.
+/// The `/context` endpoint the emitter fetches — a pure helper, split out so
+/// it's unit-testable without a network call. Carries no query string, ever
+/// (ADR 0013 §7): the mesh emitter gets nothing from the `include=docs`
+/// feature — no docs, no flag — so this asserts by construction what was
+/// previously guaranteed only by nobody having typed one.
+fn context_endpoint(url: &str) -> String {
+    format!("{}/context", url.trim_end_matches('/'))
+}
+
 fn fetch_context(url: &str, bearer: Option<&str>) -> Option<(serde_json::Value, Option<String>)> {
-    let endpoint = format!("{}/context", url.trim_end_matches('/'));
+    let endpoint = context_endpoint(url);
     let mut req = ureq::get(&endpoint);
     if let Some(t) = bearer {
         req = req.set("authorization", &format!("Bearer {t}"));
@@ -311,6 +320,24 @@ mod tests {
             "unknown version must not be copied"
         );
         assert!(cell.exports.is_empty());
+    }
+
+    /// ADR 0013 §7: the mesh emitter gets nothing from the docs feature — no
+    /// docs, no flag — so its fetch URL must never carry a query string.
+    #[test]
+    fn context_endpoint_never_carries_a_query_string() {
+        assert_eq!(
+            context_endpoint("https://orders.data.internal"),
+            "https://orders.data.internal/context"
+        );
+        assert_eq!(
+            context_endpoint("https://orders.data.internal/"),
+            "https://orders.data.internal/context",
+            "a trailing slash must not double up"
+        );
+        for url in ["https://a.example", "https://b.example/"] {
+            assert!(!context_endpoint(url).contains('?'), "{url}");
+        }
     }
 
     /// The manifest is a closed shape — a consumer rejects unknown fields
