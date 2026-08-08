@@ -48,6 +48,23 @@ pub struct SourceRunInfo {
     /// From the ADR 0007 §4 dry-run preflight where one ran (`query:`
     /// sources only, today) — `None` for everything else, not zero.
     pub bytes_scanned: Option<i64>,
+    /// Cell sources only (issue #7): the upstream execution actually
+    /// attached — `Some` only in published mode (a floating pin resolves
+    /// whatever `catalog/LATEST` names, and this is what it resolved to);
+    /// `None` for direct-attach cell sources (no execution number exists to
+    /// report) and for every non-cell source. `#[serde(skip...)]` so a
+    /// summary with nothing to say here is byte-identical to one written
+    /// before this field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<u64>,
+    /// Cell sources only: the attached snapshot's `snapshot_time` — scoped
+    /// to the pinned version when the source declares one, else the
+    /// upstream's newest. Read from the just-attached catalog
+    /// (`ducklake_snapshots`), never the upstream's own run summary (that's
+    /// denormalized narration, never truth). Best-effort: `None` when it
+    /// couldn't be read cheaply, never fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_as_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +92,8 @@ mod tests {
                     kind: Some("query".to_string()),
                     staged_rows: Some(1234),
                     bytes_scanned: Some(987_654),
+                    execution: None,
+                    data_as_of: None,
                 },
                 SourceRunInfo {
                     name: "raw_orders".to_string(),
@@ -82,6 +101,8 @@ mod tests {
                     kind: None,
                     staged_rows: None,
                     bytes_scanned: None,
+                    execution: None,
+                    data_as_of: None,
                 },
             ],
             transforms: vec![TransformRunInfo {
@@ -136,6 +157,38 @@ mod tests {
         assert_eq!(parsed.sources.len(), summary.sources.len());
         assert_eq!(parsed.sources[0].bytes_scanned, Some(987_654));
         assert_eq!(parsed.sources[1].kind, None);
+    }
+
+    /// Issue #7: a cell source's `execution`/`data_as_of` serialize when
+    /// present, and stay entirely absent (not `null`) when not — the
+    /// additive-field contract the golden test above pins for the
+    /// already-published fields.
+    #[test]
+    fn source_run_info_carries_upstream_execution_and_data_as_of_when_present() {
+        let info = SourceRunInfo {
+            name: "upstream_flights".to_string(),
+            connection: None,
+            kind: None,
+            staged_rows: None,
+            bytes_scanned: None,
+            execution: Some(41),
+            data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains(r#""execution":41"#), "{json}");
+        assert!(
+            json.contains(r#""data_as_of":"2026-08-04 06:00:11+00""#),
+            "{json}"
+        );
+
+        let absent = SourceRunInfo {
+            execution: None,
+            data_as_of: None,
+            ..info
+        };
+        let json = serde_json::to_string(&absent).unwrap();
+        assert!(!json.contains("execution"), "{json}");
+        assert!(!json.contains("data_as_of"), "{json}");
     }
 
     /// Defense in depth against a future field addition leaking
