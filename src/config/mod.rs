@@ -1,6 +1,12 @@
 mod bindings;
 mod connections; // per-connector config shapes (`connections::bigquery`, …)
 pub mod deploy; // DeployConfig/Target; read only by the deploy command (Phase 3 wires it)
+/// Long-form `docs:` pages (ADR 0013): path resolution, caps, and page
+/// loading. `pub(crate)` (not re-exported through the flat `pub use` list
+/// below) — consumers reach it as `crate::config::docs::…`, mirroring
+/// `deploy`'s own module-path style rather than adding another dozen names
+/// to the flat re-export list.
+pub(crate) mod docs;
 mod schema;
 
 use anyhow::Result;

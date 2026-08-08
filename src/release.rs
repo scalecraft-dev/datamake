@@ -25,6 +25,25 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     // `published.json` directly must not see a route implying a lake table.
     let never_tables = crate::config::never_backed_tables(&cell.transforms);
 
+    // ADR 0013 §5: docs fingerprints are a release-time fact, computed here
+    // (not at config-load time — that would populate `observed.docs` on
+    // every never-built cell) for the cell plus every discoverable export
+    // that declares `docs:`, regardless of contract — the same route list
+    // `declared.docs`/`context::declared` derive from, so identity and
+    // fingerprint never disagree on what a "target" is.
+    let doc_routes = crate::context::discoverable_routes(&cell.def)?;
+    let docs_pages = crate::config::docs::load_declared(&cell.dir, &cell.def, &doc_routes)?;
+    let mut docs = BTreeMap::new();
+    for page in &docs_pages {
+        docs.insert(
+            page.target.clone(),
+            crate::context::DocsFingerprint {
+                sha256: page.sha256.clone(),
+                bytes: page.bytes,
+            },
+        );
+    }
+
     let mut routes = BTreeMap::new();
     let mut versions = BTreeMap::new();
     let mut descriptions = BTreeMap::new();
@@ -43,7 +62,11 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
         let route = export.route()?;
         routes.insert(route.clone(), snapshot);
         versions.insert(route.clone(), export.version.clone());
-        descriptions.insert(route, description_digest(export));
+        let docs_content = docs_pages
+            .iter()
+            .find(|p| p.target == route)
+            .map(|p| p.content.as_ref());
+        descriptions.insert(route, description_digest(export, docs_content));
     }
     if routes.is_empty() {
         tracing::warn!("no exports marked 'contract: supported'; nothing to pin");
@@ -80,6 +103,7 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
         routes,
         versions,
         descriptions,
+        docs,
     };
     std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -88,11 +112,15 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     Ok(())
 }
 
-/// Digest of an export's meaning prose: its description plus every column's
-/// unit and description, in declared order. Types and grain are versioned by
-/// the schema itself; this digest tracks exactly the fields the ADR 0012 §3
-/// ratchet exists to guard — the ones `verify` cannot check against rows.
-fn description_digest(export: &crate::config::Export) -> String {
+/// Digest of an export's meaning prose: its description, every column's unit
+/// and description, and (ADR 0013 §9) its docs page content, in declared
+/// order. Types and grain are versioned by the schema itself; this digest
+/// tracks exactly the fields the ADR 0012 §3 ratchet exists to guard — the
+/// ones `verify` cannot check against rows. Folding in docs content means a
+/// prose-only edit to a page still draws the "changed meaning without a
+/// version bump" warning at the next release — setting both `description`
+/// and `docs:` is correct, not an error, and both are meaning.
+fn description_digest(export: &crate::config::Export, docs_content: Option<&str>) -> String {
     let mut input = String::new();
     input.push_str(export.description.as_deref().unwrap_or(""));
     for (col, spec) in &export.schema {
@@ -103,6 +131,8 @@ fn description_digest(export: &crate::config::Export) -> String {
         input.push('\u{1f}');
         input.push_str(spec.description.as_deref().unwrap_or(""));
     }
+    input.push('\u{1f}');
+    input.push_str(docs_content.unwrap_or(""));
     crate::context::sha256_hex(input.as_bytes())
 }
 
@@ -217,15 +247,33 @@ mod tests {
     // prose — export description and per-column unit/description.
     #[test]
     fn description_digest_moves_with_meaning_and_only_meaning() {
-        let base = description_digest(&export(Some("A row."), None));
-        assert_eq!(base, description_digest(&export(Some("A row."), None)));
-        assert_ne!(
+        let base = description_digest(&export(Some("A row."), None), None);
+        assert_eq!(
             base,
-            description_digest(&export(Some("A different row."), None))
+            description_digest(&export(Some("A row."), None), None)
         );
         assert_ne!(
             base,
-            description_digest(&export(Some("A row."), Some("Gross.")))
+            description_digest(&export(Some("A different row."), None), None)
+        );
+        assert_ne!(
+            base,
+            description_digest(&export(Some("A row."), Some("Gross.")), None)
+        );
+    }
+
+    // ADR 0013 §9: docs page content folds into the same digest, so editing
+    // only a docs page (description and version both unchanged) still draws
+    // the "changed meaning without a version bump" warning.
+    #[test]
+    fn description_digest_moves_with_docs_content_too() {
+        let e = export(Some("A row."), None);
+        let base = description_digest(&e, None);
+        assert_eq!(base, description_digest(&e, Some("")));
+        assert_ne!(
+            base,
+            description_digest(&e, Some("Some long-form prose.")),
+            "editing docs content alone must move the digest"
         );
     }
 }

@@ -90,6 +90,22 @@ struct AppState {
     /// on the poller thread, never on the request path; omitted pieces stay
     /// omitted rather than blocking serving.
     probes: Mutex<indexmap::IndexMap<String, crate::context::ExportProbe>>,
+    /// Loaded docs pages (ADR 0013): content read exactly once, at startup —
+    /// the mount is immutable for the life of the process, so unlike probes
+    /// this needs no poller re-computation. Handlers must never touch the
+    /// filesystem; this cache (and `docs_fingerprints`/`docs_etag_suffix`
+    /// below) is what makes that true.
+    docs_pages: Vec<crate::config::docs::DocsPage>,
+    /// Docs page fingerprints (ADR 0013 §5), read from `published.json` at
+    /// startup — a release-time fact, never recomputed from the live files
+    /// (which would tie `observed.docs` to "what's on disk right now"
+    /// instead of "what a release verified").
+    docs_fingerprints: indexmap::IndexMap<String, crate::context::DocsFingerprint>,
+    /// The docs-variant `ETag` suffix (ADR 0013 §6): a hash over `docs_pages`'
+    /// sha256s in declared order, precomputed at startup — never on the
+    /// request path. `"<interface_digest>~docs.<this>"` is the docs-variant
+    /// ETag; the plain digest (no suffix) is the default variant's.
+    docs_bundle_sha12: String,
 }
 
 #[derive(Default, Clone)]
@@ -274,6 +290,20 @@ fn build_state(
         /* include_values */ data_mounted,
     );
 
+    // ADR 0013: docs pages read exactly once, at startup — content for the
+    // `?include=docs` door and the bundle sha the docs-variant ETag hashes
+    // over. An unreadable/oversized/empty/non-UTF-8 page fails `serve` at
+    // startup (matching `load_principals`'s discipline), not on the first
+    // request that happens to ask for it.
+    let docs_pages = crate::config::docs::load_declared(&cell.dir, &cell.def, &all_routes)?;
+    let docs_bundle_sha12 = docs_bundle_sha12(&docs_pages);
+    // Fingerprints are a release-time fact (ADR 0013 §5) — read from
+    // `published.json`, never recomputed from the live files.
+    let docs_fingerprints: indexmap::IndexMap<String, crate::context::DocsFingerprint> =
+        crate::manifest::Published::load(&cell.dir)
+            .map(|p| p.docs.into_iter().collect())
+            .unwrap_or_default();
+
     let state = Arc::new(AppState {
         // Under --no-data the OpenAPI paths are empty: the spec describes
         // the callable HTTP surface, and the data routes are not mounted.
@@ -306,9 +336,28 @@ fn build_state(
         data_mounted,
         channels: cell.channels.clone(),
         probes: Mutex::new(probes),
+        docs_pages,
+        docs_fingerprints,
+        docs_bundle_sha12,
         cell: Mutex::new(cell),
     });
     Ok((state, store))
+}
+
+/// The docs-variant `ETag` suffix (ADR 0013 §6): a hash over every page's
+/// sha256 in declared order, truncated to 12 hex chars — same convention as
+/// the Kubernetes ConfigMap's content-hash truncation
+/// (`deploy/targets/kubernetes/render.rs`'s `content_hash_short`). Order-
+/// and identity-sensitive (a page rename changes `target`, which isn't fed
+/// in here — that's covered by `interface_digest` instead; this suffix
+/// tracks *content* only).
+fn docs_bundle_sha12(pages: &[crate::config::docs::DocsPage]) -> String {
+    let joined = pages
+        .iter()
+        .map(|p| p.sha256.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    crate::context::sha256_hex(joined.as_bytes())[..12].to_string()
 }
 
 /// The swap-time probe (ADR 0012 §5): per export, the row count, min/max of
@@ -645,23 +694,100 @@ async fn health(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(body)
 }
 
-/// `GET /context` (ADR 0012): the cell's interface made machine-readable.
-/// Same auth tier as the data — the document is the map (grain, columns,
-/// upstream refs); no lower "docs" tier, no pre-auth serving. Handlers touch
-/// no store and no DuckDB: everything here reads precomputed state and the
-/// poller-maintained caches.
-async fn context_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// The closed `include=` vocabulary (ADR 0013 §4) — the single source both
+/// `validate_include` and `openapi::generate`'s documented `enum` read, so
+/// the two can never drift.
+pub(crate) const INCLUDE_SECTIONS: &[&str] = &["docs"];
+
+/// Validate `/context`'s query string against the closed grammar (ADR 0013
+/// §4): only `include` is accepted, and its value is a comma-separated list
+/// drawn from `INCLUDE_SECTIONS`. Returns the requested sections
+/// (deduplicated, insertion order) or the exact 400 message. Takes the raw
+/// pairs (not a `HashMap`) so repeated keys are seen rather than silently
+/// collapsed — irrelevant for the one key this grammar has today, but the
+/// discipline `serve_export`'s `validate_params` already established.
+fn validate_include(pairs: &[(String, String)]) -> std::result::Result<Vec<String>, String> {
+    let mut sections: Vec<String> = Vec::new();
+    for (k, v) in pairs {
+        if k != "include" {
+            return Err(format!(
+                "unknown query parameter '{k}' — `/context` accepts `include` (sections: docs)"
+            ));
+        }
+        for tok in v.split(',') {
+            if tok.is_empty() {
+                // Covers both an entirely empty value (`?include=`, whose
+                // single `split` item is `""`) and a trailing/leading/double
+                // comma (`?include=docs,`) with one check.
+                return Err(
+                    "`include` must name at least one section — `/context` accepts: docs"
+                        .to_string(),
+                );
+            }
+            if !INCLUDE_SECTIONS.contains(&tok) {
+                return Err(format!(
+                    "unknown `include` section '{tok}' — `/context` accepts: docs"
+                ));
+            }
+            if !sections.iter().any(|s| s == tok) {
+                sections.push(tok.to_string());
+            }
+        }
+    }
+    Ok(sections)
+}
+
+/// `GET /context` (ADR 0012, docs door: ADR 0013 §4). Same auth tier as the
+/// data — the document is the map (grain, columns, upstream refs); no lower
+/// "docs" tier, no pre-auth serving. Handlers touch no store and no DuckDB:
+/// everything here reads precomputed state and the poller-maintained caches
+/// — docs content and fingerprints included, both loaded once at startup.
+///
+/// `?include=docs` inlines docs page content and switches the `ETag` to the
+/// docs variant (`"<digest>~docs.<bundle sha>"`); the plain `GET /context`
+/// keeps the byte-identical default `ETag` it always had. Any other query
+/// param, or an unrecognized/empty `include` section, is a 400 — silently
+/// ignoring `?include=dcos` would return `content: null`, read by an agent
+/// as "no docs", the exact false-confidence failure `validate_params`
+/// already exists to kill on the data door.
+async fn context_doc(
+    State(s): State<Arc<AppState>>,
+    Query(pairs): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(resp) = authorize(&s, &headers) {
         return resp;
     }
 
-    let etag = format!("\"{}\"", s.digest);
+    let sections = match validate_include(&pairs) {
+        Ok(s) => s,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let want_docs = sections.iter().any(|s| s == "docs");
+
+    // The interface digest names the interface; the ETag names a
+    // representation of it (ADR 0013 §6) — the default variant's ETag stays
+    // byte-identical to today (mesh.rs copies it verbatim into
+    // `context_digest`), and the docs variant appends a suffix over the
+    // *content* bundle, precomputed at startup, never on the request path.
+    let etag = if want_docs {
+        format!("\"{}~docs.{}\"", s.digest, s.docs_bundle_sha12)
+    } else {
+        format!("\"{}\"", s.digest)
+    };
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == etag)
     {
-        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "private".to_string()),
+            ],
+        )
+            .into_response();
     }
 
     let execution = s.execution.load(std::sync::atomic::Ordering::Relaxed);
@@ -717,6 +843,7 @@ async fn context_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         None,
         freshness,
         probes,
+        s.docs_fingerprints.clone(),
         /* served_here */ s.data_mounted,
         s.channels.clone(),
         s.direct_attach,
@@ -726,7 +853,35 @@ async fn context_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         // carries (ADR 0012 §4).
         doc.notes.push(crate::context::NOTE_NO_DATA.to_string());
     }
-    (StatusCode::OK, [(header::ETAG, etag)], Json(doc)).into_response()
+    if want_docs {
+        // `200`, empty pages when the cell declares none — not an error;
+        // `included` is what tells an agent it asked and got a truthful
+        // (possibly empty) answer, distinct from "server predates this field".
+        doc.included = vec!["docs".to_string()];
+        doc.docs = Some(
+            s.docs_pages
+                .iter()
+                .map(|p| {
+                    (
+                        p.target.clone(),
+                        crate::context::DocsContentEntry {
+                            media_type: p.media_type.clone(),
+                            content: p.content.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "private".to_string()),
+        ],
+        Json(doc),
+    )
+        .into_response()
 }
 
 /// The back-link headers every data-route response carries (ADR 0012 §4) —
@@ -758,7 +913,13 @@ async fn openapi_doc(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     if let Err(resp) = authorize(&s, &headers) {
         return resp;
     }
-    Json(s.openapi.clone()).into_response()
+    // `authorize()` is all-or-nothing; a shared cache keyed on URI alone
+    // could otherwise hand a cached 200 to a tokenless caller (ADR 0013 §6).
+    (
+        [(header::CACHE_CONTROL, "private")],
+        Json(s.openapi.clone()),
+    )
+        .into_response()
 }
 
 async fn serve_export(
@@ -1000,6 +1161,7 @@ mod tests {
             version: "2.1.0".to_string(),
             source: Some("orders_daily".to_string()),
             description: None,
+            docs: None,
             grain: vec!["order_date".to_string(), "region".to_string()],
             schema,
             freshness: None,
@@ -1715,11 +1877,16 @@ mod smoke {
                 "{body}"
             );
 
-            // OpenAPI describes the callable surface — no data paths here.
+            // OpenAPI describes the callable surface (ADR 0013 §8: meta
+            // paths always present) — no data paths, since none are mounted.
             let (status, body) = get(&router, "/openapi.json", None).await;
             assert_eq!(status, StatusCode::OK);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert!(v["paths"].as_object().unwrap().is_empty(), "{body}");
+            let paths = v["paths"].as_object().unwrap();
+            assert!(paths.contains_key("/"), "{body}");
+            assert!(paths.contains_key("/context"), "{body}");
+            assert!(paths.contains_key("/openapi.json"), "{body}");
+            assert!(!paths.contains_key("/orders_daily@2"), "{body}");
         });
     }
 
@@ -1844,6 +2011,275 @@ mod smoke {
             let (status, body) = get(&router, "/virtual_pii@1", Some("good")).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
             assert!(body.contains("materialize: never"), "{body}");
+        });
+    }
+
+    // --- ADR 0013: long-form docs pages -------------------------------
+
+    /// A second, docs-bearing scaffold (the `init` scaffold declares no
+    /// `docs:` fields) — cell-level and one export-level page, built once
+    /// per test binary run like `built_cell`.
+    fn built_cell_with_docs() -> &'static Scaffold {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Scaffold> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-docs-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sql")).unwrap();
+            std::fs::create_dir_all(dir.join("profiles")).unwrap();
+            std::fs::create_dir_all(dir.join("docs")).unwrap();
+            std::fs::write(
+                dir.join("cell.yaml"),
+                "cell: docs_demo\n\
+                 description: A demo cell with docs pages.\n\
+                 docs: docs/overview.md\n\
+                 transforms:\n\
+                 \x20 - sql/orders.sql\n\
+                 interface:\n\
+                 \x20 - name: orders\n\
+                 \x20   version: 1.0.0\n\
+                 \x20   description: One row per order.\n\
+                 \x20   docs: docs/orders.md\n\
+                 \x20   grain: [order_id]\n\
+                 \x20   schema:\n\
+                 \x20     order_id: bigint\n\
+                 \x20     revenue: decimal\n\
+                 access:\n\
+                 \x20 shareable: true\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("sql/orders.sql"),
+                "SELECT * FROM (VALUES (CAST(1 AS BIGINT), 10.0), (CAST(2 AS BIGINT), 20.0)) \
+                 AS t(order_id, revenue)",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("docs/overview.md"),
+                "# Docs demo\n\nWhat this cell is for, at length.",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("docs/orders.md"),
+                "# Orders\n\nOne row per order placed, explained at length.",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("profiles/local.yaml"),
+                "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+            )
+            .unwrap();
+            crate::engine::run(
+                &dir.join("cell.yaml"),
+                "local",
+                None,
+                crate::engine::RunOptions::default(),
+            )
+            .expect("build the docs scaffold cell");
+            Scaffold { dir }
+        })
+    }
+
+    fn router_docs(no_data: bool, mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        let scaffold = built_cell_with_docs();
+        let mut cell = engine::open(&scaffold.dir.join("cell.yaml"), "local", true)
+            .expect("open docs scaffold read-only");
+        mutate(&mut cell);
+        let (state, _store) = build_state(cell, no_data).expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    async fn get_with_headers(
+        router: &Router,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut req = Request::builder().uri(uri);
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let resp = router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// `?include=docs` inlines both declared pages, switches to the docs
+    /// variant `ETag`, and the plain `GET /context` keeps the byte-identical
+    /// default `ETag`. Both round-trip through `If-None-Match` to a real 304
+    /// — a client holding a cached *plain* `ETag` and asking for
+    /// `?include=docs` must NOT 304 (the exact bug the exact-match check
+    /// fixes by construction, ADR 0013 §6).
+    #[test]
+    fn include_docs_inlines_content_with_a_variant_etag_and_round_trips() {
+        let router = router_docs(false, |_| {});
+        rt().block_on(async {
+            let (status, headers, body) = get_with_headers(&router, "/context", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let plain_etag = headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(!plain_etag.contains("~docs"), "{plain_etag}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["included"], serde_json::json!([]));
+            assert!(v["docs"].is_null(), "{body}");
+            assert_eq!(
+                headers.get(header::CACHE_CONTROL).unwrap(),
+                "private",
+                "{body}"
+            );
+
+            let (status, headers, body) =
+                get_with_headers(&router, "/context?include=docs", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let docs_etag = headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(docs_etag.contains("~docs."), "{docs_etag}");
+            assert_ne!(docs_etag, plain_etag);
+
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["included"], serde_json::json!(["docs"]));
+            assert_eq!(
+                v["docs"]["cell"]["media_type"],
+                "text/markdown; charset=utf-8"
+            );
+            assert!(
+                v["docs"]["cell"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Docs demo"),
+                "{body}"
+            );
+            assert!(
+                v["docs"]["orders@1"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("One row per order"),
+                "{body}"
+            );
+            // Fingerprints ship in the default variant too (not gated on
+            // `include=docs`) — a release ran for this scaffold (`engine::run`
+            // in direct-attach mode still writes no `published.json` unless
+            // `release` runs, so this cell has none; assert the shape stays
+            // absent-not-fabricated instead).
+            let (status, _headers, default_body) = get_with_headers(&router, "/context", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{default_body}");
+            let dv: serde_json::Value = serde_json::from_str(&default_body).unwrap();
+            assert!(
+                dv["observed"]["docs"].is_null() || dv["observed"]["docs"] == serde_json::json!({}),
+                "{default_body}"
+            );
+
+            // The plain ETag round-trips to 304; the docs ETag does too —
+            // and a plain-cached client asking with `?include=docs` gets a
+            // fresh 200, never a false 304.
+            let (status, _, _) =
+                get_with_headers(&router, "/context", &[("if-none-match", &plain_etag)]).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED);
+            let (status, _, _) = get_with_headers(
+                &router,
+                "/context?include=docs",
+                &[("if-none-match", &docs_etag)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED);
+            let (status, _, _) = get_with_headers(
+                &router,
+                "/context?include=docs",
+                &[("if-none-match", &plain_etag)],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a plain cached ETag must not 304-match the docs variant"
+            );
+        });
+    }
+
+    /// `?include=docs` on a cell with no `docs:` fields at all is a normal
+    /// 200 with an empty pages map — not an error.
+    #[test]
+    fn include_docs_on_a_docs_less_cell_is_200_with_empty_pages() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?include=docs", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["included"], serde_json::json!(["docs"]));
+            assert_eq!(v["docs"], serde_json::json!({}));
+        });
+    }
+
+    /// The closed `include=` grammar (ADR 0013 §4): an unrecognized query
+    /// parameter, an unrecognized section, and an empty/trailing-comma value
+    /// are all 400s naming exactly what's accepted.
+    #[test]
+    fn context_query_param_validation_rejects_the_closed_set() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?limit=5", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("unknown query parameter 'limit'"), "{body}");
+            assert!(body.contains("sections: docs"), "{body}");
+
+            let (status, body) = get(&router, "/context?include=dcos", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("unknown `include` section 'dcos'"), "{body}");
+            assert!(body.contains("accepts: docs"), "{body}");
+
+            let (status, body) = get(&router, "/context?include=", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("must name at least one section"), "{body}");
+
+            let (status, body) = get(&router, "/context?include=docs,", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("must name at least one section"), "{body}");
+
+            // A repeated identical token is accepted.
+            let (status, body) = get(&router, "/context?include=docs&include=docs", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        });
+    }
+
+    /// ADR 0013 §10: docs stay available under `--no-data` — the withheld
+    /// `values` lists are row-derived; prose is not.
+    #[test]
+    fn no_data_mode_keeps_docs_available() {
+        let router = router_docs(true, |_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?include=docs", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["data"]["served_here"], false);
+            assert_eq!(v["included"], serde_json::json!(["docs"]));
+            assert!(
+                v["docs"]["cell"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Docs demo"),
+                "{body}"
+            );
         });
     }
 }
