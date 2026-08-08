@@ -14,6 +14,7 @@ use anyhow::Result;
 use indexmap::IndexMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 use crate::config::{CellDef, ColumnSpec, Contract, Export, Source, Visibility};
 use crate::engine::run_summary::RunSummary;
@@ -40,14 +41,21 @@ const SAMPLE_LIMIT: usize = 10;
 pub struct ContextDocument {
     pub datamk_context: u32,
     pub cell: String,
-    /// `draft` | `verified`. Verified means exactly one thing: real provenance
-    /// (a published, verify-gated execution) stands behind this document.
+    /// `draft` | `verified_at_source` | `verified`, weakest to strongest
+    /// (issue #6). `verified` means exactly one thing: real provenance (a
+    /// published, verify-gated execution) stands behind this document.
     /// Pinless ⇒ draft, by definition (ADR 0012 §4) — a direct-attach cell has
     /// no pin and no run summary, so it is draft even after a local build; the
-    /// engine-emitted note says why.
+    /// engine-emitted note says why. `verified_at_source` sits strictly
+    /// between the two: no execution, but a `datamk verify` live-checked
+    /// every `materialize: never` export against the live warehouse
+    /// (`observed.source_check`) — a claim about rows as of that check, not
+    /// about immutable rows that still exist. Distinct from `verified` on
+    /// purpose (issue #6 Q3): an agent that branches on `status` must opt in
+    /// to trusting a weaker guarantee, never inherit it silently.
     pub status: Status,
-    /// `false` unless a verified build stands behind the document — never
-    /// `null`, never `true` by assumption (ADR 0012 §2).
+    /// `false` unless a verified build or a live source check stands behind
+    /// the document — never `null`, never `true` by assumption (ADR 0012 §2).
     pub grain_verified: bool,
     /// Author claims: the interface exactly as `cell.yaml` declares it.
     pub declared: Declared,
@@ -86,6 +94,11 @@ pub struct ContextDocument {
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Draft,
+    /// Issue #6: `#[serde(rename)]` because `rename_all = "lowercase"` alone
+    /// would emit `verifiedatsource` (it lowercases, it does not
+    /// snake_case).
+    #[serde(rename = "verified_at_source")]
+    VerifiedAtSource,
     Verified,
 }
 
@@ -224,6 +237,16 @@ pub struct Observed {
     /// direct-attach cell writes no summary; that absence is served as-is,
     /// never as zeros (ADR 0012 §2).
     pub provenance: Option<Provenance>,
+    /// From `datamk verify`'s live-verify pass (issue #6): present iff a
+    /// fresh (digest-matched) `.cell/source_check.json` record exists.
+    /// `null` when no live check has run, or its record is stale (a
+    /// `cell.yaml` edit since the check — silently omitted, never emitted
+    /// stale). Independent of `provenance`: a cell can carry both (a mixed
+    /// cell with a published execution AND a separately live-checked
+    /// never-backed export), though `status` only reads `provenance` once
+    /// it's present (ADR 0012 §2 cell-level rule, issue #6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_check: Option<SourceCheck>,
     /// Hosted `/context` only, published mode only: the poll telemetry that
     /// makes bounded staleness visible (ADR 0004 §6). Never in the portable
     /// artifact — poll telemetry is a lie the instant the file is written.
@@ -333,6 +356,37 @@ pub struct Provenance {
     pub data_as_of: Option<String>,
 }
 
+/// A live check of a `materialize: never` export against the warehouse
+/// (issue #6, live-verify core) — the fact behind `status: verified_at_source`.
+/// Deliberately not `Provenance`: there is no execution, no snapshot, no
+/// immutable rows behind this — just a machine check that passed as of
+/// `checked_at`. Built from `crate::manifest::SourceCheckRecord` (the
+/// `.cell/source_check.json` file `datamk verify` writes); the wire shape
+/// mirrors the record's admitted fields exactly, field-by-field the same
+/// discipline `Provenance` uses for `RunSummary`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCheck {
+    /// `"passed"` by construction — see `SourceCheckRecord`'s doc comment.
+    pub outcome: String,
+    pub checked_at: String,
+    /// Only when a connector can supply it cheaply and truthfully — omitted,
+    /// never fabricated, never defaulted to `checked_at` (ADR 0012 §2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_as_of: Option<String>,
+    pub datamk_version: String,
+}
+
+impl From<&crate::manifest::SourceCheckRecord> for SourceCheck {
+    fn from(r: &crate::manifest::SourceCheckRecord) -> Self {
+        SourceCheck {
+            outcome: r.outcome.clone(),
+            checked_at: r.checked_at.clone(),
+            data_as_of: r.data_as_of.clone(),
+            datamk_version: r.datamk_version.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FreshnessBlock {
     pub serving_execution: u64,
@@ -363,6 +417,12 @@ pub struct UpstreamRef {
 /// the router's dispatch map, `openapi::generate`, and the `/context` builder
 /// all derive from this — never three independent re-applications of the
 /// predicate. Sorted by route key so every derived surface is deterministic.
+///
+/// **Declared, not mounted** (issue #6): every discoverable export, including
+/// one sourced from a `materialize: never` table — datamk owns its contract
+/// even where it doesn't own the rows, so a virtual export is still named,
+/// typed, and versioned here. Callers that need only the subset `serve`
+/// actually routes over HTTP call `mounted_routes` on this list.
 pub fn discoverable_routes(def: &CellDef) -> Result<Vec<(String, Export)>> {
     let mut routes = Vec::new();
     for export in &def.interface {
@@ -374,8 +434,34 @@ pub fn discoverable_routes(def: &CellDef) -> Result<Vec<(String, Export)>> {
     Ok(routes)
 }
 
-/// The declared region, built from the shared route list.
-pub fn declared(def: &CellDef, routes: &[(String, Export)], with_query: bool) -> Declared {
+/// The snapshot-backed subset of `routes` (issue #6): drops every export
+/// whose `source` resolves to a `materialize: never` table. This is the list
+/// `serve` mounts data routes from, `openapi::generate` builds paths from,
+/// and swap-time probes run against — every one of those is a claim (or a
+/// query) about rows that exist in the lake, which a never-backed export's
+/// table never does.
+pub fn mounted_routes(
+    routes: &[(String, Export)],
+    never_tables: &HashSet<String>,
+) -> Vec<(String, Export)> {
+    routes
+        .iter()
+        .filter(|(_, e)| !never_tables.contains(e.source_object()))
+        .cloned()
+        .collect()
+}
+
+/// The declared region, built from the shared route list. `never_tables`
+/// (issue #6) nulls a never-backed export's `query` block even when
+/// `with_query` is otherwise true — the affordance it would describe (a
+/// mounted HTTP route) doesn't exist for that export regardless of whether
+/// this surface is serving anyone else's rows.
+pub fn declared(
+    def: &CellDef,
+    routes: &[(String, Export)],
+    with_query: bool,
+    never_tables: &HashSet<String>,
+) -> Declared {
     let exports = routes
         .iter()
         .map(|(route, e)| DeclaredExport {
@@ -391,7 +477,8 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)], with_query: bool) ->
                 .iter()
                 .map(|(col, spec)| (col.clone(), ColumnDoc::from(spec)))
                 .collect(),
-            query: with_query.then(|| query_block(route, e)),
+            query: (with_query && !never_tables.contains(e.source_object()))
+                .then(|| query_block(route, e)),
         })
         .collect();
 
@@ -470,6 +557,21 @@ pub const NOTE_NO_DATA: &str =
     "Rows are not served by this endpoint by design. Fetch them via the locations listed \
      in the context document's data.channels.";
 
+/// The engine-emitted body a never-backed export's data route serves
+/// (issue #6) — same shape as `NOTE_NO_DATA` (a whole cell dark under
+/// `--no-data`), but naming the export: this door is dark by declared
+/// design, not by an operator flag, and the caller needs to know which.
+/// Served post-`authorize()` only (`serve::serve_export_inner`) — a
+/// pre-auth 404 here would let an unauthenticated caller enumerate which
+/// exports are virtual just by probing routes.
+pub fn note_never_backed(route: &str) -> String {
+    format!(
+        "Rows for '{route}' are not served by this endpoint by design: this export is declared \
+         `materialize: never` — datamk owns its contract, not its rows. Fetch them via the \
+         locations listed in the context document's data.channels. See GET /context."
+    )
+}
+
 /// The engine-emitted note on a direct-attach (local catalog) document:
 /// pinless ⇒ draft by definition (ADR 0012 §4) — data may exist locally, but
 /// no published, verify-gated execution stands behind the document.
@@ -480,13 +582,19 @@ pub const NOTE_DIRECT_ATTACH: &str =
 
 /// Assemble a document from a prebuilt declared region (how the serve
 /// handler works — its declared region and digest are precomputed at
-/// startup). `provenance` present ⇒ verified (its wire meaning — ADR 0012
-/// §5); absent ⇒ draft, with the matching engine note.
+/// startup). Status is a ladder, weakest to strongest (issue #6 Q3):
+/// `provenance` present ⇒ `verified` (its wire meaning — ADR 0012 §5) —
+/// unchanged, and checked first, so a mixed cell's published execution
+/// (which already verified its never-backed exports live at build time, see
+/// `engine::run`) reads as the strongest claim it earns; else
+/// `source_check` present ⇒ `verified_at_source`; else `draft`, with the
+/// matching engine note.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble(
     cell: String,
     declared: Declared,
     provenance: Option<Provenance>,
+    source_check: Option<SourceCheck>,
     freshness: Option<FreshnessBlock>,
     upstreams: Vec<ObservedUpstream>,
     probes: IndexMap<String, ExportProbe>,
@@ -495,9 +603,15 @@ pub fn assemble(
     channels: Vec<String>,
     direct_attach: bool,
 ) -> ContextDocument {
-    let verified = provenance.is_some();
+    let status = if provenance.is_some() {
+        Status::Verified
+    } else if source_check.is_some() {
+        Status::VerifiedAtSource
+    } else {
+        Status::Draft
+    };
     let mut notes = Vec::new();
-    if !verified {
+    if status == Status::Draft {
         notes.push(
             if direct_attach {
                 NOTE_DIRECT_ATTACH
@@ -510,14 +624,11 @@ pub fn assemble(
     ContextDocument {
         datamk_context: DATAMK_CONTEXT_VERSION,
         cell,
-        status: if verified {
-            Status::Verified
-        } else {
-            Status::Draft
-        },
-        grain_verified: verified,
+        status,
+        grain_verified: status != Status::Draft,
         declared,
         observed: if provenance.is_some()
+            || source_check.is_some()
             || freshness.is_some()
             || !upstreams.is_empty()
             || !probes.is_empty()
@@ -525,6 +636,7 @@ pub fn assemble(
         {
             Some(Observed {
                 provenance,
+                source_check,
                 freshness,
                 upstreams,
                 exports: probes,
@@ -556,7 +668,9 @@ pub fn assemble(
 pub fn build(
     def: &CellDef,
     routes: &[(String, Export)],
+    never_tables: &HashSet<String>,
     provenance: Option<Provenance>,
+    source_check: Option<SourceCheck>,
     freshness: Option<FreshnessBlock>,
     upstreams: Vec<ObservedUpstream>,
     docs_fingerprints: IndexMap<String, DocsFingerprint>,
@@ -566,8 +680,9 @@ pub fn build(
 ) -> ContextDocument {
     assemble(
         def.cell.clone(),
-        declared(def, routes, with_query),
+        declared(def, routes, with_query, never_tables),
         provenance,
+        source_check,
         freshness,
         upstreams,
         IndexMap::new(),
@@ -693,8 +808,17 @@ pub fn emit(
 
     let loaded = crate::config::load(file, profile)?;
     let routes = discoverable_routes(&loaded.def)?;
+    let never_tables = crate::config::never_backed_tables(&loaded.transforms);
     let direct_attach = loaded.bindings.catalog.is_some();
     let refs = cell_source_refs(&loaded.def);
+
+    // Computed once, up front: it stamps every emitted document
+    // (`cell_yaml_digest`) and is the staleness key for the live-verify
+    // source-check record below (issue #6) — both need the exact same bytes,
+    // read once.
+    let cell_yaml_bytes =
+        std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    let cell_yaml_digest = sha256_hex(&cell_yaml_bytes);
 
     let (provenance, upstreams) = if direct_attach {
         (None, Vec::new())
@@ -719,6 +843,26 @@ pub fn emit(
         }
     };
 
+    // Issue #6: `datamk verify` and `datamk context` run as separate
+    // processes (CI: verify against the live warehouse, then emit the
+    // document) — the record left under `.cell/source_check.json` is the
+    // only thing that carries a passed live check across that boundary.
+    // Embedded only when its digest still matches this `cell.yaml`; a
+    // config edit since the check ran makes the record stale, and a stale
+    // record is silently omitted, never emitted as if it still applied.
+    let source_check = crate::manifest::SourceCheckRecord::load(&loaded.dir).and_then(|r| {
+        if r.cell_yaml_digest == cell_yaml_digest {
+            Some(SourceCheck::from(&r))
+        } else {
+            tracing::info!(
+                "found .cell/source_check.json but its digest no longer matches cell.yaml — \
+                 the config changed since the last `datamk verify`; omitting observed.source_check \
+                 (re-run `datamk verify` for a current one)"
+            );
+            None
+        }
+    });
+
     // Docs fingerprints (ADR 0013 §5): a release-time fact, read from
     // `published.json` when one exists — never recomputed here (computing at
     // load/emit time would populate `observed.docs` on every never-run cell
@@ -731,7 +875,9 @@ pub fn emit(
     let mut doc = build(
         &loaded.def,
         &routes,
+        &never_tables,
         provenance,
+        source_check,
         /* freshness */ None, // poll telemetry is a lie the instant the file is written
         upstreams,
         docs_fingerprints,
@@ -763,9 +909,7 @@ pub fn emit(
     }
 
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
-    doc.cell_yaml_digest = Some(sha256_hex(
-        &std::fs::read(file).with_context(|| format!("reading {}", file.display()))?,
-    ));
+    doc.cell_yaml_digest = Some(cell_yaml_digest);
 
     let json = serde_json::to_string_pretty(&doc)?;
     match out {
@@ -782,6 +926,7 @@ pub fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn sample_def() -> CellDef {
         serde_yaml::from_str(
@@ -822,6 +967,7 @@ interface:
         build(
             &def,
             &routes,
+            &HashSet::new(),
             Some(Provenance {
                 execution: 47,
                 snapshot_id: Some(12),
@@ -831,6 +977,7 @@ interface:
                 datamk_version: "0.0.12".to_string(),
                 data_as_of: Some("2026-07-13 10:00:04+00".to_string()),
             }),
+            /* source_check */ None,
             Some(FreshnessBlock {
                 serving_execution: 47,
                 latest_seen: 47,
@@ -941,6 +1088,8 @@ interface:
         let doc = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -970,6 +1119,8 @@ interface:
         let doc = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1044,6 +1195,8 @@ interface:
         let draft = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1058,12 +1211,41 @@ interface:
             "observed/status/notes must not move the digest"
         );
 
+        // Issue #6: a populated `observed.source_check` (verified_at_source)
+        // must not move the digest either — `observed` never does, this
+        // field included.
+        let verified_at_source = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            Some(SourceCheck {
+                outcome: "passed".to_string(),
+                checked_at: "2026-08-07T10:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: "0.0.13".to_string(),
+            }),
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            digest_of(&draft),
+            digest_of(&verified_at_source),
+            "a populated observed.source_check must not move the digest"
+        );
+
         let mut def2 = sample_def();
         def2.interface[0].grain.push("channel".to_string());
         let routes2 = discoverable_routes(&def2).unwrap();
         let changed = build(
             &def2,
             &routes2,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1091,6 +1273,8 @@ interface:
         let base = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1127,7 +1311,19 @@ interface:
                 bytes: 3,
             },
         );
-        let with_fp = build(&def, &routes, None, None, Vec::new(), fp, true, true, false);
+        let with_fp = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            fp,
+            true,
+            true,
+            false,
+        );
         assert_eq!(
             digest_of(&base),
             digest_of(&with_fp),
@@ -1141,6 +1337,8 @@ interface:
         let renamed = build(
             &def_renamed,
             &routes_renamed,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1162,6 +1360,8 @@ interface:
         let removed = build(
             &def_removed,
             &routes_removed,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1186,6 +1386,8 @@ interface:
         let mut doc = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1311,6 +1513,8 @@ interface:
         let draft = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1322,6 +1526,8 @@ interface:
         let with_upstreams = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             vec![ObservedUpstream {
@@ -1341,11 +1547,12 @@ interface:
         );
     }
 
-    /// Both new-facts sources at once (issue #7 + ADR 0013): a document with
-    /// populated `observed.upstreams` AND populated docs (identity, inlined
-    /// content, and a fingerprint) must still digest identically to the bare
-    /// draft — neither is part of the interface, and the two features
-    /// landing in the same release must not compound into a churned digest.
+    /// All three new-facts sources at once (issue #7 + ADR 0013 + issue #6):
+    /// a document with populated `observed.upstreams`, populated docs
+    /// (identity, inlined content, and a fingerprint), AND a populated
+    /// `observed.source_check` must still digest identically to the bare
+    /// draft — none of the three is part of the interface, and the features
+    /// landing across releases must not compound into a churned digest.
     #[test]
     fn digest_ignores_observed_upstreams_and_docs_content_together() {
         let mut def = sample_def();
@@ -1354,6 +1561,8 @@ interface:
         let draft = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             Vec::new(),
@@ -1374,7 +1583,14 @@ interface:
         let mut loaded = build(
             &def,
             &routes,
+            &HashSet::new(),
             None,
+            Some(SourceCheck {
+                outcome: "passed".to_string(),
+                checked_at: "2026-08-07T10:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: "0.0.13".to_string(),
+            }),
             None,
             vec![ObservedUpstream {
                 reference: "flights".to_string(),
@@ -1399,7 +1615,8 @@ interface:
         assert_eq!(
             digest_of(&draft),
             digest_of(&loaded),
-            "observed.upstreams and docs content/fingerprint together must not move the digest"
+            "observed.upstreams, observed.source_check, and docs content/fingerprint together \
+             must not move the digest"
         );
     }
 
@@ -1412,6 +1629,8 @@ interface:
         let doc = build(
             &def,
             &routes,
+            &HashSet::new(),
+            None,
             None,
             None,
             vec![ObservedUpstream {
@@ -1454,7 +1673,7 @@ interface:
         def.interface[0].docs = Some("docs/orders_daily.md".to_string());
         def.interface[1].docs = Some("docs/internal.md".to_string()); // private export
         let routes = discoverable_routes(&def).unwrap();
-        let d = declared(&def, &routes, true);
+        let d = declared(&def, &routes, true, &HashSet::new());
 
         assert_eq!(d.include_request, "/context?include=docs");
         assert_eq!(d.docs.len(), 2, "{:?}", d.docs);
@@ -1473,7 +1692,7 @@ interface:
     fn declared_docs_is_empty_but_present_when_nothing_is_declared() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let d = declared(&def, &routes, true);
+        let d = declared(&def, &routes, true, &HashSet::new());
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["docs"], serde_json::json!([]));
         assert_eq!(v["include_request"], "/context?include=docs");
@@ -1544,6 +1763,120 @@ interface:
         assert_eq!(
             no_docs_doc["declared"]["docs"][0]["path"],
             "docs/overview.md"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- issue #6, live-verify core: the `.cell/source_check.json` --------
+    // --- round trip ----------------------------------------------------
+
+    /// A fresh, on-disk all-`never` cell — `verify::run` and `context::emit`
+    /// driven for real (`config::load` + a real `.cell/` directory), same
+    /// pattern `release.rs`'s and `verify.rs`'s live-verify tests use, and
+    /// for the same reason: this round trip is specifically about the two
+    /// commands agreeing through a file on disk, which nothing in-memory
+    /// can stand in for.
+    fn all_never_cell_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-context-source-check-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: virtual_only\n\
+             transforms:\n\
+             \x20 - sql: sql/virtual_pii.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: virtual_pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM raw").unwrap();
+        std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn context_embeds_source_check_and_reports_verified_at_source_after_a_passing_live_verify() {
+        let dir = all_never_cell_dir("fresh");
+        let file = dir.join("cell.yaml");
+        crate::verify::run(&file, "local").expect("live-verify the all-never cell");
+        assert!(
+            dir.join(".cell/source_check.json").is_file(),
+            "verify must have written the source-check record"
+        );
+
+        let out = dir.join("context.json");
+        emit(&file, "local", Some(&out), false).expect("emit the context document");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["status"], "verified_at_source");
+        assert_eq!(v["grain_verified"], true);
+        assert_eq!(v["observed"]["provenance"], serde_json::Value::Null);
+        assert_eq!(v["observed"]["source_check"]["outcome"], "passed");
+        assert!(
+            v["observed"]["source_check"]["checked_at"].is_string(),
+            "checked_at must be a real timestamp: {v}"
+        );
+        assert!(
+            v["observed"]["source_check"]["datamk_version"].is_string(),
+            "datamk_version must be present: {v}"
+        );
+        // ADR 0012 §2: never fabricated, never defaulted to checked_at — no
+        // connector in this slice supplies one, so it must be absent.
+        assert!(
+            v["observed"]["source_check"].get("data_as_of").is_none(),
+            "data_as_of must be omitted, not fabricated: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_omits_a_stale_source_check_record_and_falls_back_to_draft() {
+        // Issue #6: `verify` and `context` are separate processes; a
+        // `cell.yaml` edit between the two must silently invalidate the
+        // record rather than let a check of the *previous* contract ride
+        // along as if it still applied.
+        let dir = all_never_cell_dir("stale");
+        let file = dir.join("cell.yaml");
+        crate::verify::run(&file, "local").expect("live-verify the all-never cell");
+        assert!(dir.join(".cell/source_check.json").is_file());
+
+        // Edit cell.yaml after the check ran — the record's digest no
+        // longer matches.
+        let mut yaml = std::fs::read_to_string(&file).unwrap();
+        yaml.push_str("description: added after the live check ran\n");
+        std::fs::write(&file, yaml).unwrap();
+
+        let out = dir.join("context.json");
+        emit(&file, "local", Some(&out), false)
+            .expect("emit must still succeed, just without the stale record");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            v["status"], "draft",
+            "a stale source-check record must not promote status: {v}"
+        );
+        assert!(
+            v["observed"].is_null(),
+            "a stale source-check record must be omitted entirely, not emitted stale: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

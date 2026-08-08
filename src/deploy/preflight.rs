@@ -1,7 +1,8 @@
 use anyhow::{bail, Result};
 
 use crate::config::{
-    is_remote, CellDef, ResolvedBindings, ResolvedConnection, ResolvedSource, SnowflakeAuth,
+    is_remote, CellDef, ResolvedBindings, ResolvedConnection, ResolvedSource, ResolvedTransform,
+    SnowflakeAuth,
 };
 use crate::deploy::target::Workloads;
 
@@ -10,6 +11,7 @@ use crate::deploy::target::Workloads;
 pub struct PreflightInput<'a> {
     pub def: &'a CellDef,
     pub bindings: &'a ResolvedBindings,
+    pub transforms: &'a [ResolvedTransform],
     pub supports: Workloads,
     pub allow_anonymous: bool,
     pub profile: &'a str,
@@ -21,10 +23,32 @@ pub struct PreflightInput<'a> {
 pub fn check(i: &PreflightInput) -> Result<()> {
     check_remote_storage(i)?;
     check_no_catalog(i)?;
+    check_no_all_never(i)?;
     check_no_interactive_connections(i)?;
     if i.supports.long_lived() {
         check_servable(i)?;
         check_auth(i)?;
+    }
+    Ok(())
+}
+
+/// Issue #6 (virtual cells foundation): a cell whose every transform is
+/// `materialize: never` commits no snapshot at all — `run` already refuses
+/// it, before BEGIN (see `engine::run`). Unconditional, alongside
+/// `check_no_catalog`, not gated on `supports.long_lived()`: a Builder-only
+/// (CronJob) target for this cell would crash-loop on every scheduled `run`
+/// just the same as a Server would 404 every route.
+fn check_no_all_never(i: &PreflightInput) -> Result<()> {
+    if crate::config::is_all_never(i.transforms) {
+        bail!(
+            "cell '{c}' has no materialized exports (every transform is `materialize: never`) \
+             — there are no rows to serve, so a deployed Server would 404 every route. Publish \
+             the context document from CI instead:\n  \
+             datamk verify  -f cell.yaml -p {p}\n  \
+             datamk context -f cell.yaml -p {p} --out context.json",
+            c = i.def.cell,
+            p = i.profile,
+        );
     }
     Ok(())
 }
@@ -152,12 +176,14 @@ mod tests {
     fn input<'a>(
         def: &'a CellDef,
         bindings: &'a ResolvedBindings,
+        transforms: &'a [ResolvedTransform],
         profile: &'a str,
         allow_anonymous: bool,
     ) -> PreflightInput<'a> {
         PreflightInput {
             def,
             bindings,
+            transforms,
             supports: Workloads::Both,
             allow_anonymous,
             profile,
@@ -171,7 +197,7 @@ mod tests {
     #[test]
     fn local_profile_is_refused_for_storage() {
         let l = loaded("local");
-        let err = check(&input(&l.def, &l.bindings, "local", true))
+        let err = check(&input(&l.def, &l.bindings, &l.transforms, "local", true))
             .unwrap_err()
             .to_string();
         assert!(
@@ -184,7 +210,28 @@ mod tests {
     fn deployable_prod_profile_passes() {
         // orders is shareable+no-roles, and deploy/prod.yaml sets allow_anonymous.
         let l = loaded("prod");
-        check(&input(&l.def, &l.bindings, "prod", true)).unwrap();
+        check(&input(&l.def, &l.bindings, &l.transforms, "prod", true)).unwrap();
+    }
+
+    // issue #6: alongside `check_no_catalog`, unconditional — a deployed
+    // Server would 404 every route, and a deployed Builder would crash-loop
+    // on every scheduled `run` (which already refuses an all-never cell).
+    #[test]
+    fn all_never_cell_is_refused_naming_verify_and_context() {
+        let l = loaded("prod");
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\ntransforms:\n  - sql: sql/virtual.sql\n    materialize: never\n",
+        )
+        .unwrap();
+        let never_transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
+        let err = check(&input(&l.def, &l.bindings, &never_transforms, "prod", true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no materialized exports"), "got: {err}");
+        assert!(err.contains("materialize: never"), "got: {err}");
+        assert!(err.contains("would 404 every route"), "got: {err}");
+        assert!(err.contains("datamk verify"), "got: {err}");
+        assert!(err.contains("datamk context"), "got: {err}");
     }
 
     #[test]
@@ -208,7 +255,7 @@ mod tests {
                 incremental: None,
             },
         );
-        let err = check(&input(&l.def, &bindings, "prod", true))
+        let err = check(&input(&l.def, &bindings, &l.transforms, "prod", true))
             .unwrap_err()
             .to_string();
         assert!(err.contains("externalbrowser"), "got: {err}");
@@ -239,13 +286,13 @@ mod tests {
                 incremental: None,
             },
         );
-        check(&input(&l.def, &bindings, "prod", true)).unwrap();
+        check(&input(&l.def, &bindings, &l.transforms, "prod", true)).unwrap();
     }
 
     #[test]
     fn open_endpoint_refused_without_allow_anonymous() {
         let l = loaded("prod");
-        let err = check(&input(&l.def, &l.bindings, "prod", false))
+        let err = check(&input(&l.def, &l.bindings, &l.transforms, "prod", false))
             .unwrap_err()
             .to_string();
         assert!(err.contains("open, unauthenticated endpoint"), "got: {err}");

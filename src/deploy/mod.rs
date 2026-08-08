@@ -47,6 +47,7 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
     preflight::check(&PreflightInput {
         def: &loaded.def,
         bindings: &loaded.bindings,
+        transforms: &loaded.transforms,
         supports: target.supports(),
         allow_anonymous: cfg.allow_anonymous,
         profile: &args.profile,

@@ -8,7 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -34,8 +34,17 @@ struct AppState {
     /// the cell it started with, and dropping the old cell reclaims its local
     /// scratch (artifact file) — resident generations are bounded at two.
     cell: Mutex<engine::Cell>,
-    /// route key (`name@major`) -> export
+    /// route key (`name@major`) -> export — every discoverable export,
+    /// including a `materialize: never` one (issue #6): the dispatch map
+    /// needs to tell "no such export" (404, unknown route) apart from "this
+    /// export exists but is not routed here" (404, `never_backed_routes`,
+    /// after `authorize()`).
     routes: HashMap<String, Export>,
+    /// route keys sourced from a `materialize: never` table (issue #6): not
+    /// mounted, described only. Checked post-`authorize()` in
+    /// `serve_export_inner` — a pre-auth check here would let an
+    /// unauthenticated caller enumerate which exports are virtual.
+    never_backed_routes: HashSet<String>,
     /// route key -> pinned snapshot id (from the release manifest)
     published: BTreeMap<String, i64>,
     openapi: serde_json::Value,
@@ -66,8 +75,11 @@ struct AppState {
     /// Newest lake snapshot time, cached at open and at swap — never queried
     /// on the request path.
     data_as_of: Mutex<Option<String>>,
-    /// The sorted route list the routes map was built from — kept so the
-    /// poller can re-run the swap-time probes against a fresh cell.
+    /// The sorted, **snapshot-backed** route list (issue #6: `mounted_routes`
+    /// applied to the full discoverable list) — kept so the poller can
+    /// re-run the swap-time probes against a fresh cell. Never-backed
+    /// exports are skipped: their `source_object()` is not a lake table, so
+    /// there is nothing here to probe (see `mounted_routes`'s doc comment).
     route_list: Vec<(String, Export)>,
     /// Whether the data routes are mounted (`false` under `--no-data`,
     /// ADR 0012 §4). Drives `data.served_here` honestly, by construction.
@@ -226,13 +238,28 @@ fn build_state(
 
     // The one visibility-filtered route list (ADR 0012 §4): the router's
     // dispatch map, the OpenAPI doc, and the context document all derive
-    // from this single call — never three independent predicates.
-    let route_list = crate::context::discoverable_routes(&cell.def)?;
-    let routes: HashMap<String, Export> = route_list.iter().cloned().collect();
+    // from this single call — never three independent predicates. Includes
+    // `materialize: never` exports (issue #6) — `declared` is unconditional
+    // (datamk owns the contract regardless of who owns the rows); `mounted`
+    // is the snapshot-backed subset actually routed over HTTP.
+    let all_routes = crate::context::discoverable_routes(&cell.def)?;
+    let never_tables = crate::config::never_backed_tables(&cell.transforms);
+    let mounted = crate::context::mounted_routes(&all_routes, &never_tables);
+    let never_backed_routes: HashSet<String> = all_routes
+        .iter()
+        .filter(|(_, e)| never_tables.contains(e.source_object()))
+        .map(|(route, _)| route.clone())
+        .collect();
+    let routes: HashMap<String, Export> = all_routes.iter().cloned().collect();
     // Under --no-data the query block is omitted (it describes HTTP
-    // affordances that do not exist there — ADR 0012 §4).
-    let declared =
-        crate::context::declared(&cell.def, &route_list, /* with_query */ data_mounted);
+    // affordances that do not exist there — ADR 0012 §4); per-export it's
+    // also omitted for a never-backed export regardless of --no-data.
+    let declared = crate::context::declared(
+        &cell.def,
+        &all_routes,
+        /* with_query */ data_mounted,
+        &never_tables,
+    );
     let data = crate::context::DataBlock {
         served_here: data_mounted,
         channels: cell.channels.clone(),
@@ -264,9 +291,12 @@ fn build_state(
     // The open-time probe run (ADR 0012 §5) — same measurements the poller
     // repeats at every swap. `--no-data` withholds the row-derived `values`
     // lists; coverage and counts stay (aggregates that name no entity).
+    // Never-backed exports (issue #6) are excluded by construction: `mounted`
+    // already dropped them, and their `source_object()` names no lake
+    // relation to probe.
     let probes = probe_exports(
         &cell.conn,
-        &route_list,
+        &mounted,
         &published,
         /* include_values */ data_mounted,
     );
@@ -276,7 +306,7 @@ fn build_state(
     // over. An unreadable/oversized/empty/non-UTF-8 page fails `serve` at
     // startup (matching `load_principals`'s discipline), not on the first
     // request that happens to ask for it.
-    let docs_pages = crate::config::docs::load_declared(&cell.dir, &cell.def, &route_list)?;
+    let docs_pages = crate::config::docs::load_declared(&cell.dir, &cell.def, &all_routes)?;
     let docs_bundle_sha12 = docs_bundle_sha12(&docs_pages);
     // Fingerprints are a release-time fact (ADR 0013 §5) — read from
     // `published.json`, never recomputed from the live files.
@@ -288,14 +318,17 @@ fn build_state(
     let state = Arc::new(AppState {
         // Under --no-data the OpenAPI paths are empty: the spec describes
         // the callable HTTP surface, and the data routes are not mounted.
+        // Never-backed exports are always excluded (issue #6) — `mounted`
+        // already dropped them regardless of --no-data.
         openapi: openapi::generate(
             &cell.def.cell,
             cell.def.description.as_deref(),
-            if data_mounted { &route_list } else { &[] },
+            if data_mounted { &mounted } else { &[] },
             &digest,
         ),
         cell_name: cell.def.cell.clone(),
         routes,
+        never_backed_routes,
         published,
         shareable: cell.def.access.shareable,
         allowed_roles: cell.def.access.roles.clone(),
@@ -310,7 +343,7 @@ fn build_state(
         direct_attach,
         run_summary: Mutex::new(None),
         data_as_of: Mutex::new(data_as_of),
-        route_list,
+        route_list: mounted,
         data_mounted,
         channels: cell.channels.clone(),
         probes: Mutex::new(probes),
@@ -824,6 +857,14 @@ async fn context_doc(
         s.cell_name.clone(),
         s.declared.clone(),
         provenance,
+        // Issue #6: `observed.source_check` is wired for the portable
+        // `datamk verify` -> `datamk context` CI path only in this slice —
+        // the Server stays credential-light and never performs a live
+        // warehouse check itself (Q1's whole point). Reading a persisted
+        // `.cell/source_check.json` here to surface it on the hosted
+        // `/context` too is a reasonable follow-up, deliberately deferred.
+        /* source_check */
+        None,
         freshness,
         upstreams,
         probes,
@@ -940,6 +981,20 @@ async fn serve_export_inner(
         Some(e) => e.clone(),
         None => return (StatusCode::NOT_FOUND, format!("no export '{route}'")).into_response(),
     };
+
+    // issue #6: this export exists and is declared (it's in `s.routes`), but
+    // its transform is `materialize: never` — no lake table backs it, so
+    // there is no data route to serve. Runs post-`authorize()` (the caller
+    // of this function already checked): a pre-auth 404 here, unlike the
+    // cell-wide --no-data check above, would let an unauthenticated caller
+    // enumerate which exports are virtual one route at a time.
+    if s.never_backed_routes.contains(&route) {
+        return (
+            StatusCode::NOT_FOUND,
+            crate::context::note_never_backed(&route),
+        )
+            .into_response();
+    }
 
     // ADR 0012 §7: unknown or invalid query params are a 400, never silently
     // dropped — an ignored `?revenue=999` returns unfiltered rows the caller
@@ -1474,6 +1529,81 @@ mod smoke {
         router_mode(false, mutate)
     }
 
+    /// A MIXED cell (issue #6): one materializing export (`stg`) and one
+    /// `materialize: never` export (`virtual_pii`) — the shape "described,
+    /// not routed" is built to test against, not simulated. Built once
+    /// (`engine::run`), same discipline as `built_cell()`.
+    fn built_never_cell() -> &'static Scaffold {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Scaffold> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-never-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sql")).unwrap();
+            std::fs::create_dir_all(dir.join("profiles")).unwrap();
+            std::fs::write(
+                dir.join("cell.yaml"),
+                "cell: virtual_smoke\n\
+                 transforms:\n\
+                 \x20 - sql/stg.sql\n\
+                 \x20 - sql: sql/virtual_pii.sql\n\
+                 \x20   materialize: never\n\
+                 interface:\n\
+                 \x20 - name: stg\n\
+                 \x20   version: 1.0.0\n\
+                 \x20   description: A materialized export, for contrast with virtual_pii.\n\
+                 \x20   grain: [id]\n\
+                 \x20   schema:\n\
+                 \x20     id: integer\n\
+                 \x20     val: string\n\
+                 \x20 - name: virtual_pii\n\
+                 \x20   version: 1.0.0\n\
+                 \x20   description: PII rows datamk verifies but never stores.\n\
+                 \x20   grain: [id]\n\
+                 \x20   schema:\n\
+                 \x20     id: integer\n\
+                 \x20     val: string\n\
+                 access:\n\
+                 \x20 shareable: true\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("sql/stg.sql"),
+                "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
+            )
+            .unwrap();
+            std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM stg").unwrap();
+            std::fs::write(
+                dir.join("profiles/local.yaml"),
+                "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+            )
+            .unwrap();
+            crate::engine::run(
+                &dir.join("cell.yaml"),
+                "local",
+                None,
+                crate::engine::RunOptions::default(),
+            )
+            .expect("build the mixed (materializing + never) scaffold cell");
+            Scaffold { dir }
+        })
+    }
+
+    fn never_router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        let scaffold = built_never_cell();
+        let mut cell = engine::open(&scaffold.dir.join("cell.yaml"), "local", true)
+            .expect("open built never-cell read-only");
+        mutate(&mut cell);
+        let (state, _store) = build_state(cell, /* no_data */ false).expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1807,6 +1937,105 @@ mod smoke {
             assert_eq!(status, StatusCode::FORBIDDEN, "wrong role");
             let (status, body) = get(&router, "/orders_daily@2", Some("good")).await;
             assert_eq!(status, StatusCode::OK, "{body}");
+        });
+    }
+
+    // --- issue #6: `materialize: never` — described, not routed ------------
+
+    #[test]
+    fn never_backed_export_is_declared_with_null_query_and_absent_from_openapi() {
+        let router = never_router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let exports = v["declared"]["exports"].as_array().unwrap();
+            let stg = exports
+                .iter()
+                .find(|e| e["name"] == "stg")
+                .expect("stg must still be declared");
+            assert!(
+                stg.get("query").is_some_and(|q| q.is_object()),
+                "the materializing export keeps its query block: {body}"
+            );
+            let virtual_pii = exports
+                .iter()
+                .find(|e| e["name"] == "virtual_pii")
+                .expect("virtual_pii must be declared even though it isn't routed (issue #6)");
+            assert!(
+                virtual_pii.get("query").is_none_or(|q| q.is_null()),
+                "a never-backed export's query block must be null: {body}"
+            );
+
+            // No swap-time probe ran against it either — its `source_object`
+            // names no lake relation.
+            assert!(
+                v["observed"]["exports"].get("virtual_pii@1").is_none(),
+                "{body}"
+            );
+            let stg_probe = &v["observed"]["exports"]["stg@1"];
+            assert_eq!(
+                stg_probe["rows"], 2,
+                "stg's own probe is unaffected: {body}"
+            );
+
+            // OpenAPI omits the never-backed path entirely (precedent:
+            // --no-data hands `generate` an empty slice) but keeps the
+            // materializing one.
+            let (status, body) = get(&router, "/openapi.json", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let paths = v["paths"].as_object().unwrap();
+            assert!(paths.contains_key("/stg@1"), "{body}");
+            assert!(!paths.contains_key("/virtual_pii@1"), "{body}");
+        });
+    }
+
+    #[test]
+    fn never_backed_export_data_route_404s_after_auth_naming_the_export() {
+        let router = never_router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/virtual_pii@1", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains("virtual_pii@1"), "{body}");
+            assert!(body.contains("materialize: never"), "{body}");
+            assert!(body.contains("data.channels"), "{body}");
+
+            // The materializing sibling export still serves rows normally.
+            let (status, body) = get(&router, "/stg@1", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), 2, "{body}");
+        });
+    }
+
+    #[test]
+    fn never_backed_export_404_is_gated_behind_auth_not_ahead_of_it() {
+        // ADR 0012 §4's disclosure-boundary rule, per issue #6's review: an
+        // unauthenticated caller must not be able to enumerate which
+        // exports are virtual by probing routes. `authorize()` has to run
+        // (and reject) BEFORE the never-backed check ever fires.
+        let scaffold = built_never_cell();
+        let principals = scaffold.dir.join("never_principals.json");
+        std::fs::write(&principals, r#"{ "good": ["analyst"] }"#).unwrap();
+        let router = never_router_with(|cell| {
+            cell.def.access.roles = vec!["analyst".to_string()];
+            cell.principals = Some(principals.to_string_lossy().into_owned());
+        });
+        rt().block_on(async {
+            // No token at all: 401, never the virtual-export 404 — the
+            // caller learns nothing about whether the route is real.
+            let (status, body) = get(&router, "/virtual_pii@1", None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert!(
+                !body.contains("materialize: never"),
+                "an unauthenticated caller must not learn this export is virtual: {body}"
+            );
+
+            // A correctly-authorized caller reaches the never-backed 404.
+            let (status, body) = get(&router, "/virtual_pii@1", Some("good")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains("materialize: never"), "{body}");
         });
     }
 

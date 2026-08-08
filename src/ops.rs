@@ -62,7 +62,10 @@ pub fn status(file: &Path, profile: &str) -> Result<()> {
             Some(ts) => println!("LATEST -> {n}   (pointer written {ts})"),
             None => println!("LATEST -> {n}"),
         },
-        None => println!("LATEST: absent (no execution published yet — run `datamk run`)"),
+        None => println!(
+            "{}",
+            latest_absent_line(&loaded.def.cell, config::is_all_never(&loaded.transforms))
+        ),
     }
 
     // Persistent run logs + a published run-summary: a compact narration of
@@ -97,6 +100,24 @@ pub fn status(file: &Path, profile: &str) -> Result<()> {
 /// JSON at that key) both silently no-op — this is best-effort
 /// observability layered on top of `status`, never something `status`
 /// depends on to be useful.
+/// `status`'s `LATEST: absent` line — pure, split out for testing (mirrors
+/// `last_run_summary_lines`/`format_rollback_lines`). issue #6: an
+/// all-never cell's `run` refuses before BEGIN (there is no snapshot to
+/// commit) — pointing the generic message at `datamk run` would send the
+/// operator straight into that refusal, so it branches to the commands
+/// that actually apply instead.
+fn latest_absent_line(cell: &str, is_all_never: bool) -> String {
+    if is_all_never {
+        format!(
+            "LATEST: absent — cell '{cell}' is contract-only (every transform is `materialize: \
+             never`); there is nothing to publish. Run `datamk verify` to check the contract, \
+             and `datamk context` to emit the document."
+        )
+    } else {
+        "LATEST: absent (no execution published yet — run `datamk run`)".to_string()
+    }
+}
+
 fn print_last_run_summary(
     store: &Store,
     execution: u64,
@@ -781,6 +802,37 @@ fn format_rollback_lines(items: &[(String, RollbackChange)], target_execution: u
         .collect()
 }
 
+/// `attach`'s "nothing published" refusal when `execution` is unset and no
+/// `LATEST` pointer exists — pure, split out for testing, same reason as
+/// `latest_absent_line`. issue #6: an all-never cell's `run` refuses before
+/// BEGIN, so "run `datamk run -f ... -p ...` first" is a dead end for it;
+/// branch to the commands that actually apply — the contract can be
+/// checked and the document emitted with no snapshot ever having existed.
+fn no_latest_to_attach_message(
+    cell: &str,
+    storage: &str,
+    file: &Path,
+    profile: &str,
+    is_all_never: bool,
+) -> String {
+    if is_all_never {
+        format!(
+            "cell '{cell}' is contract-only (every transform is `materialize: never`) — there \
+             is nothing published to attach. Run `datamk verify -f {} -p {profile}` to check \
+             the contract, and `datamk context -f {} -p {profile} --out context.json` to emit \
+             the document.",
+            file.display(),
+            file.display(),
+        )
+    } else {
+        format!(
+            "no LATEST pointer under {storage} — nothing published yet; run `datamk run -f {} \
+             -p {profile}` first",
+            file.display()
+        )
+    }
+}
+
 /// `datamk attach`: print ready-to-run SQL that attaches the cell's catalog
 /// in DuckDB, read-only. stdout carries ONLY SQL — one statement per line —
 /// so `duckdb -c "$(datamk attach ...) SELECT ..."` composes; resolution
@@ -869,13 +921,16 @@ pub fn attach(file: &Path, profile: &str, execution: Option<u64>, download: bool
             );
             n
         }
-        None => store.latest()?.with_context(|| {
-            format!(
-                "no LATEST pointer under {storage} — nothing published yet; run `datamk run -f \
-                 {} -p {profile}` first",
-                file.display()
-            )
-        })?,
+        None => match store.latest()? {
+            Some(n) => n,
+            None => bail!(no_latest_to_attach_message(
+                &loaded.def.cell,
+                &storage,
+                file,
+                profile,
+                config::is_all_never(&loaded.transforms),
+            )),
+        },
     };
 
     let catalog = format!("{}/{}", storage.trim_end_matches('/'), execution_key(n));
@@ -1355,6 +1410,73 @@ mod tests {
         assert_eq!(
             lines,
             vec!["last run (execution 47): verify passed, 1 transform in 42 ms"]
+        );
+    }
+
+    // --- issue #6: all-never branch messages (status / attach) -------------
+
+    #[test]
+    fn latest_absent_line_points_at_run_for_an_ordinary_cell() {
+        assert_eq!(
+            latest_absent_line("orders", false),
+            "LATEST: absent (no execution published yet — run `datamk run`)"
+        );
+    }
+
+    #[test]
+    fn latest_absent_line_points_at_verify_and_context_for_an_all_never_cell() {
+        let line = latest_absent_line("virtual_only", true);
+        assert!(
+            line.contains("cell 'virtual_only' is contract-only"),
+            "{line}"
+        );
+        assert!(line.contains("materialize: never"), "{line}");
+        assert!(line.contains("datamk verify"), "{line}");
+        assert!(line.contains("datamk context"), "{line}");
+        assert!(
+            !line.contains("datamk run"),
+            "must not send the operator into `run`'s own refusal: {line}"
+        );
+    }
+
+    #[test]
+    fn no_latest_to_attach_message_points_at_run_for_an_ordinary_cell() {
+        let msg = no_latest_to_attach_message(
+            "orders",
+            "s3://bkt/cells/orders",
+            Path::new("cell.yaml"),
+            "prod",
+            false,
+        );
+        assert!(
+            msg.contains("no LATEST pointer under s3://bkt/cells/orders"),
+            "{msg}"
+        );
+        assert!(msg.contains("datamk run -f cell.yaml -p prod"), "{msg}");
+    }
+
+    #[test]
+    fn no_latest_to_attach_message_points_at_verify_and_context_for_an_all_never_cell() {
+        let msg = no_latest_to_attach_message(
+            "virtual_only",
+            "s3://bkt/cells/virtual_only",
+            Path::new("cell.yaml"),
+            "prod",
+            true,
+        );
+        assert!(
+            msg.contains("cell 'virtual_only' is contract-only"),
+            "{msg}"
+        );
+        assert!(msg.contains("materialize: never"), "{msg}");
+        assert!(msg.contains("datamk verify -f cell.yaml -p prod"), "{msg}");
+        assert!(
+            msg.contains("datamk context -f cell.yaml -p prod --out context.json"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("datamk run"),
+            "must not send the operator into `run`'s own refusal: {msg}"
         );
     }
 

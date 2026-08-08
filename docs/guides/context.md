@@ -129,10 +129,14 @@ A few parts earn special attention:
   `values` measurements turn the worst agent failure — an empty result read
   as a legitimate zero — into a diagnosable miss ("June is outside the data's
   range" instead of "revenue was zero").
-- **`status`** is `verified` only when real provenance — a published,
+- **`status`** is weakest to strongest — `draft` | `verified_at_source` |
+  `verified` — never a single verified/not-verified flag, because the
+  strength of the claim behind the document differs by *how* it was
+  checked (see below). `verified` means real provenance — a published,
   verify-gated build — stands behind the document. A cell that has never
-  been published serves `status: "draft"` with an engine note saying exactly
-  that. Draft never wears the verified costume.
+  been published, and never live-checked, serves `status: "draft"` with an
+  engine note saying exactly that. Draft never wears the verified costume,
+  and neither wears the other's.
 - **`declared.upstreams` vs. `observed.upstreams`** close a real gap for
   composed cells: `declared` carries only the author's pin (`version`,
   usually `null` — most cells float on whatever `catalog/LATEST` points at
@@ -330,6 +334,80 @@ channels:
   - "warehouse: analytics.orders_daily (SELECT with your existing grants)"
 ```
 
+## A contract with no rows to copy: `materialize: never`
+
+Some cells own a contract over data they should never own a copy of — a
+semantic layer over a warehouse that already exists, where the rows already
+have a system of record and copying them into DuckLake would just be
+duplication plus a staleness window nobody asked for. A transform can say so
+directly:
+
+```yaml
+transforms:
+  - sql: sql/customer_pii.sql
+    materialize: never    # bind as a session view and stop — nothing is stored
+```
+
+`datamk run` never commits a snapshot for a `materialize: never` transform —
+it binds the SELECT as a session view, checks it, and moves on. A cell whose
+*every* transform is `never` has no snapshot to commit at all, so `run`
+refuses outright and points at `verify`/`context` instead: the contract is
+still real, but the Builder isn't the workload that proves it — a live check
+is.
+
+`datamk verify` proves it: it binds the cell's sources against the live
+warehouse and dry-runs every `never` transform as a session view, then runs
+the exact same schema and grain checks it always has — declared columns
+exist with compatible types, declared grain exists and is unique — just
+against a live query instead of a stored snapshot. In a mixed cell
+(materializing and `never` transforms together), the materialized side is
+still checked against the lake exactly as before; only the `never` side is
+checked live. Every live check is billed by your warehouse like any other
+query — `verify` narrates the scan cost where the connector can supply one
+(the same dry-run preflight `run` already uses), but never skips or caches a
+check to avoid the cost. Run it wherever you'd run any other CI check:
+
+```bash
+datamk verify -f cell.yaml -p prod   # binds sources, live-checks, exits 0/1
+```
+
+A passing live check is what earns `status: "verified_at_source"` —
+deliberately not `verified`. `verified` is a claim about immutable rows that
+still exist behind a published snapshot; a live check is a claim about rows
+as of the moment it ran, which may since have changed. An agent that reads
+`observed.source_check` knows exactly which guarantee it's trusting:
+
+```json
+{
+  "status": "verified_at_source",
+  "grain_verified": true,
+  "observed": {
+    "provenance": null,
+    "source_check": {
+      "outcome": "passed",
+      "checked_at": "2026-08-07T10:00:00Z",
+      "datamk_version": "0.0.14"
+    }
+  }
+}
+```
+
+`data_as_of` joins that block only when a connector can say, cheaply and
+truthfully, when the checked rows were last known-true — omitted otherwise,
+never guessed and never defaulted to `checked_at`.
+
+`verify` and `context` are typically separate steps in CI — verify against
+the warehouse, then emit the document — so the passing check has to survive
+between processes. `verify` records it under `.cell/source_check.json`,
+stamped with a digest of the `cell.yaml` it ran against; `context` embeds
+`observed.source_check` only when that digest still matches. Edit the cell
+between the two steps and the record goes stale silently: `context` omits it
+entirely (falling back to `draft` if nothing else stands behind the
+document) rather than reporting a check that no longer describes the current
+contract. There's no freshness window beyond that digest match — the
+document always carries `checked_at`, and it's on the consumer to decide how
+old is too old for its purposes.
+
 ## Many cells: the mesh manifest
 
 An agent holding one cell's URL can orient on that cell. To tell it which
@@ -361,11 +439,16 @@ whatever cadence keeps the summaries fresh.
 
 ## The trust model, in one paragraph
 
-The document's authority comes from the build. `verify` checks the declared
-schema and grain uniqueness against the actual rows on every build, and a
-published execution is created only after `verify` passes — so
-`status: "verified"` means a machine checked the claims against the data,
-recently, and the document can prove when. The prose is the one part the
-machine cannot check; the ratchet bounds its drift, and the
-`declared`/`observed` split makes sure an agent always knows which kind of
-statement it is reading.
+The document's authority comes from a machine check, not from prose. `verify`
+checks the declared schema and grain uniqueness against the actual rows —
+against a published snapshot for a materializing cell, live against the
+warehouse for a `materialize: never` one — and never against anything else.
+A published execution is created only after `verify` passes, so
+`status: "verified"` means a machine checked the claims against immutable
+rows that still exist behind that snapshot; `status: "verified_at_source"`
+means a machine checked the claims live, as of the timestamp it carries,
+against rows that may since have changed — a real but weaker guarantee, on
+purpose given its own token so no consumer inherits it by assuming
+`verified`'s meaning. The prose is the one part no machine check covers; the
+ratchet bounds its drift, and the `declared`/`observed` split makes sure an
+agent always knows which kind of statement it is reading.
