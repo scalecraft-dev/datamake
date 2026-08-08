@@ -154,6 +154,13 @@ pub struct ContextArgs {
     /// Write the document to a file instead of stdout
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Emit identity + fingerprints only — withhold docs page content (ADR
+    /// 0013). Mirrors `serve --no-data`'s withholding idiom: a portable
+    /// artifact inlines docs by default (a request can be repeated, a file
+    /// cannot — a null-content pointer to a path the reader doesn't have is
+    /// a dangling pointer), so this is a negative flag.
+    #[arg(long)]
+    pub no_docs: bool,
 }
 
 #[derive(Args)]

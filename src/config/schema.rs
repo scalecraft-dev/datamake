@@ -12,6 +12,14 @@ pub struct CellDef {
     /// Length-capped at parse time (`validate_prose`).
     #[serde(default)]
     pub description: Option<String>,
+    /// A relative path to one long-form prose page, additive to
+    /// `description` — never a replacement (ADR 0013). Delivered inline in
+    /// the context document only under `GET /context?include=docs`; there
+    /// is no `/docs/:name` route. Resolved and cap-checked at load
+    /// (`validate_docs`, next to `validate_prose`), same failure discipline
+    /// as `principals:`.
+    #[serde(default)]
+    pub docs: Option<String>,
     /// External inputs, bound as session-local TEMP VIEWs before transforms run.
     /// A source is either a raw path/URI or a reference to another cell's table.
     #[serde(default)]
@@ -55,6 +63,12 @@ pub struct Export {
     /// lands on the deliberate promotion gesture, enforced by `verify`.
     #[serde(default)]
     pub description: Option<String>,
+    /// A relative path to one long-form prose page for this export,
+    /// additive to `description` — never a replacement, and never a
+    /// substitute for it: `docs:` does not satisfy the `contract: supported`
+    /// description lint (`verify`, ADR 0013).
+    #[serde(default)]
+    pub docs: Option<String>,
     /// Grain columns: exposed as equality filters and uniqueness-checked by `verify`.
     #[serde(default)]
     pub grain: Vec<String>,
@@ -1036,6 +1050,15 @@ impl CellDef {
             .with_context(|| format!("parsing cell definition {}", path.display()))?;
         def.validate_prose()
             .with_context(|| format!("validating cell definition {}", path.display()))?;
+        // ADR 0013: `docs:` paths are resolved (allowlist-by-construction:
+        // relative, canonicalized, under the cell dir, never into
+        // `profiles/` or `.cell/`) and cap-checked here, fail-loud — same
+        // discipline as `principals:` (`load_principals`). Every caller of
+        // `CellDef::load`/`config::load` gets a validated cell before
+        // anything opens a connection.
+        let dir = super::cell_dir(path);
+        super::docs::validate_all(&dir, &def)
+            .with_context(|| format!("validating cell definition {}", path.display()))?;
         Ok(def)
     }
 
@@ -1122,6 +1145,7 @@ mod tests {
             version: version.to_string(),
             source: source.map(str::to_string),
             description: None,
+            docs: None,
             grain: vec![],
             schema: IndexMap::new(),
             freshness: None,

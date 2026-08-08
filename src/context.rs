@@ -58,6 +58,20 @@ pub struct ContextDocument {
     /// Engine-emitted only — no author-supplied string ever lands here
     /// (author prose lives in `declared`, labeled as a claim).
     pub notes: Vec<String>,
+    /// Which optional sections this response inlines (ADR 0013) —
+    /// engine-emitted, always present: `[]` on the default variant, `["docs"]`
+    /// under `?include=docs` (served) or the default portable emission. Lets
+    /// an agent distinguish "server predates this field" (absent — an old
+    /// binary) from "this cell has no docs" (present, and `docs` below is
+    /// `Some({})`), the same assert-absence discipline as `observed`.
+    pub included: Vec<String>,
+    /// Docs page content (ADR 0013), present ONLY when `included` contains
+    /// `"docs"`. Top-level (not nested under `declared`) so a prose-only edit
+    /// never moves `interface_digest` — that digest is also `/openapi.json`'s
+    /// `info.version` and the mesh manifest's `context_digest`, and a prose
+    /// typo must not tell generic tooling the callable surface changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs: Option<IndexMap<String, DocsContentEntry>>,
     /// Portable artifact only (`datamk context`): when the document was
     /// emitted. A hosted `/context` omits it — the response is always now.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +103,52 @@ pub struct Declared {
     /// (the upstream owner's to disclose, on its own document, under its own
     /// auth — ADR 0012 §5).
     pub upstreams: Vec<UpstreamRef>,
+    /// Docs page **identity only** (ADR 0013) — `{target, path, media_type}`
+    /// per declared page, always present (`[]` when none). No
+    /// content-derived value here (no sha256, no bytes): this struct is what
+    /// `interface_digest` serializes whole, and a prose typo must not tell
+    /// generic OpenAPI tooling the callable surface changed. Identity
+    /// (adding/removing/renaming a page) legitimately does move the digest —
+    /// see `digest_tracks_docs_identity_but_ignores_content_and_fingerprint`.
+    pub docs: Vec<DeclaredDocsEntry>,
+    /// The affordance to fetch the pages above — a constant, always present,
+    /// the same precedent as `DeclaredExport::query` (an affordance field
+    /// inside `declared`).
+    pub include_request: String,
+}
+
+/// `/context?include=docs` — the one and only door to docs content (ADR
+/// 0012 §4: one document, one route; there is no `/docs/:name`).
+const INCLUDE_DOCS_REQUEST: &str = "/context?include=docs";
+
+/// One declared docs page's identity — never its content or a
+/// content-derived fingerprint (those live at the top-level `docs` field and
+/// under `observed.docs` respectively).
+#[derive(Debug, Clone, Serialize)]
+pub struct DeclaredDocsEntry {
+    /// `"cell"` or the route key (`name@major`) — route keys always carry
+    /// `@major`, so an export can never collide with the literal `"cell"`.
+    pub target: String,
+    pub path: String,
+    pub media_type: String,
+}
+
+/// One docs page's content, as served under `?include=docs` (ADR 0013).
+/// Never under `observed` — author bytes are a claim, not a measurement.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocsContentEntry {
+    pub media_type: String,
+    pub content: String,
+}
+
+/// One docs page's content fingerprint (ADR 0013) — a machine fact computed
+/// at release time and carried through `published.json`, never author bytes.
+/// Present in both the default and docs variant (it is cheap identity data,
+/// not gated behind `include=docs`) and never in `interface_digest`.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct DocsFingerprint {
+    pub sha256: String,
+    pub bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +246,14 @@ pub struct Observed {
     /// legitimate zero — into a diagnosable miss.
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub exports: IndexMap<String, ExportProbe>,
+    /// Docs page fingerprints (ADR 0013), `{target: {sha256, bytes}}` —
+    /// computed at release time and carried through `published.json`, never
+    /// at config-load time (which would force this non-empty on every
+    /// unbuilt cell that merely declares `docs:`, breaking the "`observed`
+    /// stays null on an unbuilt cell" invariant below). Author bytes never
+    /// sit here — only their fingerprint.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub docs: IndexMap<String, DocsFingerprint>,
 }
 
 /// What was actually attached for one `cell` source (issue #7): the
@@ -345,7 +413,35 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)], with_query: bool) ->
         description: def.description.clone(),
         exports,
         upstreams,
+        docs: docs_entries(def, routes),
+        include_request: INCLUDE_DOCS_REQUEST.to_string(),
     }
+}
+
+/// Docs identity only (ADR 0013): the cell-level page (if declared) plus
+/// every **discoverable** export's page, in that order — no filesystem
+/// access, since identity needs only the declared path and its extension. A
+/// private export's docs entry never appears here, matching the same
+/// visibility filter `routes` was already built with (ADR 0012 §4).
+fn docs_entries(def: &CellDef, routes: &[(String, Export)]) -> Vec<DeclaredDocsEntry> {
+    let mut entries = Vec::new();
+    if let Some(path) = &def.docs {
+        entries.push(DeclaredDocsEntry {
+            target: "cell".to_string(),
+            path: path.clone(),
+            media_type: crate::config::docs::guess_media_type(path).to_string(),
+        });
+    }
+    for (route, e) in routes {
+        if let Some(path) = &e.docs {
+            entries.push(DeclaredDocsEntry {
+                target: route.clone(),
+                path: path.clone(),
+                media_type: crate::config::docs::guess_media_type(path).to_string(),
+            });
+        }
+    }
+    entries
 }
 
 /// The served affordances for one export — derived from the exact constants
@@ -394,6 +490,7 @@ pub fn assemble(
     freshness: Option<FreshnessBlock>,
     upstreams: Vec<ObservedUpstream>,
     probes: IndexMap<String, ExportProbe>,
+    docs_fingerprints: IndexMap<String, DocsFingerprint>,
     served_here: bool,
     channels: Vec<String>,
     direct_attach: bool,
@@ -424,12 +521,14 @@ pub fn assemble(
             || freshness.is_some()
             || !upstreams.is_empty()
             || !probes.is_empty()
+            || !docs_fingerprints.is_empty()
         {
             Some(Observed {
                 provenance,
                 freshness,
                 upstreams,
                 exports: probes,
+                docs: docs_fingerprints,
             })
         } else {
             None
@@ -439,6 +538,11 @@ pub fn assemble(
             channels,
         },
         notes,
+        // Request-specific (`?include=docs`) / flag-specific (`--no-docs`):
+        // set by the caller after `assemble`/`build` returns, the same
+        // post-build mutation pattern `emit` already uses for `emitted_at`.
+        included: Vec::new(),
+        docs: None,
         emitted_at: None,
         cell_yaml_digest: None,
     }
@@ -455,6 +559,7 @@ pub fn build(
     provenance: Option<Provenance>,
     freshness: Option<FreshnessBlock>,
     upstreams: Vec<ObservedUpstream>,
+    docs_fingerprints: IndexMap<String, DocsFingerprint>,
     with_query: bool,
     served_here: bool,
     direct_attach: bool,
@@ -466,6 +571,7 @@ pub fn build(
         freshness,
         upstreams,
         IndexMap::new(),
+        docs_fingerprints,
         served_here,
         Vec::new(),
         direct_attach,
@@ -570,7 +676,19 @@ fn hex(bytes: &[u8]) -> String {
 /// `LATEST`'s run summary from the store (the same trust and credentials as
 /// `datamk status`). Pinless ⇒ draft, by definition — a direct-attach
 /// profile has no pin and emits a draft even after a local build.
-pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>) -> Result<()> {
+///
+/// `no_docs` (ADR 0013) is the one asymmetry with the served door: a request
+/// can be repeated, a file cannot — so a portable artifact **inlines docs by
+/// default**; `--no-docs` withholds content, emitting identity + fingerprints
+/// only (mirroring `serve --no-data`'s withholding idiom). `included` is
+/// truthful in both cases, so a consumer never needs to know which door
+/// produced the file.
+pub fn emit(
+    file: &std::path::Path,
+    profile: &str,
+    out: Option<&std::path::Path>,
+    no_docs: bool,
+) -> Result<()> {
     use anyhow::Context as _;
 
     let loaded = crate::config::load(file, profile)?;
@@ -601,17 +719,49 @@ pub fn emit(file: &std::path::Path, profile: &str, out: Option<&std::path::Path>
         }
     };
 
+    // Docs fingerprints (ADR 0013 §5): a release-time fact, read from
+    // `published.json` when one exists — never recomputed here (computing at
+    // load/emit time would populate `observed.docs` on every never-run cell
+    // that merely declares `docs:`, the exact invariant break §5 forbids).
+    let docs_fingerprints: IndexMap<String, DocsFingerprint> =
+        crate::manifest::Published::load(&loaded.dir)
+            .map(|p| p.docs.into_iter().collect())
+            .unwrap_or_default();
+
     let mut doc = build(
         &loaded.def,
         &routes,
         provenance,
         /* freshness */ None, // poll telemetry is a lie the instant the file is written
         upstreams,
+        docs_fingerprints,
         /* with_query */ true,
         /* served_here */ false, // a file serves no rows
         direct_attach,
     );
     doc.data.channels = loaded.bindings.channels.clone();
+
+    // ADR 0013 §7: inline by default — a portable artifact with null content
+    // pointing at a path the reader doesn't have is a dangling pointer.
+    if !no_docs {
+        let pages = crate::config::docs::load_declared(&loaded.dir, &loaded.def, &routes)?;
+        doc.included = vec!["docs".to_string()];
+        doc.docs = Some(
+            pages
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.target,
+                        DocsContentEntry {
+                            media_type: p.media_type,
+                            content: p.content.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
     doc.cell_yaml_digest = Some(sha256_hex(
         &std::fs::read(file).with_context(|| format!("reading {}", file.display()))?,
@@ -687,6 +837,7 @@ interface:
                 last_successful_poll_age_seconds: Some(3),
             }),
             /* upstreams */ Vec::new(),
+            IndexMap::new(),
             /* with_query */ true,
             /* served_here */ true,
             /* direct_attach */ false,
@@ -750,7 +901,9 @@ interface:
         "ref": "flights",
         "version": 7
       }
-    ]
+    ],
+    "docs": [],
+    "include_request": "/context?include=docs"
   },
   "observed": {
     "provenance": {
@@ -772,7 +925,8 @@ interface:
     "served_here": true,
     "channels": []
   },
-  "notes": []
+  "notes": [],
+  "included": []
 }"#;
         assert_eq!(json, expected);
     }
@@ -784,19 +938,46 @@ interface:
     fn draft_document_asserts_unbuilt_status_positively() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let doc = build(&def, &routes, None, None, Vec::new(), true, true, false);
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "draft");
         assert_eq!(v["grain_verified"], false);
         assert!(v["observed"].is_null(), "observed must be null, got {v}");
         assert_eq!(v["notes"][0], NOTE_NOTHING_BUILT);
+        // ADR 0013: `included` is always present, `[]` when nothing was
+        // requested/inlined — never absent, the old-binary/no-docs signal.
+        assert_eq!(v["included"], serde_json::json!([]));
+        assert!(
+            v["docs"].is_null(),
+            "docs must be absent when not requested"
+        );
     }
 
     #[test]
     fn direct_attach_document_is_draft_with_the_direct_attach_note() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let doc = build(&def, &routes, None, None, Vec::new(), true, true, true);
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            true,
+        );
         assert_eq!(doc.status, Status::Draft);
         assert_eq!(doc.notes, vec![NOTE_DIRECT_ATTACH.to_string()]);
     }
@@ -860,7 +1041,17 @@ interface:
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
         let verified = sample_verified();
-        let draft = build(&def, &routes, None, None, Vec::new(), true, true, false);
+        let draft = build(
+            &def,
+            &routes,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
         assert_eq!(
             digest_of(&verified),
             digest_of(&draft),
@@ -870,11 +1061,119 @@ interface:
         let mut def2 = sample_def();
         def2.interface[0].grain.push("channel".to_string());
         let routes2 = discoverable_routes(&def2).unwrap();
-        let changed = build(&def2, &routes2, None, None, Vec::new(), true, true, false);
+        let changed = build(
+            &def2,
+            &routes2,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
         assert_ne!(
             digest_of(&draft),
             digest_of(&changed),
             "a declared-interface change must move the digest"
+        );
+    }
+
+    /// ADR 0013: the digest tracks docs **identity** (adding, removing, or
+    /// renaming a page moves it, since that's part of `Declared`) but never
+    /// docs **content** or its fingerprint (neither lives inside `Declared`)
+    /// — in the mold of `digest_ignores_observed_but_tracks_declared`.
+    #[test]
+    fn digest_tracks_docs_identity_but_ignores_content_and_fingerprint() {
+        let mut def = sample_def();
+        def.docs = Some("docs/overview.md".to_string());
+        let routes = discoverable_routes(&def).unwrap();
+        let base = build(
+            &def,
+            &routes,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+
+        // Injecting top-level content (as `?include=docs` would) must not
+        // move the digest — content lives outside `declared`.
+        let mut with_content = base.clone();
+        with_content.included = vec!["docs".to_string()];
+        with_content.docs = Some(IndexMap::from([(
+            "cell".to_string(),
+            DocsContentEntry {
+                media_type: "text/markdown; charset=utf-8".to_string(),
+                content: "Some prose an agent will read.".to_string(),
+            },
+        )]));
+        assert_eq!(
+            digest_of(&base),
+            digest_of(&with_content),
+            "inlined docs content must not move the digest"
+        );
+
+        // Neither must a fingerprint (`observed.docs`) — a machine fact, not
+        // part of the interface.
+        let mut fp = IndexMap::new();
+        fp.insert(
+            "cell".to_string(),
+            DocsFingerprint {
+                sha256: "abc123".to_string(),
+                bytes: 3,
+            },
+        );
+        let with_fp = build(&def, &routes, None, None, Vec::new(), fp, true, true, false);
+        assert_eq!(
+            digest_of(&base),
+            digest_of(&with_fp),
+            "a docs fingerprint must not move the digest"
+        );
+
+        // Renaming the declared page DOES move the digest.
+        let mut def_renamed = def.clone();
+        def_renamed.docs = Some("docs/other.md".to_string());
+        let routes_renamed = discoverable_routes(&def_renamed).unwrap();
+        let renamed = build(
+            &def_renamed,
+            &routes_renamed,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+        assert_ne!(
+            digest_of(&base),
+            digest_of(&renamed),
+            "renaming a declared docs page must move the digest"
+        );
+
+        // Removing it DOES move the digest.
+        let mut def_removed = def.clone();
+        def_removed.docs = None;
+        let routes_removed = discoverable_routes(&def_removed).unwrap();
+        let removed = build(
+            &def_removed,
+            &routes_removed,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+        assert_ne!(
+            digest_of(&base),
+            digest_of(&removed),
+            "removing a declared docs page must move the digest"
         );
     }
 
@@ -884,7 +1183,17 @@ interface:
     fn portable_shape_keeps_the_grammar_without_claiming_to_serve() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let mut doc = build(&def, &routes, None, None, Vec::new(), true, false, true);
+        let mut doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            false,
+            true,
+        );
         doc.emitted_at = Some("2026-08-06T00:00:00Z".to_string());
         doc.cell_yaml_digest = Some("abc123".to_string());
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
@@ -999,7 +1308,17 @@ interface:
     fn digest_ignores_observed_upstreams() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let draft = build(&def, &routes, None, None, Vec::new(), true, true, false);
+        let draft = build(
+            &def,
+            &routes,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
         let with_upstreams = build(
             &def,
             &routes,
@@ -1010,6 +1329,7 @@ interface:
                 execution: Some(41),
                 data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
             }],
+            IndexMap::new(),
             true,
             true,
             false,
@@ -1018,6 +1338,68 @@ interface:
             digest_of(&draft),
             digest_of(&with_upstreams),
             "observed.upstreams must not move the digest"
+        );
+    }
+
+    /// Both new-facts sources at once (issue #7 + ADR 0013): a document with
+    /// populated `observed.upstreams` AND populated docs (identity, inlined
+    /// content, and a fingerprint) must still digest identically to the bare
+    /// draft — neither is part of the interface, and the two features
+    /// landing in the same release must not compound into a churned digest.
+    #[test]
+    fn digest_ignores_observed_upstreams_and_docs_content_together() {
+        let mut def = sample_def();
+        def.docs = Some("docs/overview.md".to_string());
+        let routes = discoverable_routes(&def).unwrap();
+        let draft = build(
+            &def,
+            &routes,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+
+        let mut fp = IndexMap::new();
+        fp.insert(
+            "cell".to_string(),
+            DocsFingerprint {
+                sha256: "abc123".to_string(),
+                bytes: 3,
+            },
+        );
+        let mut loaded = build(
+            &def,
+            &routes,
+            None,
+            None,
+            vec![ObservedUpstream {
+                reference: "flights".to_string(),
+                execution: Some(41),
+                data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
+            }],
+            fp,
+            true,
+            true,
+            false,
+        );
+        // Inline docs content too, as `?include=docs` would.
+        loaded.included = vec!["docs".to_string()];
+        loaded.docs = Some(IndexMap::from([(
+            "cell".to_string(),
+            DocsContentEntry {
+                media_type: "text/markdown; charset=utf-8".to_string(),
+                content: "Some prose an agent will read.".to_string(),
+            },
+        )]));
+
+        assert_eq!(
+            digest_of(&draft),
+            digest_of(&loaded),
+            "observed.upstreams and docs content/fingerprint together must not move the digest"
         );
     }
 
@@ -1037,6 +1419,7 @@ interface:
                 execution: Some(41),
                 data_as_of: None,
             }],
+            IndexMap::new(),
             true,
             true,
             false,
@@ -1057,5 +1440,112 @@ interface:
             !json.contains(r#""upstreams":[]"#),
             "observed.upstreams must be skipped when empty, not emitted as []: {json}"
         );
+    }
+
+    // --- ADR 0013: long-form docs pages -------------------------------
+
+    /// ADR 0013: `declared.docs` is identity only (target/path/media_type),
+    /// always present (`[]` when none), and excludes a private export's page
+    /// exactly like every other private-export fact (ADR 0012 §4).
+    #[test]
+    fn declared_docs_carries_identity_only_and_excludes_private_exports() {
+        let mut def = sample_def();
+        def.docs = Some("docs/overview.md".to_string());
+        def.interface[0].docs = Some("docs/orders_daily.md".to_string());
+        def.interface[1].docs = Some("docs/internal.md".to_string()); // private export
+        let routes = discoverable_routes(&def).unwrap();
+        let d = declared(&def, &routes, true);
+
+        assert_eq!(d.include_request, "/context?include=docs");
+        assert_eq!(d.docs.len(), 2, "{:?}", d.docs);
+        assert_eq!(d.docs[0].target, "cell");
+        assert_eq!(d.docs[0].path, "docs/overview.md");
+        assert_eq!(d.docs[0].media_type, "text/markdown; charset=utf-8");
+        assert_eq!(d.docs[1].target, "orders_daily@2");
+        assert_eq!(d.docs[1].path, "docs/orders_daily.md");
+
+        // Private export's docs page never appears, in any form.
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("internal.md"), "{json}");
+    }
+
+    #[test]
+    fn declared_docs_is_empty_but_present_when_nothing_is_declared() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let d = declared(&def, &routes, true);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["docs"], serde_json::json!([]));
+        assert_eq!(v["include_request"], "/context?include=docs");
+    }
+
+    /// ADR 0013 §7: `datamk context` inlines docs by default — a request can
+    /// be repeated, a file cannot — and `--no-docs` emits identity +
+    /// fingerprints only. Exercises the real `emit` entry point end to end
+    /// on a direct-attach profile (no DB, no network — `emit` never touches
+    /// either in that mode), so this is the seam that actually proves the
+    /// CLI flag reaches the file, not just the internal `build`/`assemble`
+    /// plumbing.
+    #[test]
+    fn emit_inlines_docs_by_default_and_no_docs_withholds_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-context-emit-docs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: orders\n\
+             description: Daily order revenue by region.\n\
+             docs: docs/overview.md\n\
+             interface:\n\
+             \x20 - name: orders_daily\n\
+             \x20   version: 1.0.0\n\
+             \x20   description: One row per order.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("docs/overview.md"),
+            "# Orders\n\nWhat this cell is for, at length.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+
+        let default_out = dir.join("context.json");
+        emit(&dir.join("cell.yaml"), "local", Some(&default_out), false).unwrap();
+        let default_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&default_out).unwrap()).unwrap();
+        assert_eq!(default_doc["included"], serde_json::json!(["docs"]));
+        assert!(
+            default_doc["docs"]["cell"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("What this cell is for"),
+            "{default_doc}"
+        );
+
+        let no_docs_out = dir.join("context_no_docs.json");
+        emit(&dir.join("cell.yaml"), "local", Some(&no_docs_out), true).unwrap();
+        let no_docs_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&no_docs_out).unwrap()).unwrap();
+        assert_eq!(no_docs_doc["included"], serde_json::json!([]));
+        assert!(no_docs_doc["docs"].is_null(), "{no_docs_doc}");
+        // Identity still ships either way — `--no-docs` withholds content,
+        // not the fact that a page exists.
+        assert_eq!(
+            no_docs_doc["declared"]["docs"][0]["path"],
+            "docs/overview.md"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
