@@ -73,7 +73,12 @@ pub fn status(file: &Path, profile: &str) -> Result<()> {
     // substitute for the watermark block below, which stays sourced from
     // the catalog itself.
     if let Some(n) = latest {
-        print_last_run_summary(&store, n);
+        if let Some(summary) = print_last_run_summary(&store, n) {
+            // Issue #7: what got read, not what was asked for — the
+            // execution/freshness actually attached for each `cell`
+            // source, reusing the summary this fetch already paid for.
+            print_status_upstreams(&loaded.def, &summary);
+        }
     }
 
     // ADR 0005 §4: only when the cell declares incremental sources AND there
@@ -113,15 +118,117 @@ fn latest_absent_line(cell: &str, is_all_never: bool) -> String {
     }
 }
 
-fn print_last_run_summary(store: &Store, execution: u64) {
-    let Ok(Some(bytes)) = store.get(&crate::store::run_summary_key(execution)) else {
-        return;
-    };
-    let Ok(summary) = serde_json::from_slice::<engine::run_summary::RunSummary>(&bytes) else {
-        return;
-    };
+fn print_last_run_summary(
+    store: &Store,
+    execution: u64,
+) -> Option<engine::run_summary::RunSummary> {
+    let bytes = store
+        .get(&crate::store::run_summary_key(execution))
+        .ok()
+        .flatten()?;
+    let summary = serde_json::from_slice::<engine::run_summary::RunSummary>(&bytes).ok()?;
     for line in last_run_summary_lines(&summary) {
         println!("{line}");
+    }
+    Some(summary)
+}
+
+/// Issue #7: `upstreams (at LATEST):`, the CLI half of the feature — a
+/// resolved execution/freshness in the JSON document nobody reads doesn't
+/// fix "silently stale" on its own. Omitted entirely when the cell declares
+/// no `cell:` sources. Best-effort like the rest of `status`'s narration:
+/// this runs only once `print_last_run_summary` has already produced a
+/// summary to read from.
+fn print_status_upstreams(def: &config::CellDef, summary: &engine::run_summary::RunSummary) {
+    let refs = crate::context::cell_source_refs(def);
+    if refs.is_empty() {
+        return;
+    }
+    let upstreams = crate::context::observed_upstreams_from(&refs, summary);
+    println!("upstreams (at LATEST):");
+    let now = crate::timeutil::unix_now();
+    for line in format_upstream_lines(&upstreams, now) {
+        println!("{line}");
+    }
+}
+
+/// Pure line-building for `print_status_upstreams`, split out for testing
+/// (mirrors `format_status_lines`/`last_run_summary_lines`): two-space
+/// indent, one line per declared `cell` source, Nones spelled out rather
+/// than omitted so a stale/never-observed upstream is exactly as visible as
+/// a fresh one.
+fn format_upstream_lines(upstreams: &[crate::context::ObservedUpstream], now: i64) -> Vec<String> {
+    upstreams
+        .iter()
+        .map(|u| {
+            let execution = match u.execution {
+                Some(n) => format!("execution {n}"),
+                None => "execution unknown (direct-attach or unpublished)".to_string(),
+            };
+            let freshness = match u.data_as_of.as_deref().and_then(parse_duckdb_timestamp) {
+                Some(then) => format!(
+                    "data as of {} ({} old)",
+                    u.data_as_of.as_deref().unwrap_or_default(),
+                    format_age(now - then)
+                ),
+                None => "data as of unknown".to_string(),
+            };
+            format!("  {}: {execution}, {freshness}", u.reference)
+        })
+        .collect()
+}
+
+/// Parse the exact shape DuckDB's `CAST(... AS VARCHAR)` produces for a
+/// `TIMESTAMP WITH TIME ZONE` (`query_upstream_data_as_of`'s output):
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]+00`. Ducklake snapshot times are always
+/// UTC, so the offset is assumed rather than parsed. Not a general RFC 3339
+/// parser — `timeutil` deliberately has none (see its module doc) — this is
+/// the one display that needs age math without a live DuckDB connection to
+/// redo the cast on.
+fn parse_duckdb_timestamp(s: &str) -> Option<i64> {
+    let date_time = s.split(['+', 'Z']).next().unwrap_or(s);
+    let (date, time) = date_time.split_once([' ', 'T'])?;
+    let mut d = date.splitn(3, '-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    let time = time.split('.').next().unwrap_or(time); // drop fractional seconds
+    let mut t = time.splitn(3, ':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let min: i64 = t.next()?.parse().ok()?;
+    let sec: i64 = t.next()?.parse().ok()?;
+
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Days since the Unix epoch for a UTC calendar date — the inverse of
+/// `timeutil::civil_from_days` (Howard Hinnant's `days_from_civil`,
+/// <https://howardhinnant.github.io/date_algorithms.html>, public domain).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// A compact age string: the largest two non-zero units, matching the
+/// `status` narration's terse style — never a full duration spelled out.
+fn format_age(secs: i64) -> String {
+    let secs = secs.max(0);
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        "just now".to_string()
     }
 }
 
@@ -1238,6 +1345,8 @@ mod tests {
                     kind: Some("query".to_string()),
                     staged_rows: Some(59_542_301),
                     bytes_scanned: Some(987_654_321),
+                    execution: None,
+                    data_as_of: None,
                 },
                 engine::run_summary::SourceRunInfo {
                     name: "raw_flights".to_string(),
@@ -1245,6 +1354,8 @@ mod tests {
                     kind: Some("table".to_string()),
                     staged_rows: None,
                     bytes_scanned: None,
+                    execution: None,
+                    data_as_of: None,
                 },
                 engine::run_summary::SourceRunInfo {
                     name: "raw_orders".to_string(),
@@ -1252,6 +1363,8 @@ mod tests {
                     kind: None,
                     staged_rows: None,
                     bytes_scanned: None,
+                    execution: None,
+                    data_as_of: None,
                 },
             ],
             transforms: vec![
@@ -1364,6 +1477,81 @@ mod tests {
         assert!(
             !msg.contains("datamk run"),
             "must not send the operator into `run`'s own refusal: {msg}"
+        );
+    }
+
+    // --- issue #7: format_upstream_lines / parse_duckdb_timestamp -------
+
+    fn upstream(
+        reference: &str,
+        execution: Option<u64>,
+        data_as_of: Option<&str>,
+    ) -> crate::context::ObservedUpstream {
+        crate::context::ObservedUpstream {
+            reference: reference.to_string(),
+            execution,
+            data_as_of: data_as_of.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn format_upstream_lines_states_execution_and_age() {
+        // now = 2026-08-07T09:00:11Z; data_as_of = 2026-08-04T06:00:11+00 —
+        // exactly 3 days 3 hours old (the ADR-sample shape).
+        let now = parse_duckdb_timestamp("2026-08-07 09:00:11+00").unwrap();
+        let lines = format_upstream_lines(
+            &[upstream(
+                "flights",
+                Some(41),
+                Some("2026-08-04 06:00:11+00"),
+            )],
+            now,
+        );
+        assert_eq!(
+            lines,
+            vec!["  flights: execution 41, data as of 2026-08-04 06:00:11+00 (3d 3h old)"]
+        );
+    }
+
+    #[test]
+    fn format_upstream_lines_handles_none_execution_and_none_data_as_of() {
+        let lines = format_upstream_lines(&[upstream("flights", None, None)], 0);
+        assert_eq!(
+            lines,
+            vec!["  flights: execution unknown (direct-attach or unpublished), data as of unknown"]
+        );
+    }
+
+    #[test]
+    fn parse_duckdb_timestamp_round_trips_known_dates() {
+        assert_eq!(parse_duckdb_timestamp("1970-01-01 00:00:00+00"), Some(0));
+        assert_eq!(
+            parse_duckdb_timestamp("2026-08-04 06:00:11+00"),
+            Some(1_785_823_211)
+        );
+        // Fractional seconds must not break parsing.
+        assert_eq!(
+            parse_duckdb_timestamp("2026-08-04 06:00:11.987654+00"),
+            Some(1_785_823_211)
+        );
+    }
+
+    #[test]
+    fn parse_duckdb_timestamp_rejects_garbage() {
+        assert_eq!(parse_duckdb_timestamp("not a timestamp"), None);
+        assert_eq!(parse_duckdb_timestamp(""), None);
+    }
+
+    #[test]
+    fn format_age_picks_the_two_largest_nonzero_units() {
+        assert_eq!(format_age(3 * 86_400 + 3 * 3600 + 5 * 60), "3d 3h");
+        assert_eq!(format_age(2 * 3600 + 30 * 60), "2h 30m");
+        assert_eq!(format_age(45 * 60), "45m");
+        assert_eq!(format_age(30), "just now");
+        assert_eq!(
+            format_age(-5),
+            "just now",
+            "a future timestamp must not go negative"
         );
     }
 

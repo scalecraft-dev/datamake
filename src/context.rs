@@ -252,6 +252,16 @@ pub struct Observed {
     /// artifact — poll telemetry is a lie the instant the file is written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<FreshnessBlock>,
+    /// The execution/freshness actually attached for each `cell` source
+    /// (issue #7) — the gap `declared.upstreams`' author-pinned `version`
+    /// leaves open when a source floats: what got read, not what was
+    /// asked for. Deliberately *not* on `UpstreamRef`/`Declared` (ADR 0012
+    /// §2): that struct is hashed into `interface_digest`, and an
+    /// execution number there would churn agent caches on every refresh
+    /// without the interface moving. Empty for cells with no cell sources,
+    /// or when nothing has been observed yet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<ObservedUpstream>,
     /// Swap-time probe results, per route (ADR 0012 §5) — measured against
     /// the rows the route actually serves (pinned snapshot for supported
     /// routes), never computed on the request path, omitted on failure.
@@ -267,6 +277,22 @@ pub struct Observed {
     /// sit here — only their fingerprint.
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub docs: IndexMap<String, DocsFingerprint>,
+}
+
+/// What was actually attached for one `cell` source (issue #7): the
+/// resolved execution and its snapshot time, never the upstream `table`
+/// (same disclosure boundary as `UpstreamRef` — ADR 0012 §5). `execution`
+/// is `None` for a direct-attach cell source (no execution number exists to
+/// report — ADR 0004 §12) or when nothing has been observed; never
+/// fabricated.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObservedUpstream {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_as_of: Option<String>,
 }
 
 /// What the swap-time probe measured for one export.
@@ -570,6 +596,7 @@ pub fn assemble(
     provenance: Option<Provenance>,
     source_check: Option<SourceCheck>,
     freshness: Option<FreshnessBlock>,
+    upstreams: Vec<ObservedUpstream>,
     probes: IndexMap<String, ExportProbe>,
     docs_fingerprints: IndexMap<String, DocsFingerprint>,
     served_here: bool,
@@ -603,6 +630,7 @@ pub fn assemble(
         observed: if provenance.is_some()
             || source_check.is_some()
             || freshness.is_some()
+            || !upstreams.is_empty()
             || !probes.is_empty()
             || !docs_fingerprints.is_empty()
         {
@@ -610,6 +638,7 @@ pub fn assemble(
                 provenance,
                 source_check,
                 freshness,
+                upstreams,
                 exports: probes,
                 docs: docs_fingerprints,
             })
@@ -643,6 +672,7 @@ pub fn build(
     provenance: Option<Provenance>,
     source_check: Option<SourceCheck>,
     freshness: Option<FreshnessBlock>,
+    upstreams: Vec<ObservedUpstream>,
     docs_fingerprints: IndexMap<String, DocsFingerprint>,
     with_query: bool,
     served_here: bool,
@@ -654,6 +684,7 @@ pub fn build(
         provenance,
         source_check,
         freshness,
+        upstreams,
         IndexMap::new(),
         docs_fingerprints,
         served_here,
@@ -674,6 +705,51 @@ pub fn provenance_from(summary: &RunSummary, data_as_of: Option<String>) -> Prov
         datamk_version: summary.datamk_version.clone(),
         data_as_of,
     }
+}
+
+/// Cell-source name -> upstream ref, in declared order (structural: derived
+/// only from `cell.yaml`, so it never changes for the life of a loaded
+/// definition). The correlation key `observed_upstreams_from` uses to pair a
+/// `SourceRunInfo` entry — keyed by the local source name — with the
+/// upstream cell it names, so `observed.upstreams` reports against the same
+/// nominal edge `declared.upstreams` already lists.
+pub fn cell_source_refs(def: &CellDef) -> Vec<(String, String)> {
+    def.sources
+        .iter()
+        .filter_map(|(name, s)| match s {
+            Source::Cell { cell, .. } => Some((name.clone(), cell.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The admitted projection of a run summary's cell-source attachments (issue
+/// #7, sibling to `provenance_from`): built field-by-field from the
+/// allowlisted `SourceRunInfo.execution`/`data_as_of` — nothing else on
+/// `SourceRunInfo` (connection, staged_rows, bytes_scanned…) ever rides
+/// along. A source with no matching entry in `summary.sources` (e.g. the
+/// summary predates this source, or the two have drifted) reports both
+/// fields absent rather than being dropped — the ref still belongs in
+/// `declared.upstreams`.
+pub fn observed_upstreams_from(
+    refs: &[(String, String)],
+    summary: &RunSummary,
+) -> Vec<ObservedUpstream> {
+    refs.iter()
+        .map(|(source_name, reference)| {
+            let (execution, data_as_of) = summary
+                .sources
+                .iter()
+                .find(|s| &s.name == source_name)
+                .map(|s| (s.execution, s.data_as_of.clone()))
+                .unwrap_or((None, None));
+            ObservedUpstream {
+                reference: reference.clone(),
+                execution,
+                data_as_of,
+            }
+        })
+        .collect()
 }
 
 /// The interface digest: the document's `ETag` and `/openapi.json`'s
@@ -734,6 +810,7 @@ pub fn emit(
     let routes = discoverable_routes(&loaded.def)?;
     let never_tables = crate::config::never_backed_tables(&loaded.transforms);
     let direct_attach = loaded.bindings.catalog.is_some();
+    let refs = cell_source_refs(&loaded.def);
 
     // Computed once, up front: it stamps every emitted document
     // (`cell_yaml_digest`) and is the staleness key for the live-verify
@@ -743,20 +820,26 @@ pub fn emit(
         std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let cell_yaml_digest = sha256_hex(&cell_yaml_bytes);
 
-    let provenance = if direct_attach {
-        None
+    let (provenance, upstreams) = if direct_attach {
+        (None, Vec::new())
     } else {
         let store = crate::store::Store::for_storage(
             &loaded.bindings.storage,
             loaded.bindings.s3.as_ref(),
             loaded.bindings.gcs.as_ref(),
         )?;
-        match store.latest()? {
+        let summary = match store.latest()? {
             None => None,
             Some(n) => store
                 .get(&crate::store::run_summary_key(n))?
-                .and_then(|bytes| serde_json::from_slice::<RunSummary>(&bytes).ok())
-                .map(|summary| provenance_from(&summary, None)),
+                .and_then(|bytes| serde_json::from_slice::<RunSummary>(&bytes).ok()),
+        };
+        match summary {
+            Some(summary) => (
+                Some(provenance_from(&summary, None)),
+                observed_upstreams_from(&refs, &summary),
+            ),
+            None => (None, Vec::new()),
         }
     };
 
@@ -796,6 +879,7 @@ pub fn emit(
         provenance,
         source_check,
         /* freshness */ None, // poll telemetry is a lie the instant the file is written
+        upstreams,
         docs_fingerprints,
         /* with_query */ true,
         /* served_here */ false, // a file serves no rows
@@ -899,6 +983,7 @@ interface:
                 latest_seen: 47,
                 last_successful_poll_age_seconds: Some(3),
             }),
+            /* upstreams */ Vec::new(),
             IndexMap::new(),
             /* with_query */ true,
             /* served_here */ true,
@@ -1007,6 +1092,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1037,6 +1123,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1112,6 +1199,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1138,6 +1226,7 @@ interface:
                 datamk_version: "0.0.13".to_string(),
             }),
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1159,6 +1248,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1187,6 +1277,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1227,6 +1318,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             fp,
             true,
             true,
@@ -1249,6 +1341,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1271,6 +1364,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             true,
@@ -1296,6 +1390,7 @@ interface:
             None,
             None,
             None,
+            Vec::new(),
             IndexMap::new(),
             true,
             false,
@@ -1319,6 +1414,254 @@ interface:
         let keys: Vec<&str> = routes.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["orders_daily@2"]);
     }
+
+    // --- issue #7: observed.upstreams --------------------------------
+
+    use crate::engine::run_summary::SourceRunInfo;
+
+    fn sample_run_summary(sources: Vec<SourceRunInfo>) -> RunSummary {
+        RunSummary {
+            execution: 47,
+            snapshot_id: Some(12),
+            started_at: "2026-07-13T10:00:00Z".to_string(),
+            finished_at: "2026-07-13T10:00:05Z".to_string(),
+            datamk_version: "0.0.12".to_string(),
+            verify_outcome: "passed".to_string(),
+            sources,
+            transforms: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cell_source_refs_maps_source_name_to_upstream_ref() {
+        let def = sample_def();
+        assert_eq!(
+            cell_source_refs(&def),
+            vec![("upstream_flights".to_string(), "flights".to_string())]
+        );
+    }
+
+    /// The published-mode shape (issue #7): the actually-attached execution
+    /// and its snapshot time thread from `SourceRunInfo` (keyed by the
+    /// local source name) into `ObservedUpstream` (keyed by the upstream
+    /// ref), never fabricated, never carrying the upstream `table`.
+    #[test]
+    fn observed_upstreams_from_projects_execution_and_data_as_of() {
+        let refs = vec![("upstream_flights".to_string(), "flights".to_string())];
+        let summary = sample_run_summary(vec![SourceRunInfo {
+            name: "upstream_flights".to_string(),
+            connection: None,
+            kind: None,
+            staged_rows: None,
+            bytes_scanned: None,
+            execution: Some(41),
+            data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
+        }]);
+        let upstreams = observed_upstreams_from(&refs, &summary);
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].reference, "flights");
+        assert_eq!(upstreams[0].execution, Some(41));
+        assert_eq!(
+            upstreams[0].data_as_of.as_deref(),
+            Some("2026-08-04 06:00:11+00")
+        );
+    }
+
+    /// Direct-attach cell sources have no execution number (ADR 0004 §12) —
+    /// the projection must report `None`, never fabricate one, even though
+    /// the source did produce a `SourceRunInfo` entry.
+    #[test]
+    fn observed_upstreams_from_reports_none_execution_for_direct_attach() {
+        let refs = vec![("upstream_flights".to_string(), "flights".to_string())];
+        let summary = sample_run_summary(vec![SourceRunInfo {
+            name: "upstream_flights".to_string(),
+            connection: None,
+            kind: None,
+            staged_rows: None,
+            bytes_scanned: None,
+            execution: None,
+            data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
+        }]);
+        let upstreams = observed_upstreams_from(&refs, &summary);
+        assert_eq!(upstreams[0].execution, None);
+        assert!(upstreams[0].data_as_of.is_some());
+    }
+
+    /// A declared cell source with nothing in the summary (drift, or a
+    /// summary predating this source) still gets an entry — both fields
+    /// absent, never dropped and never fabricated.
+    #[test]
+    fn observed_upstreams_from_handles_a_source_missing_from_the_summary() {
+        let refs = vec![("upstream_flights".to_string(), "flights".to_string())];
+        let summary = sample_run_summary(Vec::new());
+        let upstreams = observed_upstreams_from(&refs, &summary);
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].reference, "flights");
+        assert_eq!(upstreams[0].execution, None);
+        assert_eq!(upstreams[0].data_as_of, None);
+    }
+
+    /// The digest must not move when `observed.upstreams` is populated —
+    /// it's observed telemetry, not interface, and churning it on every
+    /// refresh is exactly the failure this feature must not reintroduce
+    /// (ADR 0012 §2, same guarantee `digest_ignores_observed_but_tracks_declared`
+    /// pins for `provenance`/`freshness`).
+    #[test]
+    fn digest_ignores_observed_upstreams() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let draft = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+        let with_upstreams = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            None,
+            vec![ObservedUpstream {
+                reference: "flights".to_string(),
+                execution: Some(41),
+                data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
+            }],
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            digest_of(&draft),
+            digest_of(&with_upstreams),
+            "observed.upstreams must not move the digest"
+        );
+    }
+
+    /// All three new-facts sources at once (issue #7 + ADR 0013 + issue #6):
+    /// a document with populated `observed.upstreams`, populated docs
+    /// (identity, inlined content, and a fingerprint), AND a populated
+    /// `observed.source_check` must still digest identically to the bare
+    /// draft — none of the three is part of the interface, and the features
+    /// landing across releases must not compound into a churned digest.
+    #[test]
+    fn digest_ignores_observed_upstreams_and_docs_content_together() {
+        let mut def = sample_def();
+        def.docs = Some("docs/overview.md".to_string());
+        let routes = discoverable_routes(&def).unwrap();
+        let draft = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+
+        let mut fp = IndexMap::new();
+        fp.insert(
+            "cell".to_string(),
+            DocsFingerprint {
+                sha256: "abc123".to_string(),
+                bytes: 3,
+            },
+        );
+        let mut loaded = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            Some(SourceCheck {
+                outcome: "passed".to_string(),
+                checked_at: "2026-08-07T10:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: "0.0.13".to_string(),
+            }),
+            None,
+            vec![ObservedUpstream {
+                reference: "flights".to_string(),
+                execution: Some(41),
+                data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
+            }],
+            fp,
+            true,
+            true,
+            false,
+        );
+        // Inline docs content too, as `?include=docs` would.
+        loaded.included = vec!["docs".to_string()];
+        loaded.docs = Some(IndexMap::from([(
+            "cell".to_string(),
+            DocsContentEntry {
+                media_type: "text/markdown; charset=utf-8".to_string(),
+                content: "Some prose an agent will read.".to_string(),
+            },
+        )]));
+
+        assert_eq!(
+            digest_of(&draft),
+            digest_of(&loaded),
+            "observed.upstreams, observed.source_check, and docs content/fingerprint together \
+             must not move the digest"
+        );
+    }
+
+    /// `observed` is present (not `null`) when `upstreams` is the only
+    /// populated piece — mirrors the existing rule for `freshness`/`probes`.
+    #[test]
+    fn observed_is_present_when_only_upstreams_is_populated() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            &HashSet::new(),
+            None,
+            None,
+            None,
+            vec![ObservedUpstream {
+                reference: "flights".to_string(),
+                execution: Some(41),
+                data_as_of: None,
+            }],
+            IndexMap::new(),
+            true,
+            true,
+            false,
+        );
+        let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["status"], "draft", "no provenance ⇒ still draft");
+        assert_eq!(v["observed"]["upstreams"][0]["ref"], "flights");
+        assert_eq!(v["observed"]["upstreams"][0]["execution"], 41);
+    }
+
+    /// A cell with no `cell` sources must serialize byte-identically to
+    /// before this field existed — `upstreams` skipped, not `[]`.
+    #[test]
+    fn upstreams_field_is_omitted_not_empty_array_when_there_are_no_cell_sources() {
+        let json = serde_json::to_string(&sample_verified()).unwrap();
+        // sample_verified() calls `build` with `Vec::new()` for upstreams.
+        assert!(
+            !json.contains(r#""upstreams":[]"#),
+            "observed.upstreams must be skipped when empty, not emitted as []: {json}"
+        );
+    }
+
+    // --- ADR 0013: long-form docs pages -------------------------------
 
     /// ADR 0013: `declared.docs` is identity only (target/path/media_type),
     /// always present (`[]` when none), and excludes a private export's page

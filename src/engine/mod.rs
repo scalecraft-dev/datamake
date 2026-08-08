@@ -1434,6 +1434,38 @@ fn current_snapshot_id(conn: &Connection) -> Option<i64> {
     .ok()
 }
 
+/// The alias-parameterized sibling of `serve::query_data_as_of` (issue #7):
+/// the snapshot time of a just-attached upstream cell source — scoped to
+/// the pinned version's own snapshot when the source declares `version:`
+/// (matching the `AT (VERSION => ...)` the bound view itself reads through),
+/// else the alias's newest. Read from the attached catalog, never the
+/// upstream's own run summary ("denormalized narration, never truth").
+/// Best-effort: `None` on any failure (an unexpected catalog shape, a
+/// pinned version with no matching snapshot row) rather than propagating —
+/// this is narration, and a run that otherwise succeeded must not fail
+/// over it.
+fn query_upstream_data_as_of(
+    conn: &Connection,
+    alias: &str,
+    version: Option<u64>,
+) -> Option<String> {
+    let sql = match version {
+        Some(v) => format!(
+            "SELECT CAST(snapshot_time AS VARCHAR) FROM ducklake_snapshots('{}') \
+             WHERE snapshot_id = {v}",
+            esc(alias)
+        ),
+        None => format!(
+            "SELECT CAST(max(snapshot_time) AS VARCHAR) FROM ducklake_snapshots('{}')",
+            esc(alias)
+        ),
+    };
+    conn.prepare(&sql)
+        .and_then(|mut s| s.query_row([], |r| r.get::<_, Option<String>>(0)))
+        .ok()
+        .flatten()
+}
+
 /// Write the run summary alongside the catalog artifact just published
 /// (`catalog/executions/<N>.run.json`) — conditionally, matching the
 /// artifact's own immutability model (`put_if_absent`, the same primitive
@@ -1561,6 +1593,8 @@ fn bind_source(
         kind: None,
         staged_rows: None,
         bytes_scanned: None,
+        execution: None,
+        data_as_of: None,
     };
     let info = match src {
         ResolvedSource::Raw(uri) => {
@@ -1585,8 +1619,15 @@ fn bind_source(
             // otherwise the upstream's *published* artifact is fetched from
             // its storage prefix and attached locally — composing on
             // released, versioned state, not a live peer's internals.
-            let (catalog, data_path) = match catalog {
-                Some(c) => (resolve_catalog(c, dir)?, resolve_storage(storage, dir)?),
+            // `execution` (issue #7) is `Some` only in the published branch
+            // — direct-attach has no execution number to report, never a
+            // fabricated one (ADR 0004 §12).
+            let (catalog, data_path, execution) = match catalog {
+                Some(c) => (
+                    resolve_catalog(c, dir)?,
+                    resolve_storage(storage, dir)?,
+                    None,
+                ),
                 None => {
                     if !crate::config::is_remote(storage) {
                         anyhow::bail!(
@@ -1603,10 +1644,10 @@ fn bind_source(
                     })?;
                     let src_dir = scratch.join(format!("src-{idx}"));
                     let local = store.download_execution(n, &src_dir)?;
-                    tracing::info!(source = %name, execution = n, "fetched upstream artifact");
                     (
                         local.to_string_lossy().into_owned(),
                         format!("{storage}/data"),
+                        Some(n),
                     )
                 }
             };
@@ -1629,8 +1670,29 @@ fn bind_source(
                 table.replace('"', "\"\"")
             ))
             .with_context(|| format!("binding cell source '{name}' -> {table}"))?;
+            // Issue #7: the freshness of what was actually attached, not
+            // just the pin the author declared — read off the just-
+            // attached alias (never the upstream's own run summary, which
+            // is "denormalized narration, never truth"), scoped to the
+            // pinned snapshot when `version:` names one, else the alias's
+            // newest.
+            let data_as_of = query_upstream_data_as_of(conn, &alias, *version);
+            if let Some(n) = execution {
+                tracing::info!(
+                    source = %name, execution = n, data_as_of = ?data_as_of,
+                    "fetched upstream artifact"
+                );
+            }
             tracing::info!(source = %name, table = %table, version = ?version, "bound cell source");
-            no_connection_info()
+            SourceRunInfo {
+                name: name.to_string(),
+                connection: None,
+                kind: None,
+                staged_rows: None,
+                bytes_scanned: None,
+                execution,
+                data_as_of,
+            }
         }
         ResolvedSource::Connection {
             connection,
@@ -1736,6 +1798,8 @@ fn bind_source(
                         kind: Some("query".to_string()),
                         staged_rows: Some(staged_rows),
                         bytes_scanned,
+                        execution: None,
+                        data_as_of: None,
                     }
                 }
                 ConnectionTarget::Table(table) => {
@@ -1788,6 +1852,8 @@ fn bind_source(
                                     kind: Some("table".to_string()),
                                     staged_rows: None,
                                     bytes_scanned: None,
+                                    execution: None,
+                                    data_as_of: None,
                                 }
                             }
                             ObjectKind::Query => {
@@ -1857,6 +1923,8 @@ fn bind_source(
                                     kind: Some(config.staged_kind().to_string()),
                                     staged_rows: Some(staged_rows),
                                     bytes_scanned: None,
+                                    execution: None,
+                                    data_as_of: None,
                                 }
                             }
                         },
@@ -1887,6 +1955,8 @@ fn bind_source(
                                 kind: Some(kind.to_string()),
                                 staged_rows: Some(adv.staged_rows),
                                 bytes_scanned: None,
+                                execution: None,
+                                data_as_of: None,
                             };
                             advance = Some(adv);
                             info
@@ -4114,6 +4184,156 @@ mod tests {
             |r| r.get(0),
         )
         .expect("query max snapshot id")
+    }
+
+    // --- issue #7: bind_source's cell-source execution/data_as_of --------
+    //
+    // Published mode (the `catalog: None` branch, `execution: Some(n)`)
+    // needs an object store (`Store::for_storage` only accepts `s3://`/
+    // `gs://`) and so isn't practical to exercise end-to-end in this
+    // harness without network or a mocked store — see `context.rs`'s
+    // `observed_upstreams_from` unit tests and `run_summary.rs`'s
+    // `SourceRunInfo` serialization test for coverage of that half
+    // (the projection and the wire threading). Direct-attach (the
+    // `catalog: Some(c)` branch) needs neither, so it's exercised here as
+    // a real `bind_source` call against a genuine attached DuckLake
+    // catalog — the `execution: None` guarantee (ADR 0004 §12) and the
+    // `data_as_of`/`AT VERSION` scoping both get real coverage.
+
+    #[test]
+    fn bind_source_direct_attach_cell_source_reports_no_execution_but_real_data_as_of() {
+        let (upstream_conn, upstream_dir) = probe_attach("issue7-direct-upstream");
+        upstream_conn
+            .execute_batch("CREATE TABLE fct_flights AS SELECT * FROM range(10) tbl(id);")
+            .expect("seed upstream table");
+        drop(upstream_conn); // release the catalog file before the downstream attaches it
+
+        let catalog_path = upstream_dir.join("probe.ducklake");
+        let data_path = upstream_dir.join("data");
+        let src = ResolvedSource::Cell {
+            catalog: Some(catalog_path.to_string_lossy().into_owned()),
+            storage: data_path.to_string_lossy().into_owned(),
+            table: "fct_flights".to_string(),
+            version: None,
+        };
+        let mut sources = IndexMap::new();
+        sources.insert("upstream_flights".to_string(), src.clone());
+        let mut cache = ClassifyCache::new(&sources);
+        let downstream_dir = probe_scratch_dir("issue7-direct-downstream");
+        let scratch = probe_scratch_dir("issue7-direct-downstream-scratch");
+        let downstream = Connection::open_in_memory().expect("open downstream duckdb");
+        downstream
+            .execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL json; LOAD json;")
+            .expect("install/load ducklake on downstream");
+
+        let outcome = bind_source(
+            &downstream,
+            0,
+            "upstream_flights",
+            &src,
+            &downstream_dir,
+            None,
+            None,
+            &scratch,
+            false,
+            &mut cache,
+            "orders",
+        )
+        .expect("bind direct-attach cell source");
+
+        assert_eq!(
+            outcome.info.execution, None,
+            "direct-attach has no execution number to report — never fabricated"
+        );
+        assert!(
+            outcome.info.data_as_of.is_some(),
+            "data_as_of should be cheaply readable off the just-attached catalog"
+        );
+        let count: i64 = downstream
+            .query_row("SELECT count(*) FROM \"upstream_flights\"", [], |r| {
+                r.get(0)
+            })
+            .expect("query bound view");
+        assert_eq!(count, 10, "the bound view reads the upstream's real rows");
+    }
+
+    #[test]
+    fn bind_source_cell_source_version_pin_scopes_data_as_of_to_that_snapshot() {
+        let (upstream_conn, upstream_dir) = probe_attach("issue7-pinned-upstream");
+        upstream_conn
+            .execute_batch("CREATE TABLE fct_flights AS SELECT * FROM range(3) tbl(id);")
+            .expect("seed upstream table (snapshot 1)");
+        let pinned_id = max_snapshot_id(&upstream_conn);
+        let pinned_time: String = upstream_conn
+            .query_row(
+                &format!(
+                    "SELECT CAST(snapshot_time AS VARCHAR) FROM ducklake_snapshots('lake') \
+                     WHERE snapshot_id = {pinned_id}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("read pinned snapshot time");
+        // A second commit moves the upstream's newest snapshot forward — the
+        // pin must not silently follow it.
+        upstream_conn
+            .execute_batch("INSERT INTO fct_flights VALUES (999);")
+            .expect("second commit (snapshot 2)");
+        let newest_id = max_snapshot_id(&upstream_conn);
+        assert!(
+            newest_id > pinned_id,
+            "test needs a later snapshot to exist"
+        );
+        drop(upstream_conn);
+
+        let catalog_path = upstream_dir.join("probe.ducklake");
+        let data_path = upstream_dir.join("data");
+        let src = ResolvedSource::Cell {
+            catalog: Some(catalog_path.to_string_lossy().into_owned()),
+            storage: data_path.to_string_lossy().into_owned(),
+            table: "fct_flights".to_string(),
+            version: Some(pinned_id as u64),
+        };
+        let mut sources = IndexMap::new();
+        sources.insert("upstream_flights".to_string(), src.clone());
+        let mut cache = ClassifyCache::new(&sources);
+        let downstream_dir = probe_scratch_dir("issue7-pinned-downstream");
+        let scratch = probe_scratch_dir("issue7-pinned-downstream-scratch");
+        let downstream = Connection::open_in_memory().expect("open downstream duckdb");
+        downstream
+            .execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL json; LOAD json;")
+            .expect("install/load ducklake on downstream");
+
+        let outcome = bind_source(
+            &downstream,
+            0,
+            "upstream_flights",
+            &src,
+            &downstream_dir,
+            None,
+            None,
+            &scratch,
+            false,
+            &mut cache,
+            "orders",
+        )
+        .expect("bind pinned cell source");
+
+        assert_eq!(outcome.info.execution, None);
+        assert_eq!(
+            outcome.info.data_as_of.as_deref(),
+            Some(pinned_time.as_str()),
+            "a pinned source must report the pinned snapshot's time, not the upstream's newest"
+        );
+        let count: i64 = downstream
+            .query_row("SELECT count(*) FROM \"upstream_flights\"", [], |r| {
+                r.get(0)
+            })
+            .expect("query bound view");
+        assert_eq!(
+            count, 3,
+            "AT (VERSION => ...) must read only the pinned snapshot's rows"
+        );
     }
 
     #[test]
