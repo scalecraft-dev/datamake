@@ -374,7 +374,7 @@ fn build_state(
     let source_check =
         crate::manifest::SourceCheckRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
             .as_ref()
-            .map(crate::context::SourceCheck::from);
+            .map(|r| crate::context::SourceCheck::from_record(r, &all_routes));
     // Issue #6/#10: same fresh_for gate, same reason, sibling file — see
     // `source_check` immediately above.
     let source_descriptions: indexmap::IndexMap<String, indexmap::IndexMap<String, String>> =
@@ -464,12 +464,17 @@ fn observed_bundle_sha12(
         return None;
     }
     let checked_at = source_check.map(|sc| sc.checked_at.as_str()).unwrap_or("");
+    // The measurements ride the same variant: two checks a second apart with
+    // different counts must not share an ETag.
+    let measurements_json = source_check
+        .map(|sc| serde_json::to_string(&sc.exports).unwrap_or_default())
+        .unwrap_or_default();
     // `source_descriptions` is deterministic within one process's lifetime
     // (built once, at startup, from a `BTreeMap`-sorted record) — good
     // enough for a cache-invalidation hash, which only needs to change when
     // the content genuinely does, not to be canonical across processes.
     let descriptions_json = serde_json::to_string(source_descriptions).unwrap_or_default();
-    let joined = format!("{checked_at}|{descriptions_json}");
+    let joined = format!("{checked_at}|{measurements_json}|{descriptions_json}");
     Some(crate::context::sha256_hex(joined.as_bytes())[..12].to_string())
 }
 
@@ -1988,7 +1993,7 @@ mod smoke {
             let (status, body) = get(&router, "/context", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(v["datamk_context"], 1);
+            assert_eq!(v["datamk_context"], 2);
             assert_eq!(v["cell"], "smoke");
             assert_eq!(v["status"], "draft");
             assert_eq!(v["grain_verified"], false);

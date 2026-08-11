@@ -22,7 +22,9 @@ use crate::engine::run_summary::RunSummary;
 /// cell semver and `datamk_version`: additive changes don't bump; any removal,
 /// rename, or re-meaning bumps, with the prior version served through a
 /// deprecation window (ADR 0012 §2).
-pub const DATAMK_CONTEXT_VERSION: u32 = 1;
+///
+/// **2**: `declared.docs[].path` renamed to `source_path`.
+pub const DATAMK_CONTEXT_VERSION: u32 = 2;
 
 /// The `limit` in every emitted `sample_request` — the smallest useful legal
 /// call, a pure function of the route key and the limit grammar.
@@ -141,7 +143,11 @@ pub struct DeclaredDocsEntry {
     /// `"cell"` or the route key (`name@major`) — route keys always carry
     /// `@major`, so an export can never collide with the literal `"cell"`.
     pub target: String,
-    pub path: String,
+    /// The author's cell.yaml-relative filesystem path. Named `source_path`,
+    /// not `path`, because it is not fetchable — there is no `/docs/:target`
+    /// route (ADR 0012 §4); content arrives via `?include=docs`. Same
+    /// false-affordance fix already made for `DeclaredExport::route`.
+    pub source_path: String,
     pub media_type: String,
 }
 
@@ -198,6 +204,25 @@ pub struct DeclaredExport {
     /// that do not exist there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<QueryBlock>,
+    /// Where the rows are, for a bound export — present iff `query` is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<BindingBlock>,
+}
+
+/// A bound export's target, exactly as `cell.yaml` writes it — never
+/// profile-resolved: `table` is env-expandable and `declared` is hashed into
+/// `interface_digest`, so a resolved value would churn the digest per
+/// environment. A templated table ships as `${DATASET}.fct_x`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BindingBlock {
+    /// The `sources:` key this export binds to.
+    pub source: String,
+    /// The declared object: a warehouse table path, or a raw file/glob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    /// The connection alias only — what it resolves to is profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
 }
 
 /// One declared column as the document emits it.
@@ -394,15 +419,51 @@ pub struct SourceCheck {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_as_of: Option<String>,
     pub datamk_version: String,
+    /// What each check actually measured, per route — the numbers behind
+    /// `outcome`, so a reader sees what passed and not only that it did.
+    /// Timestamped by `checked_at` above: one pass, one time.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub exports: IndexMap<String, ExportCheck>,
 }
 
-impl From<&crate::manifest::SourceCheckRecord> for SourceCheck {
-    fn from(r: &crate::manifest::SourceCheckRecord) -> Self {
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportCheck {
+    pub check: String,
+    pub grain: Vec<String>,
+    pub rows: i64,
+    pub distinct_grain: i64,
+}
+
+impl SourceCheck {
+    /// Visibility-filtered (ADR 0012 §4): a private export's measurement never
+    /// reaches the wire, so this takes the same route list every other
+    /// consumer reads rather than copying the record's map wholesale.
+    pub fn from_record(
+        r: &crate::manifest::SourceCheckRecord,
+        routes: &[(String, Export)],
+    ) -> Self {
+        let exports = routes
+            .iter()
+            .filter_map(|(route, _)| {
+                r.exports.get(route).map(|m| {
+                    (
+                        route.clone(),
+                        ExportCheck {
+                            check: m.check.clone(),
+                            grain: m.grain.clone(),
+                            rows: m.rows,
+                            distinct_grain: m.distinct_grain,
+                        },
+                    )
+                })
+            })
+            .collect();
         SourceCheck {
             outcome: r.outcome.clone(),
             checked_at: r.checked_at.clone(),
             data_as_of: r.data_as_of.clone(),
             datamk_version: r.datamk_version.clone(),
+            exports,
         }
     }
 }
@@ -504,6 +565,7 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)]) -> Declared {
                 .map(|(col, spec)| (col.clone(), ColumnDoc::from(spec)))
                 .collect(),
             query: (!e.is_bound()).then(|| query_block(route, e)),
+            binding: e.bind.as_deref().map(|b| binding_block(def, b)),
         })
         .collect();
 
@@ -530,6 +592,25 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)]) -> Declared {
     }
 }
 
+/// A bound export's target, looked up in `sources:`. A `cell:` source is
+/// rejected at resolve time (`verify::validate_bound_exports`) and an unknown
+/// name can't resolve, so both emit the source name alone rather than a
+/// fabricated object.
+fn binding_block(def: &CellDef, bind: &str) -> BindingBlock {
+    let (object, connection) = match def.sources.get(bind) {
+        Some(Source::Raw(path)) => (Some(path.clone()), None),
+        Some(Source::Connection {
+            connection, table, ..
+        }) => (table.clone(), Some(connection.clone())),
+        Some(Source::Cell { .. }) | None => (None, None),
+    };
+    BindingBlock {
+        source: bind.to_string(),
+        object,
+        connection,
+    }
+}
+
 /// Docs identity only (ADR 0013): the cell-level page (if declared) plus
 /// every **discoverable** export's page, in that order — no filesystem
 /// access, since identity needs only the declared path and its extension. A
@@ -540,7 +621,7 @@ fn docs_entries(def: &CellDef, routes: &[(String, Export)]) -> Vec<DeclaredDocsE
     if let Some(path) = &def.docs {
         entries.push(DeclaredDocsEntry {
             target: "cell".to_string(),
-            path: path.clone(),
+            source_path: path.clone(),
             media_type: crate::config::docs::guess_media_type(path).to_string(),
         });
     }
@@ -548,7 +629,7 @@ fn docs_entries(def: &CellDef, routes: &[(String, Export)]) -> Vec<DeclaredDocsE
         if let Some(path) = &e.docs {
             entries.push(DeclaredDocsEntry {
                 target: route.clone(),
-                path: path.clone(),
+                source_path: path.clone(),
                 media_type: crate::config::docs::guess_media_type(path).to_string(),
             });
         }
@@ -1008,7 +1089,7 @@ pub fn build_document(
     let source_check =
         crate::manifest::SourceCheckRecord::fresh_for(&loaded.dir, &cell_yaml_digest, profile)
             .as_ref()
-            .map(SourceCheck::from);
+            .map(|r| SourceCheck::from_record(r, &routes));
 
     // Docs fingerprints (ADR 0013 §5): a release-time fact, read from
     // `published.json` when one exists — never recomputed here (computing at
@@ -1175,7 +1256,7 @@ interface:
     fn context_document_serializes_to_the_documented_shape() {
         let json = serde_json::to_string_pretty(&sample_verified()).unwrap();
         let expected = r#"{
-  "datamk_context": 1,
+  "datamk_context": 2,
   "cell": "orders",
   "status": "verified",
   "grain_verified": true,
@@ -1497,6 +1578,7 @@ interface:
                 checked_at: "2026-08-07T10:00:00Z".to_string(),
                 data_as_of: None,
                 datamk_version: "0.0.13".to_string(),
+                exports: IndexMap::new(),
             }),
             None,
             Vec::new(),
@@ -1863,6 +1945,7 @@ interface:
                 checked_at: "2026-08-07T10:00:00Z".to_string(),
                 data_as_of: None,
                 datamk_version: "0.0.13".to_string(),
+                exports: IndexMap::new(),
             }),
             None,
             vec![ObservedUpstream {
@@ -1952,10 +2035,10 @@ interface:
         assert_eq!(d.include_request, "/context?include=docs");
         assert_eq!(d.docs.len(), 2, "{:?}", d.docs);
         assert_eq!(d.docs[0].target, "cell");
-        assert_eq!(d.docs[0].path, "docs/overview.md");
+        assert_eq!(d.docs[0].source_path, "docs/overview.md");
         assert_eq!(d.docs[0].media_type, "text/markdown; charset=utf-8");
         assert_eq!(d.docs[1].target, "orders_daily@2");
-        assert_eq!(d.docs[1].path, "docs/orders_daily.md");
+        assert_eq!(d.docs[1].source_path, "docs/orders_daily.md");
 
         // Private export's docs page never appears, in any form.
         let json = serde_json::to_string(&d).unwrap();
@@ -2035,7 +2118,7 @@ interface:
         // Identity still ships either way — `--no-docs` withholds content,
         // not the fact that a page exists.
         assert_eq!(
-            no_docs_doc["declared"]["docs"][0]["path"],
+            no_docs_doc["declared"]["docs"][0]["source_path"],
             "docs/overview.md"
         );
 
@@ -2115,6 +2198,82 @@ interface:
             v["observed"]["source_check"].get("data_as_of").is_none(),
             "data_as_of must be omitted, not fabricated: {v}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The binding is the only actionable fact on a cell that serves no rows.
+    /// Before it, the warehouse object existed only in prose and `channels`
+    /// gave the dataset alone, so writing a query meant reading English.
+    #[test]
+    fn a_bound_export_emits_its_binding_and_a_materialized_one_does_not() {
+        let def: CellDef = serde_yaml::from_str(
+            r#"
+cell: qfai
+sources:
+  gold_customer:
+    connection: dw-main
+    table: ${DATASET}.fct_qfai_customer
+  local_file: ./data/*.parquet
+interface:
+  - name: qfai_customer
+    version: 1.0.0
+    grain: [customer_id]
+    bind: gold_customer
+  - name: from_file
+    version: 1.0.0
+    grain: [id]
+    bind: local_file
+  - name: materialized
+    version: 1.0.0
+    grain: [id]
+"#,
+        )
+        .unwrap();
+        let routes = discoverable_routes(&def).unwrap();
+        let d = declared(&def, &routes);
+        let by_name = |n: &str| d.exports.iter().find(|e| e.name == n).unwrap();
+
+        let bound = by_name("qfai_customer");
+        let b = bound
+            .binding
+            .as_ref()
+            .expect("a bound export names its target");
+        assert_eq!(b.source, "gold_customer");
+        // Verbatim cell.yaml: expanding this would put the environment inside
+        // `interface_digest`.
+        assert_eq!(b.object.as_deref(), Some("${DATASET}.fct_qfai_customer"));
+        assert_eq!(b.connection.as_deref(), Some("dw-main"));
+        assert!(bound.query.is_none(), "binding and query are complements");
+
+        let raw = by_name("from_file").binding.as_ref().unwrap();
+        assert_eq!(raw.object.as_deref(), Some("./data/*.parquet"));
+        assert!(raw.connection.is_none(), "a raw source has no connection");
+
+        let m = by_name("materialized");
+        assert!(m.binding.is_none());
+        assert!(m.query.is_some());
+    }
+
+    /// `grain_verified: true` used to be the whole story: `verify` computed
+    /// the counts, compared them, and threw them away.
+    #[test]
+    fn source_check_carries_the_grain_measurement_through_to_the_document() {
+        let dir = all_bound_cell_dir("measurements");
+        let file = dir.join("cell.yaml");
+        crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
+
+        let out = dir.join("context.json");
+        emit(&file, "local", Some(&out), false).expect("emit the context document");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+
+        let m = &v["observed"]["source_check"]["exports"]["virtual_pii@1"];
+        assert_eq!(m["check"], "grain_unique");
+        assert_eq!(m["grain"], serde_json::json!(["id"]));
+        // data.csv holds two rows with distinct ids.
+        assert_eq!(m["rows"], 2);
+        assert_eq!(m["distinct_grain"], 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

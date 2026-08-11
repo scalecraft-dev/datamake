@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::config::{CellDef, MaterializeStrategy, ResolvedTransform};
@@ -319,9 +319,9 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     } else {
         HashMap::new()
     };
-    check(&cell.conn, &cell.def, &warehouse_columns)?;
+    let measurements = check(&cell.conn, &cell.def, &warehouse_columns)?;
     if has_bound_exports {
-        write_source_check_record(file, &cell.dir, profile)
+        write_source_check_record(file, &cell.dir, profile, measurements)
             .context("writing the live-verify source-check record (.cell/source_check.json)")?;
         // Issue #6/#10: the same live bind pass above already carries
         // `warehouse_columns` — persisted here under the identical
@@ -359,7 +359,12 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
 /// `data_as_of` stays `None` in this slice — no connector currently threads
 /// a cheap, truthful "as of" timestamp out of the bind path; fabricating one
 /// (or defaulting it to `checked_at`) is exactly what ADR 0012 §2 forbids.
-fn write_source_check_record(file: &Path, dir: &Path, profile: &str) -> Result<()> {
+fn write_source_check_record(
+    file: &Path,
+    dir: &Path,
+    profile: &str,
+    exports: BTreeMap<String, crate::manifest::GrainMeasurement>,
+) -> Result<()> {
     let path = dir.join(".cell").join("source_check.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -373,6 +378,7 @@ fn write_source_check_record(file: &Path, dir: &Path, profile: &str) -> Result<(
         datamk_version: env!("CARGO_PKG_VERSION").to_string(),
         cell_yaml_digest,
         profile: profile.to_string(),
+        exports,
     };
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -405,11 +411,15 @@ fn write_source_check_record(file: &Path, dir: &Path, profile: &str) -> Result<(
 /// connector with no classification job — not a lesser fallback, there is
 /// genuinely no other authority to consult there either). Mixed cells hit
 /// both paths in the same loop.
+/// Returns what the grain check measured, per route key — the numbers behind
+/// a passing check, for `.cell/source_check.json` and from there
+/// `observed.source_check.exports`. A grainless export contributes nothing:
+/// no check ran on it.
 pub fn check(
     conn: &Connection,
     def: &CellDef,
     warehouse_columns: &HashMap<String, crate::engine::SourceWarehouseColumns>,
-) -> Result<()> {
+) -> Result<BTreeMap<String, crate::manifest::GrainMeasurement>> {
     // ADR 0005 §1: `__datamk_` is a reserved, enforced namespace — a table
     // matching it other than the watermark table itself is refused before
     // publish.
@@ -423,6 +433,7 @@ pub fn check(
     // mandatory — an experimental export needs nothing.
     check_supported_have_descriptions(def)?;
 
+    let mut measurements = BTreeMap::new();
     for export in &def.interface {
         let source = export
             .bind
@@ -512,11 +523,20 @@ pub fn check(
                     export.grain
                 );
             }
+            measurements.insert(
+                export.route()?,
+                crate::manifest::GrainMeasurement {
+                    check: "grain_unique".to_string(),
+                    grain: export.grain.clone(),
+                    rows: total,
+                    distinct_grain: distinct,
+                },
+            );
         }
 
         tracing::info!(export = %export.name, version = %export.version, "interface ok");
     }
-    Ok(())
+    Ok(measurements)
 }
 
 /// ADR 0012 §3 ratchet check 4: an export with `contract: supported` must
