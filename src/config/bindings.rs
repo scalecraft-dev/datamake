@@ -178,6 +178,21 @@ pub fn is_metadata_db_catalog(catalog: &str) -> bool {
     catalog.starts_with("sqlite:") || catalog.starts_with("postgres:")
 }
 
+/// Whether a profile is direct-attach (local catalog) mode, per `catalog`'s own
+/// doc comment above: `Some` ⇒ direct attach, `None` ⇒ published-artifact mode.
+/// The one place this is decided — `context::emit` and `engine::open` (which
+/// stamps it onto `Cell` for `serve` to read) both call this instead of each
+/// re-deriving it from a different signal. `engine::Cell.published` looks like
+/// an equivalent signal (`is_none()` reads "not published") but isn't: for a
+/// published-mode cell with no materializing transforms, `published` is
+/// *also* `None` (no execution can ever exist for that cell — `run` refuses
+/// to build one),
+/// which would misclassify a storage-backed cell as direct-attach. This
+/// function never consults `published` at all, so that state can't reach it.
+pub fn direct_attach(bindings: &ResolvedBindings) -> bool {
+    bindings.catalog.is_some()
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedS3 {
     pub region: Option<String>,

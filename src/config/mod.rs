@@ -13,9 +13,9 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub use bindings::{
-    is_gcs, is_metadata_db_catalog, is_remote, is_s3, resolve, ConnectionTarget, ResolvedBindings,
-    ResolvedConnection, ResolvedGcs, ResolvedIncremental, ResolvedS3, ResolvedSource,
-    SnowflakeAuth,
+    direct_attach, is_gcs, is_metadata_db_catalog, is_remote, is_s3, resolve, ConnectionTarget,
+    ResolvedBindings, ResolvedConnection, ResolvedGcs, ResolvedIncremental, ResolvedS3,
+    ResolvedSource, SnowflakeAuth,
 };
 // Part of `SnowflakeAuth`'s public shape; constructed outside `config` only
 // by connector tests, which is what the non-test build would otherwise warn
@@ -24,9 +24,17 @@ pub use bindings::{
 pub use bindings::Redacted;
 pub use deploy::{DeployConfig, Target};
 pub use schema::{
-    is_all_never, never_backed_tables, resolve_transforms, Bindings, CellDef, ColumnSpec, Contract,
-    Export, MaterializeStrategy, ResolvedTransform, Source, Visibility,
+    builds_no_snapshot, Bindings, CellDef, ColumnSpec, Contract, Export, MaterializeStrategy,
+    ResolvedTransform, Source, Visibility,
 };
+// `pub(crate)`, not part of the flat `pub use` list above: every caller
+// (`verify.rs`, `deploy::preflight`, `config::mod::load` itself) is already
+// crate-internal, and the `materialize: never` rejection this function
+// deliberately does NOT perform (see its own doc comment) is only ever
+// completed by `config::mod::load`'s own call to it — keeping this
+// `pub(crate)` is one honest signal that "resolved" here does not yet mean
+// "safe to execute."
+pub(crate) use schema::resolve_transforms;
 
 /// A cell parsed and resolved against a profile — **without a database
 /// connection**. This is the pure prefix of `engine::open`: `deploy` inspects a
@@ -106,6 +114,21 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
     // artifact/preflight inspection) gets a validated cell or an error
     // before anything opens a connection.
     let transforms = resolve_transforms(&def.transforms)?;
+
+    // Issue #6, binding model: `materialize: never` is a rejected legacy
+    // value (see `MaterializeStrategy`'s doc comment) — reject it here, with
+    // the whole `CellDef` in view, so the error can name the affected
+    // export(s) and both exits (materialize, or `Export::bind`). Before
+    // `check_replace_incremental_gate`/grain inheritance below: those don't
+    // need to reason about a strategy that's about to be refused anyway.
+    crate::verify::check_no_materialize_never(&def, &transforms, &dir)?;
+
+    // Issue #6, binding model: a bound export (`Export::bind`) must name a
+    // real `sources:` entry of a bindable shape, and must not also set
+    // `source` (a bound export has no transform table to override). Pure,
+    // offline — the source's *shape* (raw/cell/connection, table vs query)
+    // is contract, not environment, so no `ResolvedBindings` is needed here.
+    crate::verify::validate_bound_exports(&def)?;
 
     // ADR 0008 guard 4c: a `replace` model that references an incremental
     // source's name by word-boundary token is a resolve-time hard error —

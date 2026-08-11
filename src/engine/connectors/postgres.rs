@@ -140,6 +140,7 @@ pub(super) fn classify_objects(tables: &[&str]) -> Result<IndexMap<String, Objec
             ObjectMeta {
                 kind: ObjectKind::Table,
                 columns: IndexMap::new(),
+                descriptions: IndexMap::new(),
             },
         );
     }

@@ -334,42 +334,84 @@ channels:
   - "warehouse: analytics.orders_daily (SELECT with your existing grants)"
 ```
 
-## A contract with no rows to copy: `materialize: never`
+## A contract with no rows to copy: binding
 
 Some cells own a contract over data they should never own a copy of — a
 semantic layer over a warehouse that already exists, where the rows already
 have a system of record and copying them into DuckLake would just be
-duplication plus a staleness window nobody asked for. A transform can say so
-directly:
+duplication plus a staleness window nobody asked for. An export can point
+straight at the existing object instead of a transform:
 
 ```yaml
-transforms:
-  - sql: sql/customer_pii.sql
-    materialize: never    # bind as a session view and stop — nothing is stored
+sources:
+  pii: { connection: crm, table: raw.customers }
+
+interface:
+  - name: customer_pii
+    version: 1.0.0
+    bind: pii              # bind directly to the source — no transform runs
+    schema:
+      id: { type: bigint }
+      email: { type: string }
 ```
 
-`datamk run` never commits a snapshot for a `materialize: never` transform —
-it binds the SELECT as a session view, checks it, and moves on. A cell whose
-*every* transform is `never` has no snapshot to commit at all, so `run`
+`bind:` names an existing `sources:` entry directly — the same split
+`sources:` already has between contract and environment: *which* upstream
+object (the source's logical name) is contract, in `cell.yaml`; *where* it
+resolves (project, dataset, instance) is environment, in the profile's
+`connections:` map. No SQL runs for a bound export — `datamk run` never
+computes or stores anything for it. Bindable today: a raw file, or a
+connection source with `table:` set (a `query:`-shaped connection is ad hoc
+SQL nobody runs, and isn't bindable; read a query-shaped source through a
+materializing transform instead). A cell whose *every* export is bound has
+no materializing transforms and so no snapshot to commit at all — `run`
 refuses outright and points at `verify`/`context` instead: the contract is
 still real, but the Builder isn't the workload that proves it — a live check
 is.
 
 `datamk verify` proves it: it binds the cell's sources against the live
-warehouse and dry-runs every `never` transform as a session view, then runs
-the exact same schema and grain checks it always has — declared columns
-exist with compatible types, declared grain exists and is unique — just
-against a live query instead of a stored snapshot. In a mixed cell
-(materializing and `never` transforms together), the materialized side is
-still checked against the lake exactly as before; only the `never` side is
-checked live. Every live check is billed by your warehouse like any other
-query — `verify` narrates the scan cost where the connector can supply one
-(the same dry-run preflight `run` already uses), but never skips or caches a
-check to avoid the cost. Run it wherever you'd run any other CI check:
+warehouse, then runs the exact same schema and grain checks it always has —
+declared columns exist with compatible types, declared grain exists and is
+unique — just against the live bound object instead of a stored snapshot.
+Where the connector has its own metadata (BigQuery today), the type check
+uses the warehouse's own native type, not DuckDB's rendering of it — DuckDB's
+`DESCRIBE` can lose information the warehouse's own type didn't (a wide
+`NUMERIC` can degrade to DuckDB `VARCHAR`; checked against the warehouse's
+own type, a declared `decimal` still passes correctly). In a mixed cell
+(materializing and bound exports together), the materialized side is still
+checked against the lake exactly as before; only the bound side is checked
+live. Every live check is billed by your warehouse like any other query —
+`verify` narrates the scan cost where the connector can supply one (the same
+dry-run preflight `run` already uses), but never skips or caches a check to
+avoid the cost. Run it wherever you'd run any other CI check:
 
 ```bash
 datamk verify -f cell.yaml -p prod   # binds sources, live-checks, exits 0/1
 ```
+
+The same live check, where the connector has one, also surfaces the
+upstream's own column descriptions — a fact, not authored prose — under
+`observed.source_descriptions`, keyed by source name:
+
+```json
+"observed": {
+  "source_descriptions": {
+    "pii": { "email": "Customer's primary contact address, from the CRM." }
+  }
+}
+```
+
+This never appears in `declared` (author-reviewed prose only) and never
+feeds `docs:`'s release-time digest — an upstream comment edit in someone
+else's warehouse must never move datamk's own release gate.
+
+A bound cell is deployable: `datamk deploy` no longer refuses an all-bound
+cell outright, only where the target genuinely has nothing to run (no
+long-lived Server and no snapshot to build). Deploying the Server for an
+all-bound cell means its `/context` document *is* the payload served to
+anyone who can reach it — declared columns, grain, and prose, which can
+themselves name upstream fields — worth the same open-endpoint decision as
+any other cell, not a lesser one because no rows are copied.
 
 A passing live check is what earns `status: "verified_at_source"` —
 deliberately not `verified`. `verified` is a claim about immutable rows that
@@ -442,7 +484,7 @@ whatever cadence keeps the summaries fresh.
 The document's authority comes from a machine check, not from prose. `verify`
 checks the declared schema and grain uniqueness against the actual rows —
 against a published snapshot for a materializing cell, live against the
-warehouse for a `materialize: never` one — and never against anything else.
+warehouse for a bound one — and never against anything else.
 A published execution is created only after `verify` passes, so
 `status: "verified"` means a machine checked the claims against immutable
 rows that still exist behind that snapshot; `status: "verified_at_source"`

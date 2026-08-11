@@ -51,6 +51,12 @@ pub struct ObjectMeta {
     /// column name -> warehouse-native `data_type` (e.g. BigQuery's
     /// `INFORMATION_SCHEMA.COLUMNS.data_type`: `TIMESTAMP`, `INT64`, …).
     pub columns: IndexMap<String, String>,
+    /// column name -> upstream description, from the same metadata job as
+    /// `columns` where one exists (issue #6/#10: BigQuery's
+    /// `INFORMATION_SCHEMA.COLUMN_FIELD_PATHS.description`). Postgres and
+    /// Snowflake run no metadata job today (ADR 0010) — this stays empty for
+    /// them, same as `columns`, by design rather than as a lesser fallback.
+    pub descriptions: IndexMap<String, String>,
 }
 
 /// A watermark predicate to bake into a connector's read: the cursor column
@@ -168,6 +174,31 @@ impl ClassifyCache {
 /// only to batch classification jobs; SQL construction never touches this.
 fn dataset_of(table: &str) -> &str {
     table.split_once('.').map(|(d, _)| d).unwrap_or(table)
+}
+
+/// Verify's type authority for a bound export whose source carries
+/// warehouse-native column types (issue #6/#9, `SourceWarehouseColumns`).
+/// `connector` is `ResolvedConnection::type_name()`; `None` means no
+/// connector-specific vocabulary exists for it yet — the caller
+/// (`verify::check`) falls back to DuckDB's own `DESCRIBE`-based
+/// `type_compatible`, unmodified, same as it always has.
+///
+/// Deliberately a flat dispatch on the connector's name string, not a trait
+/// every connector must implement: `SourceWarehouseColumns.columns` is only
+/// ever non-empty for a connector whose `classify_objects` actually runs a
+/// metadata job (today: BigQuery only — Postgres/Snowflake read-through
+/// unconditionally, ADR 0010, no job to have fetched native types from), so
+/// there is exactly one real arm, not a per-vendor obligation every future
+/// connector inherits whether or not it has a metadata job to back it.
+pub(crate) fn native_type_compatible(
+    connector: &str,
+    declared: &str,
+    native: &str,
+) -> Option<bool> {
+    match connector {
+        "bigquery" => Some(bigquery::type_compatible(declared, native)),
+        _ => None,
+    }
 }
 
 impl ResolvedConnection {

@@ -49,18 +49,40 @@ pub struct Access {
 }
 
 /// One exported object: a versioned, governable view onto a lake table.
+///
+/// Deserialized to deny unknown fields (same discipline as `Incremental`,
+/// below): a typo'd key — `binds:` for `bind:` being the motivating one —
+/// would otherwise silently parse as a plain materialized export (`bind`
+/// stays `None`, `#[serde(default)]`), reading its transform table under
+/// `name` instead of binding the intended source, with no error anywhere
+/// near the typo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Export {
     pub name: String,
     /// Semantic version. The route keys on MAJOR (e.g. `name@2`).
     pub version: String,
     /// The transform table this export reads (defaults to `name`). The seam
-    /// between private internals and the public name. Usually a lake object,
-    /// but not always: a `materialize: never` transform's table is a
-    /// session-local view, never written to the lake (issue #6) — `verify`
-    /// still checks the export against it, but `serve` doesn't route it.
+    /// between private internals and the public name — a lake object, always
+    /// (a bound export, below, has no transform table and leaves this
+    /// unset). Ignored when `bind` is set; resolve-time-rejected if both are
+    /// (`verify::validate_bound_exports`).
     #[serde(default)]
     pub source: Option<String>,
+    /// Bind this export directly to an existing object declared in
+    /// `sources:`, instead of a private transform (issue #6, binding model —
+    /// replaces the removed `materialize: never` strategy). No SQL datamk
+    /// ever runs: the object already exists — a warehouse table/view via a
+    /// `connection:` source, or a raw file/glob — and `verify` checks the
+    /// declared contract against it live, every time. `serve` never routes
+    /// it (`data.served_here` and the route's own 404 say so); `datamk
+    /// context`/hosted `/context` still describe it in full. Resolve-time
+    /// validated (`verify::validate_bound_exports`): the named source must
+    /// exist, must not be a `query:`-shaped connection source (ad hoc SQL
+    /// nobody runs is the exact failure this replaces, not an existing
+    /// object to point at), and `source` must be unset.
+    #[serde(default)]
+    pub bind: Option<String>,
     /// One or two sentences: what one row means (ADR 0012 §3). Required
     /// (non-empty) once the export is `contract: supported` — the lint
     /// lands on the deliberate promotion gesture, enforced by `verify`.
@@ -91,6 +113,14 @@ pub struct Export {
 impl Export {
     pub fn source_object(&self) -> &str {
         self.source.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether this export is bound (issue #6, binding model) rather than
+    /// backed by a private transform — the one place this distinction is
+    /// made; every consumer (`context`, `serve`, `release`, `verify`) reads
+    /// this instead of re-deriving it from a transform-table lookup.
+    pub fn is_bound(&self) -> bool {
+        self.bind.is_some()
     }
 
     pub fn major(&self) -> Result<u64> {
@@ -557,19 +587,30 @@ pub(crate) fn is_valid_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// One of the four closed declarative materialization strategies (ADR 0008
-/// §3; `never` added by issue #6, "virtual cells foundation") — every value
-/// replay-safe by construction, never by author discipline. `append`/`upsert`
-/// require `key:` and are replay-safe *unconditionally* (reconciled against
-/// existing state, invariant under whether the SELECT yields a delta or a
-/// complete relation). `replace` forbids `key:` (nothing to reconcile
-/// against) and is replay-safe only *structurally* — the engine admits it
-/// solely in cells with no incremental source (`resolve_declarative_
-/// transforms`'s incremental-source gate, `config::mod::load`), never by
-/// trusting the SELECT is a complete relation. `never` also forbids `key:`
-/// (nothing is ever stored, so there is nothing to reconcile) and commits
-/// nothing at all — the engine binds it as a session-local view and stops
-/// (`engine::execute_never`).
+/// The three closed declarative materialization strategies a transform can
+/// use (ADR 0008 §3) — every value replay-safe by construction, never by
+/// author discipline. `append`/`upsert` require `key:` and are replay-safe
+/// *unconditionally* (reconciled against existing state, invariant under
+/// whether the SELECT yields a delta or a complete relation). `replace`
+/// forbids `key:` (nothing to reconcile against) and is replay-safe only
+/// *structurally* — the engine admits it solely in cells with no incremental
+/// source (`resolve_declarative_transforms`'s incremental-source gate,
+/// `config::mod::load`), never by trusting the SELECT is a complete
+/// relation.
+///
+/// `Never` is **not a fourth strategy** — it is a rejected legacy value,
+/// kept representable here only so `materialize: never` still *parses* far
+/// enough for `verify::check_no_materialize_never` (called from
+/// `config::mod::load`, with the whole `CellDef` in view) to reject it with
+/// a migration error naming the affected export(s) and both exits
+/// (materialize, or bind — see `Export::bind`). No code past that point ever
+/// sees a `ResolvedTransform` with this strategy: it is issue #6's original
+/// design (bind the SELECT as a session-local `TEMP VIEW` and stop), founder
+/// -reversed once every shipped `never` fixture turned out to be `SELECT *`
+/// — every semantic a real transform could add (a rename, a derived column,
+/// a `WHERE`) was a promise nothing ran, which on a PII surface is silent
+/// over-disclosure. A virtual export now binds directly to an existing
+/// object instead; there is no transform at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MaterializeStrategy {
@@ -586,14 +627,8 @@ pub enum MaterializeStrategy {
     /// replace accumulated history with the delta — this ADR's founding
     /// incident.
     Replace,
-    /// Commit nothing (issue #6): bind the SELECT as a session-local
-    /// `TEMP VIEW` and stop — no `lake` catalog mutation, no snapshot, no
-    /// stored rows. No `key:` — there is no stored row to reconcile a key
-    /// against. The contract (interface, grain, verify) still applies to the
-    /// view; only the storage decision is different. An export sourced from
-    /// a `never` table is described in the context document but not routed
-    /// by `serve` (ADR 0012 §4's `channels` names where the rows actually
-    /// live).
+    /// Rejected legacy value — see the enum's doc comment. Kept parseable,
+    /// never executable.
     Never,
 }
 
@@ -854,29 +889,16 @@ impl ResolvedTransform {
     }
 }
 
-/// The table names of every `materialize: never` transform (issue #6) — the
-/// virtual-export set every consumer that must not treat a never-backed
-/// export as snapshot-backed derives from, once, here: `verify`'s grain
-/// inheritance, the context document's per-export `query` block, `serve`'s
-/// route mounting/openapi/probes, and `release`'s pin sites all call this
-/// rather than re-filtering `MaterializeStrategy::Never` independently.
-pub fn never_backed_tables(transforms: &[ResolvedTransform]) -> std::collections::HashSet<String> {
-    transforms
-        .iter()
-        .filter(|t| matches!(t.strategy, MaterializeStrategy::Never))
-        .map(|t| t.table.clone())
-        .collect()
-}
-
-/// Whether every transform in the cell is `materialize: never` — a
-/// contract-only cell with no snapshot to commit (issue #6). `false` for a
-/// cell with zero transforms at all (a raw-sourced export with no transform
-/// layer, unaffected by this feature and unchanged since before it).
-pub fn is_all_never(transforms: &[ResolvedTransform]) -> bool {
-    !transforms.is_empty()
-        && transforms
-            .iter()
-            .all(|t| matches!(t.strategy, MaterializeStrategy::Never))
+/// Whether this cell's transform layer can ever commit a snapshot. Under the
+/// binding model (issue #6) a virtual export has no transform at all — it
+/// points straight at `sources:` (`Export::bind`) — so "no transforms" is
+/// now the ordinary shape of a cell that is entirely (or, in a mixed cell,
+/// partly) bound, not a special case layered on top of `MaterializeStrategy`
+/// filtering. The one place this is decided: `engine::run`'s refusal, the
+/// deploy pre-flight, and `serve`'s draft-note selection all call this
+/// rather than re-deriving it.
+pub fn builds_no_snapshot(transforms: &[ResolvedTransform]) -> bool {
+    transforms.is_empty()
 }
 
 /// Resolve-time validation for `transforms:` (ADR 0008): stem-derived table
@@ -885,7 +907,18 @@ pub fn is_all_never(transforms: &[ResolvedTransform]) -> bool {
 /// case) and key identifier shape. Pure — no `${VAR}` expansion (table/key
 /// names are contract, not environment) and no filesystem access beyond
 /// deriving a stem from the declared path string.
-pub fn resolve_transforms(transforms: &[TransformEntry]) -> Result<Vec<ResolvedTransform>> {
+///
+/// Does **not** reject `materialize: never` — a `ResolvedTransform` with
+/// that strategy resolves cleanly here; `config::mod::load` is the one call
+/// site that rejects it afterward (`verify::check_no_materialize_never`,
+/// which needs full `CellDef` context this function doesn't have — the
+/// interface, to name the affected export). `execute_transform`/
+/// `execute_materialize`'s `Never` match arms are `unreachable!()` on that
+/// call-site discipline, not on anything this function's own type enforces
+/// — `pub(crate)` (not `pub`) so every caller stays inside the module that
+/// discipline actually depends on, never a hypothetical external one that
+/// could skip straight to `execute_transform` with an unrejected `Never`.
+pub(crate) fn resolve_transforms(transforms: &[TransformEntry]) -> Result<Vec<ResolvedTransform>> {
     let mut resolved = Vec::with_capacity(transforms.len());
     // table name -> the `sql:`/file path that claimed it, for the collision error.
     let mut claimed: IndexMap<String, String> = IndexMap::new();
@@ -1211,6 +1244,7 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             source: source.map(str::to_string),
+            bind: None,
             description: None,
             docs: None,
             grain: vec![],
@@ -1559,6 +1593,24 @@ sources:
                  to track, e.g. `cursor: updated_at`."
             ),
             "unexpected error: {err}"
+        );
+    }
+
+    /// Low-priority fix, review-flagged: `Export` had no `deny_unknown_fields`,
+    /// so `binds:` (a typo for `bind:`) would otherwise silently parse as a
+    /// plain materialized export — `bind` defaults to `None`, no error
+    /// anywhere near the typo, and the export reads its transform table
+    /// under `name` instead of binding the intended source.
+    #[test]
+    fn export_unknown_field_is_rejected_not_silently_ignored() {
+        let yaml = "cell: t\ninterface:\n  - name: e\n    version: 1.0.0\n    binds: raw\n";
+        let err = serde_yaml::from_str::<CellDef>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("binds"), "unexpected error: {err}");
+        assert!(
+            err.contains("unknown field"),
+            "must be rejected, not silently parsed as a plain export: {err}"
         );
     }
 
@@ -2242,42 +2294,27 @@ cells:
         assert!(!is_valid_identifier(""));
     }
 
-    // --- issue #6: `never_backed_tables` / `is_all_never` ------------------
+    // --- binding model: `builds_no_snapshot` --------------------------------
 
-    fn never_entry(sql: &str) -> TransformEntry {
-        TransformEntry::Materialize {
-            sql: sql.to_string(),
-            materialize: MaterializeStrategy::Never,
-            key: vec![],
-        }
-    }
-
+    /// `is_all_never_true_only_when_every_transform_is_never` (pre-binding-
+    /// model) asserted `!builds_no_snapshot(&[])` — under the removed
+    /// `materialize: never` design, zero transforms was a rarely-meaningful
+    /// edge case, deliberately excluded so it wasn't mistaken for the
+    /// then-new virtual-cell feature. Under the binding model, zero
+    /// transforms is the *ordinary* shape of an entirely-bound cell (every
+    /// export points at `sources:` via `Export::bind`, no transform layer at
+    /// all) — the old exclusion would misclassify exactly that cell as
+    /// "still might build a snapshot." This is the behavior the founder's
+    /// decision changes, not a regression: an empty transform list can never
+    /// commit a snapshot regardless of why it's empty.
     #[test]
-    fn never_backed_tables_names_only_never_strategy_tables() {
-        let entries = vec![
-            TransformEntry::Path("sql/stg.sql".into()),
-            never_entry("sql/virtual_pii.sql"),
-            materialize("sql/fct.sql", &["id"]),
-        ];
-        let resolved = resolve_transforms(&entries).unwrap();
-        let never = never_backed_tables(&resolved);
-        assert_eq!(never.len(), 1);
-        assert!(never.contains("virtual_pii"));
-        assert!(!never.contains("stg"));
-        assert!(!never.contains("fct"));
-    }
-
-    #[test]
-    fn is_all_never_true_only_when_every_transform_is_never() {
-        assert!(!is_all_never(&[])); // no transforms at all: not this feature's concern
-        let mixed = resolve_transforms(&[
-            never_entry("sql/a.sql"),
+    fn builds_no_snapshot_true_only_when_transforms_are_empty() {
+        assert!(builds_no_snapshot(&[]));
+        let some = resolve_transforms(&[
+            materialize("sql/a.sql", &["id"]),
             TransformEntry::Path("sql/b.sql".into()),
         ])
         .unwrap();
-        assert!(!is_all_never(&mixed));
-        let all_never =
-            resolve_transforms(&[never_entry("sql/a.sql"), never_entry("sql/b.sql")]).unwrap();
-        assert!(is_all_never(&all_never));
+        assert!(!builds_no_snapshot(&some));
     }
 }

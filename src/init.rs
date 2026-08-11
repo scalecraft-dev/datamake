@@ -83,10 +83,16 @@ transforms:                       # private; run in listed order, atomically -> 
                                    # shape, so this is a bare path (replace, implied) too
 
 interface:                        # the export list - the public surface, single source of truth
+  # - name: crm_accounts_raw      # a VIRTUAL export (issue #6): no transform at all — `bind:`
+  #   version: 1.0.0              # points straight at a declared source. datamk owns the
+  #   bind: crm_accounts          # contract (schema/grain, live-checked by `verify`), never the
+  #   grain: [account_id]         # rows: no SQL runs, so a rename/derived column/WHERE here would
+  #   schema:                     # be a promise nothing kept. Want one of those? Materialize a
+  #     account_id: integer       # transform instead (`materialize: replace`, computes and
+  # `source`/`bind` are mutually exclusive per export — pick one.
   - name: orders_daily
     version: 2.1.0                # semver; route keys on MAJOR -> GET /orders_daily@2
-    source: orders_daily          # transform table this reads (defaults to name; a session
-                                   # view, not a lake table, if that transform is materialize: never)
+    source: orders_daily          # transform table this reads (defaults to name)
     description: One row per (order_date, region) with the summed order revenue.  # what one row
                                   # means; required once contract: supported (ADR 0012)
     grain: [order_date, region]   # filterable query params + uniqueness-checked by `verify`

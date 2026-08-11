@@ -15,16 +15,6 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
     let snapshot = current_snapshot(&cell.conn)?;
 
-    // issue #6: a `materialize: never` table is never in `lake` at all —
-    // pinning it to `snapshot` would record a version id that governs
-    // nothing, and (downstream) `serve`/`probe_exports` would apply
-    // `AT (VERSION => id)` to a relation the pin can't actually describe.
-    // `serve` doesn't route these regardless (`mounted_routes`), but the
-    // manifest itself should not carry a pin that names no real object —
-    // `datamk status`/`attach` and anything else that reads
-    // `published.json` directly must not see a route implying a lake table.
-    let never_tables = crate::config::never_backed_tables(&cell.transforms);
-
     // ADR 0013 §5: docs fingerprints are a release-time fact, computed here
     // (not at config-load time — that would populate `observed.docs` on
     // every never-built cell) for the cell plus every discoverable export
@@ -51,11 +41,20 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
         if export.contract != Contract::Supported {
             continue;
         }
-        if never_tables.contains(export.source_object()) {
+        // issue #6, binding model: a bound export's declared object is never
+        // in `lake` at all — pinning it to `snapshot` would record a
+        // version id that governs nothing, and (downstream)
+        // `serve`/`probe_exports` would apply `AT (VERSION => id)` to a
+        // relation the pin can't actually describe. `serve` doesn't route
+        // these regardless (`mounted_routes`), but the manifest itself
+        // should not carry a pin that names no real object — `datamk
+        // status`/`attach` and anything else that reads `published.json`
+        // directly must not see a route implying a lake table.
+        if export.is_bound() {
             tracing::info!(
                 export = %export.name,
-                "materialize: never — no snapshot to pin; datamk owns this export's contract, \
-                 not its rows (see `datamk context`)"
+                "bound export — no snapshot to pin; datamk owns this export's contract, not its \
+                 rows (see `datamk context`)"
             );
             continue;
         }
@@ -165,14 +164,14 @@ mod tests {
             .remove(0)
     }
 
-    // issue #6: `release` must not pin a `materialize: never` export — there
+    // issue #6, binding model: `release` must not pin a bound export — there
     // is no lake snapshot behind it to pin, and a pin naming one would let
     // `AT (VERSION => id)` be applied to a relation that isn't in the lake
     // (the exact bug class the review flagged for `serve`'s pin sites).
     #[test]
-    fn release_skips_pinning_a_never_backed_supported_export_but_pins_its_materializing_sibling() {
+    fn release_skips_pinning_a_bound_supported_export_but_pins_its_materializing_sibling() {
         let dir = std::env::temp_dir().join(format!(
-            "datamk-release-never-{}-{}",
+            "datamk-release-bound-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -186,8 +185,6 @@ mod tests {
             "cell: mixed_release\n\
              transforms:\n\
              \x20 - sql/stg.sql\n\
-             \x20 - sql: sql/virtual_pii.sql\n\
-             \x20   materialize: never\n\
              interface:\n\
              \x20 - name: stg\n\
              \x20   version: 1.0.0\n\
@@ -202,9 +199,12 @@ mod tests {
              \x20   description: PII rows datamk verifies but never stores.\n\
              \x20   grain: [id]\n\
              \x20   schema:\n\
-             \x20     id: integer\n\
+             \x20     id: bigint\n\
              \x20     val: string\n\
-             \x20   contract: supported\n",
+             \x20   contract: supported\n\
+             \x20   bind: raw\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
         )
         .unwrap();
         std::fs::write(
@@ -212,7 +212,7 @@ mod tests {
             "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
         )
         .unwrap();
-        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM stg").unwrap();
+        std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
         std::fs::write(
             dir.join("profiles/local.yaml"),
             "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
@@ -236,7 +236,7 @@ mod tests {
         );
         assert!(
             !manifest.routes.contains_key("virtual_pii@1"),
-            "a never-backed export must never be pinned — there is no lake snapshot behind it: \
+            "a bound export must never be pinned — there is no lake snapshot behind it: \
              {manifest:?}"
         );
 

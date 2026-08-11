@@ -80,6 +80,51 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// An all-bound cell (issue #6/#11): every export `bind:`s a raw-file
+/// source, no `transforms:` at all — `config::builds_no_snapshot` is `true`
+/// by construction. `deploy/prod.yaml` + `profiles/prod.yaml` are included
+/// so both the `run`-refusal (A2) and the deploy-relax (H1) CLI-level
+/// regressions can be driven against the exact same fixture shape.
+fn all_bound_fixture(tag: &str) -> PathBuf {
+    let dir = scratch_dir(tag);
+    std::fs::create_dir_all(dir.join("deploy")).unwrap();
+    std::fs::write(
+        dir.join("cell.yaml"),
+        "cell: virtual_only\n\
+         interface:\n\
+         \x20 - name: customer_pii\n\
+         \x20   version: 1.0.0\n\
+         \x20   description: PII rows datamk verifies but never stores.\n\
+         \x20   grain: [id]\n\
+         \x20   bind: raw\n\
+         \x20   schema:\n\
+         \x20     id: bigint\n\
+         \x20     email: string\n\
+         sources:\n\
+         \x20 raw: ./data.csv\n\
+         access:\n\
+         \x20 shareable: true\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("data.csv"), "id,email\n1,a@example.com\n").unwrap();
+    std::fs::write(
+        dir.join("profiles/local.yaml"),
+        "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("profiles/prod.yaml"),
+        "storage: s3://datamk-test/cells/virtual_only\ns3:\n  region: us-east-1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deploy/prod.yaml"),
+        "target: kubernetes\nallow_anonymous: true\n",
+    )
+    .unwrap();
+    dir
+}
+
 /// `run` writes a persistent file log under `.cell/logs/` and prints its
 /// path on stderr — the two discoverability halves of the feature: the file
 /// itself, and the one line that says where it went.
@@ -467,6 +512,36 @@ fn deploy_dry_run_never_contacts_a_cluster() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Issue #6/#11 (H1): `datamk deploy --dry-run` against a real all-bound
+/// cell, through the actual CLI/preflight/render path — not just the pure
+/// `manifests()` unit test — renders no init Job at all. Both reviewers
+/// caught H1 by execution (a `<cell>-init-<hash>` Job in `--dry-run`
+/// output, and `datamk run` exiting 1 on the same fixture); this pins the
+/// fixed behavior at the same layer the bug was found at.
+#[test]
+fn deploy_dry_run_renders_no_init_job_for_an_all_bound_cell() {
+    let dir = all_bound_fixture("nodryinit");
+    let out = run(
+        &dir,
+        &["deploy", "-f", "cell.yaml", "-p", "prod", "--dry-run"],
+    );
+    assert!(
+        out.status.success(),
+        "dry-run deploy of an all-bound cell should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("kind: ConfigMap"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: Deployment"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: Service"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("kind: Job"),
+        "an all-bound cell has nothing to build — no init Job may be \
+         rendered, or a real apply would crash-loop it: stdout: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- ADR 0005 (incremental source loading): CLI-surface tests -------------
 //
 // Incremental applies only to `connection` sources, and the only connector is
@@ -479,32 +554,37 @@ fn deploy_dry_run_never_contacts_a_cluster() {
 // `incremental:` block) actually reach a user running `datamk run`, not just
 // the `src/config` unit tests.
 
-/// The true `--full-refresh` no-op needs a cell with **zero transforms and
-/// zero incremental sources** (ADR 0008: every transform is declarative by
-/// construction now, so a cell with any `transforms:` entry always has
-/// something for `--full-refresh` to rebuild — see
-/// `full_refresh_rebuilds_declarative_tables_with_no_incremental_source_present`
-/// below). `orders` used to be this fixture back when a bare-path entry was
-/// a raw transform excluded from the declarative count; it no longer is,
-/// so this test builds its own empty cell instead of reusing `orders`.
+// `full_refresh_is_a_warned_noop_with_no_transforms_and_no_incremental_
+// sources` (pre-binding-model) is gone, not converted: it needed a cell
+// with zero transforms and zero incremental sources to reach the
+// `--full-refresh` "no effect" warning — but `run` now refuses a cell with
+// no materializing transforms before that warning is ever evaluated
+// (binding model, issue #6: `config::builds_no_snapshot`,
+// `engine::FullRefreshEffect`'s doc comment). The state this test built to
+// reach is no longer reachable through `datamk run` at all, by any
+// fixture. The refusal itself — the thing that replaced it — is pinned at
+// the CLI layer immediately below (A2): previously covered only by a unit
+// test calling `engine::run()` directly, which can't catch a future
+// argument-parsing or profile-loading regression the way a real subprocess
+// invocation can.
+
+/// Issue #6/#11 (A2): the zero-transform/all-bound refusal
+/// (`config::builds_no_snapshot`), driven through the real CLI binary —
+/// not just `engine::run()` called directly — so a future change to `clap`
+/// arg parsing or profile loading can't silently break it.
 #[test]
-fn full_refresh_is_a_warned_noop_with_no_transforms_and_no_incremental_sources() {
-    let dir = scratch_dir("fullrefreshnoop");
-    std::fs::write(dir.join("cell.yaml"), "cell: empty\ninterface: []\n").unwrap();
-    std::fs::write(
-        dir.join("profiles/local.yaml"),
-        "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
-    )
-    .unwrap();
-    let out = run_ok(
-        &dir,
-        &["run", "-f", "cell.yaml", "-p", "local", "--full-refresh"],
-    );
-    let log = combined(&out);
+fn run_refuses_an_all_bound_cell_with_no_materializing_transforms() {
+    let dir = all_bound_fixture("norun");
+    let out = run(&dir, &["run", "-f", "cell.yaml", "-p", "local"]);
     assert!(
-        log.contains("--full-refresh has no effect: this cell declares no incremental sources"),
-        "expected the no-op warning, got: {log}"
+        !out.status.success(),
+        "run must refuse a cell with no materializing transforms"
     );
+    let err = combined(&out);
+    assert!(err.contains("no materializing transforms"), "got: {err}");
+    assert!(err.contains("no snapshot to commit"), "got: {err}");
+    assert!(err.contains("datamk verify"), "got: {err}");
+    assert!(err.contains("datamk context"), "got: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

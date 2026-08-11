@@ -46,11 +46,22 @@ impl Kubernetes {
             .context("parsing kubernetes topology in the deploy overlay")?;
         k8s.validate()
             .context("validating kubernetes topology in the deploy overlay")?;
+        // Issue #6/#11: refused here, before the `--dry-run` branch below,
+        // so both dry-run (which never touches a cluster) and a real apply
+        // refuse `schedule:` set on an all-bound cell — a CronJob invoking
+        // `datamk run` on a cell with nothing to build, which would
+        // crash-loop on every scheduled tick.
+        preflight::check_no_schedule_for_an_all_bound_cell(&ctx.def.cell, ctx.all_bound, &k8s)?;
 
         // Reconcile workloads: the Server always (the cell is servable —
         // pre-flight guaranteed it); the Builder only when a schedule is set.
+        // `!ctx.all_bound` is defense-in-depth, not the primary guard (the
+        // check immediately above already refused this combination
+        // outright) — belt and suspenders against `Workload::Scheduled` (and
+        // the report it feeds) ever claiming a Builder exists for a cell
+        // with nothing to build.
         let mut workloads = vec![Workload::LongLived];
-        if k8s.schedule.is_some() {
+        if k8s.schedule.is_some() && !ctx.all_bound {
             workloads.push(Workload::Scheduled);
         }
 
@@ -68,6 +79,7 @@ impl Kubernetes {
                 artifact: ctx.artifact,
                 has_roles,
                 secret_checksum: None,
+                all_bound: ctx.all_bound,
             };
             let rendered = render::manifests(&input)
                 .context("rendering kubernetes manifests")?
@@ -102,6 +114,7 @@ impl Kubernetes {
             artifact: ctx.artifact,
             has_roles,
             secret_checksum: secret_checksum.as_deref(),
+            all_bound: ctx.all_bound,
         };
         let m = render::manifests(&input).context("rendering kubernetes manifests")?;
         let rendered = m.docs().context("serializing kubernetes manifests")?;

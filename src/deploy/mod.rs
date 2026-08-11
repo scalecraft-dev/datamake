@@ -44,13 +44,19 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
     })?;
     let target = build_target(target_kind)?;
 
+    // Issue #6/#11: derived once, here — the one place on this path that
+    // has resolved transforms — and threaded to both the agnostic
+    // pre-flight and `DeployContext` below, rather than each independently
+    // recomputing it (and risking drift on what "all-bound" means).
+    let all_bound = crate::config::builds_no_snapshot(&loaded.transforms);
+
     preflight::check(&PreflightInput {
         def: &loaded.def,
         bindings: &loaded.bindings,
-        transforms: &loaded.transforms,
         supports: target.supports(),
         allow_anonymous: cfg.allow_anonymous,
         profile: &args.profile,
+        all_bound,
     })
     .with_context(|| format!("deploy pre-flight failed (profile '{}')", args.profile))?;
 
@@ -101,6 +107,7 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
         def: &loaded.def,
         artifact: &artifact,
         bindings: &loaded.bindings,
+        all_bound,
         cfg: &cfg,
         profile: &args.profile,
         dry_run: args.dry_run,
