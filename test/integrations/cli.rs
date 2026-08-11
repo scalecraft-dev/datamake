@@ -125,6 +125,29 @@ fn all_bound_fixture(tag: &str) -> PathBuf {
     dir
 }
 
+/// A cell declaring a raw source and no `interface:` at all (issue #18):
+/// `datamk interface import`'s starting point — nothing declared yet, one
+/// unambiguous source to bind.
+fn source_only_fixture(tag: &str) -> PathBuf {
+    let dir = scratch_dir(tag);
+    std::fs::write(
+        dir.join("cell.yaml"),
+        "cell: importsmoke\nsources:\n  gold_customer: ./data.csv\naccess:\n  shareable: true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("data.csv"),
+        "customer_id,credits_balance,is_active\nc1,10.5,true\nc2,20.25,false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("profiles/local.yaml"),
+        "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+    )
+    .unwrap();
+    dir
+}
+
 /// `run` writes a persistent file log under `.cell/logs/` and prints its
 /// path on stderr — the two discoverability halves of the feature: the file
 /// itself, and the one line that says where it went.
@@ -946,4 +969,174 @@ fn mesh_emit_copies_the_context_summary_from_a_live_cell() {
     assert!(miss.get("context_digest").is_none(), "{miss}");
 
     let _ = std::fs::remove_dir_all(&target);
+}
+
+// --- issue #18: `datamk interface import` ----------------------------------
+
+/// stdout carries ONLY the YAML block (pipeable straight into `cell.yaml`);
+/// every narration byte goes to stderr. Types come from the live-bound raw
+/// source (no BigQuery credentials needed for this shape — DuckDB is the
+/// sole authority for a raw file, correctly, not a fallback).
+#[test]
+fn interface_import_prints_only_yaml_to_stdout() {
+    let dir = source_only_fixture("importstdout");
+    let out = run_ok(
+        &dir,
+        &[
+            "interface",
+            "import",
+            "-p",
+            "local",
+            "--as",
+            "qfai_customer",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim_start().starts_with("- name: qfai_customer"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("bind: gold_customer"), "{stdout}");
+    assert!(stdout.contains("customer_id: string"), "{stdout}");
+    assert!(stdout.contains("# description:"), "{stdout}");
+    assert!(stdout.contains("contract: experimental"), "{stdout}");
+    // Never emits an actual description or the removed `unit:` field.
+    assert!(!stdout.contains("unit:"), "{stdout}");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Paste this into"),
+        "narration must land on stderr: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--bind` is optional when the cell declares exactly one source — the
+/// fixture's sole `gold_customer` source is picked automatically.
+#[test]
+fn interface_import_defaults_bind_to_the_sole_source() {
+    let dir = source_only_fixture("importsolesource");
+    let out = run_ok(&dir, &["interface", "import", "-p", "local"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // --as omitted too: the export name defaults to the source name.
+    assert!(stdout.contains("name: gold_customer"), "{stdout}");
+    assert!(stdout.contains("bind: gold_customer"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--write` splices the block directly into `cell.yaml`, and the result
+/// passes `datamk verify` end to end — the whole point of emitting types
+/// datamk itself just read live.
+#[test]
+fn interface_import_write_splices_a_verify_passing_export() {
+    let dir = source_only_fixture("importwrite");
+    run_ok(
+        &dir,
+        &[
+            "interface",
+            "import",
+            "-p",
+            "local",
+            "--as",
+            "qfai_customer",
+            "--write",
+        ],
+    );
+    let cell_yaml = std::fs::read_to_string(dir.join("cell.yaml")).unwrap();
+    assert!(
+        cell_yaml.contains("interface:\n  - name: qfai_customer"),
+        "{cell_yaml}"
+    );
+    // The pre-existing sources:/access: content survives untouched — a
+    // splice, not a serde_yaml round-trip.
+    assert!(
+        cell_yaml.contains("sources:\n  gold_customer: ./data.csv"),
+        "{cell_yaml}"
+    );
+
+    run_ok(&dir, &["verify", "-p", "local"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Re-importing the same `--as` name without `--force` is refused; with
+/// `--force` it replaces the existing entry in place (no duplicate).
+#[test]
+fn interface_import_refuses_a_collision_without_force_then_replaces_with_it() {
+    let dir = source_only_fixture("importforce");
+    run_ok(
+        &dir,
+        &[
+            "interface",
+            "import",
+            "-p",
+            "local",
+            "--as",
+            "qfai_customer",
+            "--write",
+        ],
+    );
+
+    let out = run(
+        &dir,
+        &[
+            "interface",
+            "import",
+            "-p",
+            "local",
+            "--as",
+            "qfai_customer",
+            "--write",
+        ],
+    );
+    assert!(!out.status.success(), "must refuse without --force");
+    let err = combined(&out);
+    assert!(err.contains("already exists"), "got: {err}");
+    assert!(err.contains("--force"), "got: {err}");
+
+    run_ok(
+        &dir,
+        &[
+            "interface",
+            "import",
+            "-p",
+            "local",
+            "--as",
+            "qfai_customer",
+            "--write",
+            "--force",
+        ],
+    );
+    let cell_yaml = std::fs::read_to_string(dir.join("cell.yaml")).unwrap();
+    assert_eq!(
+        cell_yaml.matches("- name: qfai_customer").count(),
+        1,
+        "force must replace, never duplicate: {cell_yaml}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An ambiguous cell (2+ sources, no `--bind`) is refused with the source
+/// list named, not a confusing pick-one-for-you guess.
+#[test]
+fn interface_import_requires_bind_when_the_cell_has_multiple_sources() {
+    let dir = scratch_dir("importambiguous");
+    std::fs::write(
+        dir.join("cell.yaml"),
+        "cell: t\nsources:\n  a: ./a.csv\n  b: ./b.csv\naccess:\n  shareable: true\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("a.csv"), "id\n1\n").unwrap();
+    std::fs::write(dir.join("b.csv"), "id\n1\n").unwrap();
+    std::fs::write(
+        dir.join("profiles/local.yaml"),
+        "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+    )
+    .unwrap();
+
+    let out = run(&dir, &["interface", "import", "-p", "local"]);
+    assert!(!out.status.success());
+    let err = combined(&out);
+    assert!(err.contains("--bind"), "got: {err}");
+    assert!(err.contains('a') && err.contains('b'), "got: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

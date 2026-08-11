@@ -76,6 +76,9 @@ pub enum Command {
     /// agent which cells exist. A document an operator hosts anywhere —
     /// never a registry service, never served by `serve`.
     Mesh(MeshArgs),
+    /// Interface-authoring tooling (issue #18): import a warehouse object's
+    /// types into a ready-to-edit bound export block.
+    Interface(InterfaceArgs),
     /// Roll back the served DATA to an earlier execution by repointing LATEST.
     /// (To roll back a version/code change, use your orchestrator's rollout undo.)
     Rollback(RollbackArgs),
@@ -141,6 +144,52 @@ pub struct MeshEmitArgs {
     /// Write the manifest to a file instead of stdout
     #[arg(long)]
     pub out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct InterfaceArgs {
+    #[command(subcommand)]
+    pub command: InterfaceCommand,
+}
+
+#[derive(Subcommand)]
+pub enum InterfaceCommand {
+    /// Emit a ready-to-edit bound export block from a warehouse object's
+    /// own types — never its prose. Types are safe to copy because `verify`
+    /// checks them against the warehouse every run, so a stale copy is
+    /// caught; descriptions have no such check, so a copy would silently
+    /// rot. The warehouse's own prose already rides `observed.
+    /// source_descriptions`, live — write `description:` only when you mean
+    /// something different from it.
+    Import(InterfaceImportArgs),
+}
+
+#[derive(Args)]
+pub struct InterfaceImportArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml) — the live
+    /// warehouse connection the column types are read from.
+    #[arg(short, long, default_value = "local")]
+    pub profile: String,
+    /// Which `sources:` entry to bind. Optional when the cell declares
+    /// exactly one source; required (and named) otherwise.
+    #[arg(long)]
+    pub bind: Option<String>,
+    /// The new export's name. Defaults to the bound source's own name.
+    #[arg(long = "as")]
+    pub as_name: Option<String>,
+    /// Splice the block directly into cell.yaml's `interface:` list instead
+    /// of printing it. A byte-range textual edit, never a full
+    /// `serde_yaml` round-trip — that would destroy every comment already
+    /// in the file, teaching ones included.
+    #[arg(long)]
+    pub write: bool,
+    /// With --write, overwrite an existing export of the same name instead
+    /// of refusing.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
