@@ -153,7 +153,7 @@ key" impossible to reject on purpose.
 
 ## 5. Document shape — three places, never collapsed
 
-- **`declared.docs`** — identity only: `{target, path, media_type}` per
+- **`declared.docs`** — identity only: `{target, source_path, media_type}` per
   entry. `target` is `"cell"` or the route key (`name@major`) — route keys
   always carry `@major`, so no collision with the literal string `"cell"`.
   Always present (`[]` when none), alongside an affordance field

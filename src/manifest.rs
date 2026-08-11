@@ -96,6 +96,23 @@ pub struct SourceCheckRecord {
     /// the fail-closed behavior we want, not a special case for it.
     #[serde(default)]
     pub profile: String,
+    /// Route key -> what the grain check actually measured. `#[serde(default)]`
+    /// so records written before this field still parse (as empty — no
+    /// measurement, never a fabricated one).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exports: BTreeMap<String, GrainMeasurement>,
+}
+
+/// The numbers behind `grain_verified` for one export: the 722/722 that used
+/// to be computed, compared, and thrown away.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrainMeasurement {
+    /// The check that ran. `"grain_unique"` today; a closed vocabulary.
+    pub check: String,
+    /// The grain columns it ran on.
+    pub grain: Vec<String>,
+    pub rows: i64,
+    pub distinct_grain: i64,
 }
 
 impl SourceCheckRecord {

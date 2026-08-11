@@ -309,7 +309,7 @@ is a registry endpoint and pre-auth crawl bait.
   ```json
   { "datamk_mesh": 1, "generated_at": "…",
     "cells": [ { "name": "…", "url": "…", "description": "…",
-                 "exports": [ { "name": "…", "version": "…", "contract": "…" } ],
+                 "exports": [ { "name": "…", "version": "…", "contract": "…", "bound": false } ],
                  "context_digest": "…", "auth_hint": "…" } ] }
   ```
 
@@ -654,3 +654,82 @@ change): `never_backed_routes` -> `bound_routes`, `note_never_backed` ->
 `describe_never_offender` keep their names — they name the literal rejected
 `materialize: never` keyword the migration error matches on, which is
 correct as long as that error exists.
+
+## Amendment (2026-08-11): `datamk_context: 2` — bindings, measurements, and a rename
+
+From a design partner's report of consuming a live bound cell. Four changes,
+one of them breaking.
+
+- **`declared.exports[].binding`** (additive). A bound export's target was
+  machine-invisible: `query: null` said "not here" and nothing said where.
+  The object name existed only in `docs:` prose, and `data.channels` — an
+  operator hint from the profile, free-form by design — gave the dataset at
+  best. Writing a query against a bound cell meant reading English, which is
+  the one thing this document exists to stop. Now: `{source, object,
+  connection}`, present iff `query` is null, so the two are complements.
+  **Values are verbatim `cell.yaml`, never profile-resolved** — `table` is
+  env-expandable and `Declared` is hashed wholesale into `interface_digest`,
+  so a resolved value would fold the environment into the digest and churn it
+  per deployment; a templated table ships as `${DATASET}.fct_x`. A `cell:`
+  source is rejected at resolve time (`verify::validate_bound_exports`) and an
+  unresolvable name discloses no object, so neither can leak an upstream's
+  table through this field — the §5 disclosure boundary is unchanged.
+  `materialize: "never"` was requested as a third key and declined: that
+  strategy was removed by the amendment above, and presence of `binding` is
+  already the positive assertion.
+- **`observed.source_check.exports`** (additive). `grain_verified: true` and
+  `outcome: "passed"` asserted a result while `verify` computed the counts
+  behind them, compared them, and discarded them (`verify::grain_counts`).
+  Route key -> `{check, grain, rows, distinct_grain}`, persisted through
+  `.cell/source_check.json` under the same fail-closed digest+profile gate as
+  the record itself, and visibility-filtered on the way to the wire.
+  Timestamped by the enclosing `checked_at`: one pass, one time. A grainless
+  export contributes no entry — no check ran on it, and §2 forbids inventing
+  one. Deliberately not hung off `observed.exports` (`ExportProbe`), which is
+  lake-row-derived at swap time and would be re-meaned.
+- **`MeshExport.bound`** (additive, mesh manifest). The manifest carried
+  `{name, version, contract}`, so an agent routing off it picked a bound
+  export and hit the 404 the document could have warned it about. Copied from
+  `binding`'s presence, like every other manifest field. The emitter now
+  accepts `datamk_context` 1 or 2 — the v2 rename touches nothing it copies.
+- **`declared.docs[].path` -> `source_path`** (**breaking**; the reason
+  `datamk_context` is 2). A cell.yaml-relative filesystem path named `path`,
+  in a JSON document served over HTTP, reads as a relative URL and 404s for
+  anyone who tries it — the same false affordance already corrected for
+  `route` in the amendment above, in the same document, on the same reasoning.
+  Serving the pages at their own route was rejected again: §4 is one document,
+  one route, and `?include=docs` already delivers content.
+
+Alongside, on the OpenAPI surface (no document change): `/context`'s `200`
+carried a bare description string and no schema at all, so nothing in the
+spec said `include=`'s content lands at a **top-level key named for the
+section** rather than inside `included` — the reported failure was an
+iterator written over `included`, which holds section names. The response now
+has a real schema, pinned to `ContextDocument`'s top-level keys by a test,
+and the `include` parameter states the landing rule. Data path items also
+carry `x-datamk-version` and `x-datamk-contract`, which previously existed
+only as prose inside `summary`.
+
+**Declined: a cell-level semver alongside `info.version`'s digest.** There is
+no cell version in `CellDef`, and adding one creates a second identity axis
+that will drift from the per-export semvers within a single release, with no
+policy for who bumps it. Exports version independently — that is the point of
+the interface. `info.version` = interface digest remains correct (OpenAPI
+attaches no semantics to that field); the real gap was that `contract` was
+unreachable from `openapi.json`, which the extensions above close. Reverses
+if consumers need to pin the cell as a whole — and the answer then is a
+manifest of export versions, still not a new semver.
+
+**Declined: a structured `caveats` array per export, and docs-by-default.**
+The motivating hazard is real — `mrr` and `total_infra_cost_usd` both
+`decimal`/`USD`, with "not period-aligned" living only in prose behind an
+optional flag, so subtraction looks fine to a JSON-only agent. But a
+free-text `rule` with an engine-unenforced `severity` is prose in a JSON
+wrapper: it drifts exactly like `observed.source_descriptions` already does,
+and nothing can check it. Docs-by-default was rejected separately — it breaks
+the ETag variant split (ADR 0013 §6), unbounds the default response, and
+prose is precisely what the agent in question won't parse. The hazard stays
+open. The only fix that isn't docs-in-JSON is a typed column property the
+engine can verify — a period/point-in-time attribute beside `unit`, making
+"these two are not comparable" derivable rather than asserted. Not decided
+here.

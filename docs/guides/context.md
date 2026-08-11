@@ -64,7 +64,7 @@ omitted or `null` — never fabricated, never zeros.
 
 ```json
 {
-  "datamk_context": 1,
+  "datamk_context": 2,
   "cell": "orders",
   "status": "verified",
   "grain_verified": true,
@@ -258,10 +258,17 @@ curl -H "Authorization: Bearer $TOKEN" \
 }
 ```
 
+`included` holds section *names*, never the content itself: each name in it
+appears as a **top-level key of the same name**, keyed by
+`declared.docs[].target`. Iterating `included` expecting objects gets you
+strings.
+
 The default `GET /context` (no `include`) never carries page content — only
-`declared.docs`, the identity of every declared page (`{target, path,
+`declared.docs`, the identity of every declared page (`{target, source_path,
 media_type}`, no bytes) and `declared.include_request`, the affordance
-telling an agent how to ask for the rest. `included` is always present
+telling an agent how to ask for the rest. `source_path` is the author's
+path on disk, not a URL — it is deliberately not fetchable, and its name
+says so. `included` is always present
 (`[]` on the default document, `["docs"]` once inlined) so an agent can
 tell "this server predates docs pages" (the field is absent) from "this
 cell just has none" (present, `docs` is `{}`). `?include=docs` on a
@@ -369,6 +376,28 @@ refuses outright and points at `verify`/`context` instead: the contract is
 still real, but the Builder isn't the workload that proves it — a live check
 is.
 
+The document says so in machine-readable form. A bound export carries
+`query: null` — there is no `GET /{route}` for it, ever — and a `binding`
+block naming where the rows actually are:
+
+```json
+"exports": [{
+  "name": "customer_pii",
+  "route": "customer_pii@1",
+  "query": null,
+  "binding": { "source": "pii", "object": "raw.customers", "connection": "crm" }
+}]
+```
+
+The two are complements: exactly one of them is present on every export, so
+"can I query this here, and if not where do I go" is one field lookup, not a
+prose read. `object` and `connection` are verbatim `cell.yaml` — never
+profile-resolved, so a templated table ships as `${DATASET}.raw_customers`
+and the same document is honest in every environment. Which project or
+account `crm` resolves to stays in the profile, as it always has.
+`data.channels` is unchanged and still complementary: free-form operator
+hints about the destination, where `binding` is the object itself.
+
 `datamk verify` proves it: it binds the cell's sources against the live
 warehouse, then runs the exact same schema and grain checks it always has —
 declared columns exist with compatible types, declared grain exists and is
@@ -428,11 +457,24 @@ as of the moment it ran, which may since have changed. An agent that reads
     "source_check": {
       "outcome": "passed",
       "checked_at": "2026-08-07T10:00:00Z",
-      "datamk_version": "0.0.14"
+      "datamk_version": "0.0.14",
+      "exports": {
+        "customer_pii@1": {
+          "check": "grain_unique",
+          "grain": ["id"],
+          "rows": 722,
+          "distinct_grain": 722
+        }
+      }
     }
   }
 }
 ```
+
+`exports` carries what each check actually measured, so a reader sees what
+passed and not merely that it did — `checked_at` timestamps all of them, one
+pass, one time. An export with no declared grain contributes no entry: no
+check ran on it, and an empty measurement is never invented to fill the gap.
 
 `data_as_of` joins that block only when a connector can say, cheaply and
 truthfully, when the checked rows were last known-true — omitted otherwise,

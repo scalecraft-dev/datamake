@@ -57,6 +57,11 @@ pub struct MeshExport {
     pub name: String,
     pub version: String,
     pub contract: String,
+    /// Copied from the document: this export serves no rows over HTTP. Without
+    /// it an agent routing off the manifest picks a bound export and gets a
+    /// 404 with no warning it could have read here.
+    #[serde(default)]
+    pub bound: bool,
 }
 
 /// The hand-authored cells file (`mesh emit --cells`): the `{name, url}`
@@ -233,7 +238,12 @@ fn summarize(entry: CellEntry, fetched: Option<(serde_json::Value, Option<String
     let Some((doc, etag)) = fetched else {
         return cell;
     };
-    if doc.get("datamk_context").and_then(|v| v.as_u64()) != Some(1) {
+    // 1 and 2 both parse here: the v2 rename (`docs[].path` -> `source_path`)
+    // touches nothing the emitter copies. Unknown versions still bail.
+    if !matches!(
+        doc.get("datamk_context").and_then(|v| v.as_u64()),
+        Some(1) | Some(2)
+    ) {
         tracing::warn!(cell = %cell.name, "unrecognized datamk_context version; emitting name+url only");
         return cell;
     }
@@ -246,6 +256,9 @@ fn summarize(entry: CellEntry, fetched: Option<(serde_json::Value, Option<String
                     name: e["name"].as_str()?.to_string(),
                     version: e["version"].as_str()?.to_string(),
                     contract: e["contract"].as_str()?.to_string(),
+                    // `binding` present iff the export is bound — the same
+                    // signal `query: null` carries, read positively.
+                    bound: e.get("binding").is_some_and(|b| !b.is_null()),
                 })
             })
             .collect();
@@ -301,6 +314,25 @@ mod tests {
         assert_eq!(cell.auth_hint.as_deref(), Some("orders-token"));
     }
 
+    /// Without this an agent routing off the manifest picks a bound export
+    /// and hits a 404 the manifest could have warned it about.
+    #[test]
+    fn summarize_marks_a_bound_export_and_leaves_a_served_one_unmarked() {
+        let mut doc = sample_context();
+        doc["datamk_context"] = serde_json::json!(2);
+        doc["declared"]["exports"] = serde_json::json!([
+            { "name": "served", "version": "1.0.0", "contract": "supported",
+              "query": { "filters": [] } },
+            { "name": "bound", "version": "1.0.0", "contract": "experimental",
+              "query": null,
+              "binding": { "source": "gold", "object": "ds.fct_x" } },
+        ]);
+        let cell = summarize(entry("orders"), Some((doc, None)));
+        assert_eq!(cell.exports.len(), 2);
+        assert!(!cell.exports[0].bound);
+        assert!(cell.exports[1].bound);
+    }
+
     #[test]
     fn summarize_on_a_fetch_miss_keeps_the_bare_entry_and_fabricates_nothing() {
         let cell = summarize(entry("orders"), None);
@@ -313,7 +345,7 @@ mod tests {
     #[test]
     fn summarize_refuses_an_unknown_document_version() {
         let mut doc = sample_context();
-        doc["datamk_context"] = serde_json::json!(2);
+        doc["datamk_context"] = serde_json::json!(99);
         let cell = summarize(entry("orders"), Some((doc, Some("d".into()))));
         assert!(
             cell.description.is_none(),

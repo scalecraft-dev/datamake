@@ -830,7 +830,7 @@ fn context_emits_a_draft_document_for_a_local_cell() {
     let doc: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("context emits valid JSON on stdout");
 
-    assert_eq!(doc["datamk_context"], 1);
+    assert_eq!(doc["datamk_context"], 2);
     assert_eq!(doc["cell"], "ctxcell");
     assert_eq!(doc["status"], "draft", "pinless => draft, by definition");
     assert_eq!(doc["grain_verified"], false);

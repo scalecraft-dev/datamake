@@ -744,7 +744,10 @@ pub fn run(
     // `spike_temp_view_resolves_unqualified_ahead_of_use_lake`), unlike a
     // standalone `datamk verify` run afterward (see `verify::check`'s doc
     // comment).
-    crate::verify::check(&cell.conn, &cell.def, &warehouse_columns)?;
+    // The grain measurements are dropped here: a published cell reports
+    // `observed.provenance`, and `.cell/source_check.json` is `datamk verify`'s
+    // artifact alone.
+    let _ = crate::verify::check(&cell.conn, &cell.def, &warehouse_columns)?;
 
     // --verify-replay (ADR 0005 §2 item 1): after COMMIT and after
     // verify::check, before compact()/DETACH — pinned ordering. It needs the
