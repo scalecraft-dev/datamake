@@ -197,6 +197,7 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             source: None,
+            bind: None,
             description: None,
             docs: None,
             grain: vec!["order_date".to_string()],

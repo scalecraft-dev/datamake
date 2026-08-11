@@ -181,6 +181,7 @@ pub(super) fn classify_objects(tables: &[&str]) -> Result<IndexMap<String, Objec
             ObjectMeta {
                 kind: ObjectKind::Query,
                 columns: IndexMap::new(),
+                descriptions: IndexMap::new(),
             },
         );
     }

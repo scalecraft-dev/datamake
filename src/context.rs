@@ -14,7 +14,6 @@ use anyhow::Result;
 use indexmap::IndexMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 
 use crate::config::{CellDef, ColumnSpec, Contract, Export, Source, Visibility};
 use crate::engine::run_summary::RunSummary;
@@ -48,7 +47,7 @@ pub struct ContextDocument {
     /// no pin and no run summary, so it is draft even after a local build; the
     /// engine-emitted note says why. `verified_at_source` sits strictly
     /// between the two: no execution, but a `datamk verify` live-checked
-    /// every `materialize: never` export against the live warehouse
+    /// every bound export against its declared source
     /// (`observed.source_check`) — a claim about rows as of that check, not
     /// about immutable rows that still exist. Distinct from `verified` on
     /// purpose (issue #6 Q3): an agent that branches on `status` must opt in
@@ -168,7 +167,18 @@ pub struct DocsFingerprint {
 pub struct DeclaredExport {
     pub name: String,
     pub version: String,
-    /// The serving route key (`name@major`).
+    /// The route key (`name@major`) — this export's stable identity, and
+    /// its docs `target` (ADR 0013 §5), for every export regardless of
+    /// servability. It is *also* the HTTP path (`GET /{route}`) only for a
+    /// materialized export; a bound export (`Export::bind`, issue #6) has
+    /// none — `/openapi.json`'s paths already exclude it, and `query` below
+    /// is `null` for exactly the same exports, by construction
+    /// (`(!e.is_bound()).then(...)`), so `query` is the machine-checkable
+    /// signal for "does `GET /{route}` exist," never `route`'s mere
+    /// presence. Issue #6/#12: this field used to be documented as
+    /// unconditionally "the serving route key," which is what a caller
+    /// building a URL straight from it (without checking `query`) would hit
+    /// a 404 on for a bound export.
     pub route: String,
     pub contract: Contract,
     /// What one row means (ADR 0012 §3) — required once `contract:
@@ -277,6 +287,16 @@ pub struct Observed {
     /// sit here — only their fingerprint.
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub docs: IndexMap<String, DocsFingerprint>,
+    /// Upstream column descriptions observed by `datamk verify`'s live-bind
+    /// pass (issue #6/#10), source name -> column name -> description.
+    /// Keyed the same way as `cell.yaml`'s `sources:` map. A machine fact —
+    /// never authored, never hand-edited, never fed into `description_digest`
+    /// (unlike `docs:`, which is file-backed and allowlist-validated) —
+    /// because an upstream comment edit must never move datamk's own release
+    /// gate. Only BigQuery populates anything here today (ADR 0010);
+    /// Postgres/Snowflake sources are absent, not present with an empty map.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub source_descriptions: IndexMap<String, IndexMap<String, String>>,
 }
 
 /// What was actually attached for one `cell` source (issue #7): the
@@ -356,8 +376,8 @@ pub struct Provenance {
     pub data_as_of: Option<String>,
 }
 
-/// A live check of a `materialize: never` export against the warehouse
-/// (issue #6, live-verify core) — the fact behind `status: verified_at_source`.
+/// A live check of a bound export against its declared source (issue #6,
+/// live-verify core) — the fact behind `status: verified_at_source`.
 /// Deliberately not `Provenance`: there is no execution, no snapshot, no
 /// immutable rows behind this — just a machine check that passed as of
 /// `checked_at`. Built from `crate::manifest::SourceCheckRecord` (the
@@ -419,8 +439,8 @@ pub struct UpstreamRef {
 /// predicate. Sorted by route key so every derived surface is deterministic.
 ///
 /// **Declared, not mounted** (issue #6): every discoverable export, including
-/// one sourced from a `materialize: never` table — datamk owns its contract
-/// even where it doesn't own the rows, so a virtual export is still named,
+/// a bound one — datamk owns its contract even where it doesn't own the
+/// rows, so a virtual export is still named,
 /// typed, and versioned here. Callers that need only the subset `serve`
 /// actually routes over HTTP call `mounted_routes` on this list.
 pub fn discoverable_routes(def: &CellDef) -> Result<Vec<(String, Export)>> {
@@ -434,34 +454,40 @@ pub fn discoverable_routes(def: &CellDef) -> Result<Vec<(String, Export)>> {
     Ok(routes)
 }
 
-/// The snapshot-backed subset of `routes` (issue #6): drops every export
-/// whose `source` resolves to a `materialize: never` table. This is the list
-/// `serve` mounts data routes from, `openapi::generate` builds paths from,
-/// and swap-time probes run against — every one of those is a claim (or a
-/// query) about rows that exist in the lake, which a never-backed export's
-/// table never does.
-pub fn mounted_routes(
-    routes: &[(String, Export)],
-    never_tables: &HashSet<String>,
-) -> Vec<(String, Export)> {
+/// The snapshot-backed subset of `routes` (issue #6, binding model): drops
+/// every bound export (`Export::bind` — no transform, no lake table). This
+/// is the list `serve` mounts data routes from, `openapi::generate` builds
+/// paths from, and swap-time probes run against — every one of those is a
+/// claim (or a query) about rows that exist in the lake, which a bound
+/// export's declared object never is (it lives in the warehouse, or wherever
+/// `sources:` points).
+pub fn mounted_routes(routes: &[(String, Export)]) -> Vec<(String, Export)> {
     routes
         .iter()
-        .filter(|(_, e)| !never_tables.contains(e.source_object()))
+        .filter(|(_, e)| !e.is_bound())
         .cloned()
         .collect()
 }
 
-/// The declared region, built from the shared route list. `never_tables`
-/// (issue #6) nulls a never-backed export's `query` block even when
-/// `with_query` is otherwise true — the affordance it would describe (a
-/// mounted HTTP route) doesn't exist for that export regardless of whether
-/// this surface is serving anyone else's rows.
-pub fn declared(
-    def: &CellDef,
-    routes: &[(String, Export)],
-    with_query: bool,
-    never_tables: &HashSet<String>,
-) -> Declared {
+/// `data.served_here` (ADR 0012 §4): honest by construction under **both**
+/// reasons a data route can be absent — the `--no-data` flag (`data_mounted`)
+/// and a cell with nothing in `mounted` to route (every export bound, issue
+/// #6). The one place both `serve` call sites (the digest-feeding
+/// `DataBlock` and the per-request document) decide this, so the served
+/// rows, the digest/ETag, and the claim in the document can never
+/// independently disagree with each other.
+pub fn served_here(data_mounted: bool, mounted: &[(String, Export)]) -> bool {
+    data_mounted && !mounted.is_empty()
+}
+
+/// The declared region, built from the shared route list. `query` is
+/// unconditional interface grammar (ADR 0012 §2, amended) — present for
+/// every export that isn't bound. A bound export's `query` block is null:
+/// the affordance it would describe (a mounted HTTP route) does not exist
+/// for that export, ever, regardless of any serving flag — a genuine
+/// interface fact (issue #6), not a serving-mode one, which is why it's the
+/// only thing that still gates this field.
+pub fn declared(def: &CellDef, routes: &[(String, Export)]) -> Declared {
     let exports = routes
         .iter()
         .map(|(route, e)| DeclaredExport {
@@ -477,8 +503,7 @@ pub fn declared(
                 .iter()
                 .map(|(col, spec)| (col.clone(), ColumnDoc::from(spec)))
                 .collect(),
-            query: (with_query && !never_tables.contains(e.source_object()))
-                .then(|| query_block(route, e)),
+            query: (!e.is_bound()).then(|| query_block(route, e)),
         })
         .collect();
 
@@ -564,13 +589,37 @@ pub const NOTE_NO_DATA: &str =
 /// Served post-`authorize()` only (`serve::serve_export_inner`) — a
 /// pre-auth 404 here would let an unauthenticated caller enumerate which
 /// exports are virtual just by probing routes.
-pub fn note_never_backed(route: &str) -> String {
+pub fn note_bound_export(route: &str) -> String {
     format!(
-        "Rows for '{route}' are not served by this endpoint by design: this export is declared \
-         `materialize: never` — datamk owns its contract, not its rows. Fetch them via the \
-         locations listed in the context document's data.channels. See GET /context."
+        "Rows for '{route}' are not served by this endpoint by design: this export is `bind`ed \
+         to an existing object, not materialized — datamk owns its contract, not its rows. \
+         Fetch them via the locations listed in the context document's data.channels. See GET \
+         /context."
     )
 }
+
+/// The engine-emitted note on a document where every discoverable export is
+/// bound (issue #6, issue #17): `mounted` is empty regardless of
+/// `--no-data`, so no data route exists to route rows over even when the
+/// operator never passed the flag. Deliberately distinct from
+/// `NOTE_NO_DATA` — this names the cell's own definition as the reason, not
+/// an operator flag, since nothing about a deploy argument changes it. The
+/// two are mutually exclusive by construction: `served_here` is `false`
+/// either because `!data_mounted` (`NOTE_NO_DATA`) or because `mounted` is
+/// empty while `data_mounted` is `true` (this note) — never both at once.
+///
+/// M2: the caller (`serve::context_doc`) additionally gates this on at
+/// least one *discoverable* export existing at all — `mounted.is_empty()`
+/// implies "every discoverable export is bound" only when there was at
+/// least one discoverable export to begin with; a cell with zero (every
+/// export `visibility: private`) also reaches `mounted.is_empty()`, and
+/// this exact sentence would misdescribe it as bound when none of its
+/// exports are.
+pub const NOTE_NO_ROUTES_MOUNTED: &str =
+    "No data route is mounted for this cell: every export is bound directly to an existing \
+     object rather than materialized, so there is nothing here to serve regardless of the \
+     --no-data flag. Fetch rows via the locations listed in the context document's \
+     data.channels.";
 
 /// The engine-emitted note on a direct-attach (local catalog) document:
 /// pinless ⇒ draft by definition (ADR 0012 §4) — data may exist locally, but
@@ -580,29 +629,86 @@ pub const NOTE_DIRECT_ATTACH: &str =
      summary stands behind this document, so it is served as a draft. Publish with a \
      storage-backed profile for verified provenance.";
 
-/// Assemble a document from a prebuilt declared region (how the serve
-/// handler works — its declared region and digest are precomputed at
-/// startup). Status is a ladder, weakest to strongest (issue #6 Q3):
-/// `provenance` present ⇒ `verified` (its wire meaning — ADR 0012 §5) —
-/// unchanged, and checked first, so a mixed cell's published execution
-/// (which already verified its never-backed exports live at build time, see
-/// `engine::run`) reads as the strongest claim it earns; else
-/// `source_check` present ⇒ `verified_at_source`; else `draft`, with the
-/// matching engine note.
-#[allow(clippy::too_many_arguments)]
-pub fn assemble(
-    cell: String,
-    declared: Declared,
-    provenance: Option<Provenance>,
-    source_check: Option<SourceCheck>,
-    freshness: Option<FreshnessBlock>,
-    upstreams: Vec<ObservedUpstream>,
-    probes: IndexMap<String, ExportProbe>,
-    docs_fingerprints: IndexMap<String, DocsFingerprint>,
-    served_here: bool,
-    channels: Vec<String>,
-    direct_attach: bool,
-) -> ContextDocument {
+/// The engine-emitted note on a storage-backed cell with no materializing
+/// transforms (issue #6, issue #16/#3): no execution can ever exist for this
+/// cell — `run` refuses to build one (`engine::run`) — so `NOTE_DIRECT_ATTACH`
+/// would be actively wrong here (it instructs "publish with a storage-backed
+/// profile", which this cell already is, and which produces no execution
+/// regardless), and the generic `NOTE_NOTHING_BUILT` undersells it by
+/// reading as "not yet" for a cell that never will be. Points at the one
+/// command that CAN move this document off `draft`.
+///
+/// M3: deploy's pre-flight (`check_no_all_never`) does *not* refuse this
+/// cell class anymore (issue #6/#11, the deploy relax) — it refuses only a
+/// target with no long-lived Server capability at all. A Server IS
+/// deployable for exactly this cell shape; only the Builder never applies
+/// for one (no snapshot to build, `deploy::targets::kubernetes::render::
+/// render_init_job` renders no Job — H1).
+pub const NOTE_VIRTUAL_CELL: &str =
+    "This cell has no materializing transforms, so there is no snapshot to publish and no \
+     execution will ever stand behind this document. Run `datamk verify` to live-check the \
+     contract against the bound source(s), which raises this document to \
+     `verified_at_source`.";
+
+/// Every fact `assemble` needs, gathered up front. A named-field struct
+/// instead of `assemble`'s former 11 positional parameters (three bare
+/// `bool`s among them) — the exact shape that let the original `served_here`
+/// bug ship as `/* served_here */ s.data_mounted` at a call site: a comment
+/// doing the job a type should. Both doors (`build`, below, and `serve`'s
+/// `context_doc` handler) construct this with named fields; there is no
+/// positional call to `assemble` left anywhere.
+#[derive(Debug)]
+pub struct Facts {
+    pub cell: String,
+    pub declared: Declared,
+    pub provenance: Option<Provenance>,
+    pub source_check: Option<SourceCheck>,
+    pub freshness: Option<FreshnessBlock>,
+    pub upstreams: Vec<ObservedUpstream>,
+    pub probes: IndexMap<String, ExportProbe>,
+    pub docs_fingerprints: IndexMap<String, DocsFingerprint>,
+    /// Issue #6/#10: `.cell/source_descriptions.json`'s `sources` map, when
+    /// fresh — see `Observed::source_descriptions`.
+    pub source_descriptions: IndexMap<String, IndexMap<String, String>>,
+    pub served_here: bool,
+    pub channels: Vec<String>,
+    pub direct_attach: bool,
+    /// `config::builds_no_snapshot(&transforms)` — the exact predicate
+    /// `engine::run` and the deploy pre-flight already refuse a build on.
+    /// Distinct from `direct_attach`: a storage-backed cell with no
+    /// materializing transforms is neither direct-attach nor ever going to
+    /// publish, and needs its own `draft` note (issue #16/#3) rather than
+    /// either `NOTE_DIRECT_ATTACH` — which tells the reader to do the one
+    /// thing `run`/`release` refuse for this cell class — or the generic
+    /// `NOTE_NOTHING_BUILT`, which reads as "not yet" for a cell that never
+    /// will be.
+    pub is_all_never: bool,
+}
+
+/// Assemble a document from prebuilt facts (how the serve handler works —
+/// its declared region and digest are precomputed at startup). Status is a
+/// ladder, weakest to strongest (issue #6 Q3): `provenance` present ⇒
+/// `verified` (its wire meaning — ADR 0012 §5) — unchanged, and checked
+/// first, so a mixed cell's published execution (which already verified its
+/// never-backed exports live at build time, see `engine::run`) reads as the
+/// strongest claim it earns; else `source_check` present ⇒
+/// `verified_at_source`; else `draft`, with the matching engine note.
+pub fn assemble(facts: Facts) -> ContextDocument {
+    let Facts {
+        cell,
+        declared,
+        provenance,
+        source_check,
+        freshness,
+        upstreams,
+        probes,
+        docs_fingerprints,
+        source_descriptions,
+        served_here,
+        channels,
+        direct_attach,
+        is_all_never,
+    } = facts;
     let status = if provenance.is_some() {
         Status::Verified
     } else if source_check.is_some() {
@@ -610,10 +716,33 @@ pub fn assemble(
     } else {
         Status::Draft
     };
+    // issue #16/#3: `verify.rs`'s grain-uniqueness check only ever runs
+    // `if !export.grain.is_empty()` — a grainless export gets no check at
+    // all, so `status != Draft` alone would report `grain_verified: true`
+    // for a check that never ran on it. Narrowed to also require every
+    // discoverable export to declare a grain; only ever moves `true` to
+    // `false` relative to the old formula, and only where the old value was
+    // lying. Computed from `declared.exports` (not a separate parameter) so
+    // it can't drift from what `declared` itself says — and it never touches
+    // `interface_digest`, which hashes `declared` wholesale regardless of
+    // this field's value.
+    let grain_verified =
+        status != Status::Draft && declared.exports.iter().all(|e| !e.grain.is_empty());
     let mut notes = Vec::new();
     if status == Status::Draft {
         notes.push(
-            if direct_attach {
+            // M1: `is_all_never` checked first, deliberately — a local-dev
+            // all-bound cell (every one of this file's own fixtures sets
+            // `catalog:`, i.e. `direct_attach: true`) would otherwise get
+            // `NOTE_DIRECT_ATTACH`'s "publish with a storage-backed profile
+            // for verified provenance," which routes the reader straight
+            // into `datamk run`'s own refusal (no materializing transforms
+            // means no snapshot, direct-attach or not). `is_all_never` is
+            // the stronger, permanent fact — no profile ever fixes it — so
+            // it wins regardless of which profile loaded this document.
+            if is_all_never {
+                NOTE_VIRTUAL_CELL
+            } else if direct_attach {
                 NOTE_DIRECT_ATTACH
             } else {
                 NOTE_NOTHING_BUILT
@@ -625,7 +754,7 @@ pub fn assemble(
         datamk_context: DATAMK_CONTEXT_VERSION,
         cell,
         status,
-        grain_verified: status != Status::Draft,
+        grain_verified,
         declared,
         observed: if provenance.is_some()
             || source_check.is_some()
@@ -633,6 +762,7 @@ pub fn assemble(
             || !upstreams.is_empty()
             || !probes.is_empty()
             || !docs_fingerprints.is_empty()
+            || !source_descriptions.is_empty()
         {
             Some(Observed {
                 provenance,
@@ -641,6 +771,7 @@ pub fn assemble(
                 upstreams,
                 exports: probes,
                 docs: docs_fingerprints,
+                source_descriptions,
             })
         } else {
             None
@@ -660,37 +791,45 @@ pub fn assemble(
     }
 }
 
-/// Build a document straight from a definition. `with_query` controls the
-/// per-export `query` blocks (the served affordances); `served_here` is the
-/// data block's honest fact about *this* surface — a portable emission keeps
-/// the grammar (`with_query`) but never claims to serve rows itself.
+/// Build a document straight from a definition. `served_here` is the data
+/// block's honest fact about *this* surface — a portable emission keeps the
+/// query grammar (ADR 0012 §2, amended: unconditional) but never claims to
+/// serve rows itself. `is_all_never` is `config::builds_no_snapshot(&transforms)`
+/// — see `Facts`'s doc comment for why it's a separate fact from
+/// `direct_attach`.
+///
+/// Kept positional (not `Facts`-taking) on purpose: this is `assemble`'s one
+/// remaining positional caller, isolated to this one thin function so it
+/// can't drift into a second copy of the struct-literal pattern below.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     def: &CellDef,
     routes: &[(String, Export)],
-    never_tables: &HashSet<String>,
     provenance: Option<Provenance>,
     source_check: Option<SourceCheck>,
     freshness: Option<FreshnessBlock>,
     upstreams: Vec<ObservedUpstream>,
     docs_fingerprints: IndexMap<String, DocsFingerprint>,
-    with_query: bool,
+    source_descriptions: IndexMap<String, IndexMap<String, String>>,
     served_here: bool,
     direct_attach: bool,
+    is_all_never: bool,
 ) -> ContextDocument {
-    assemble(
-        def.cell.clone(),
-        declared(def, routes, with_query, never_tables),
+    assemble(Facts {
+        cell: def.cell.clone(),
+        declared: declared(def, routes),
         provenance,
         source_check,
         freshness,
         upstreams,
-        IndexMap::new(),
+        probes: IndexMap::new(),
         docs_fingerprints,
+        source_descriptions,
         served_here,
-        Vec::new(),
+        channels: Vec::new(),
         direct_attach,
-    )
+        is_all_never,
+    })
 }
 
 /// The admitted projection of a run summary (ADR 0012 §5) — built
@@ -784,13 +923,30 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `datamk context` (ADR 0012 §4): emit the document to stdout (`--out` to
-/// write a file). No server, no port, no token — commit it, host it
-/// statically, paste it into an agent's context. Loads the cell without a
-/// database (`config::load`); published-mode profiles additionally fetch
-/// `LATEST`'s run summary from the store (the same trust and credentials as
-/// `datamk status`). Pinless ⇒ draft, by definition — a direct-attach
-/// profile has no pin and emits a draft even after a local build.
+/// sha256 of the exact bytes on disk at `file` — the digest both
+/// `build_document` (`cell_yaml_digest` on the portable artifact) and
+/// `serve`'s startup load (issue #16, gating `.cell/source_check.json`
+/// freshness) stamp, so the two doors can never digest different bytes for
+/// the same path.
+pub fn cell_yaml_digest_of(file: &std::path::Path) -> Result<String> {
+    use anyhow::Context as _;
+    let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// The portable door's document, built but not yet serialized or written —
+/// split out of `emit` so a test (the two-doors regression, `serve::mod`'s
+/// `two_doors`) can construct the exact same `ContextDocument` the CLI emits
+/// and compare it against the hosted door's, in one process, without
+/// shelling out to the binary and parsing stdout. `emit` (below) is the only
+/// production caller; everything about *how* the document reaches the
+/// caller (stdout vs. `--out`, pretty-printing) stays there.
+///
+/// Loads the cell without a database (`config::load`); published-mode
+/// profiles additionally fetch `LATEST`'s run summary from the store (the
+/// same trust and credentials as `datamk status`). Pinless ⇒ draft, by
+/// definition — a direct-attach profile has no pin and emits a draft even
+/// after a local build.
 ///
 /// `no_docs` (ADR 0013) is the one asymmetry with the served door: a request
 /// can be repeated, a file cannot — so a portable artifact **inlines docs by
@@ -798,27 +954,23 @@ fn hex(bytes: &[u8]) -> String {
 /// only (mirroring `serve --no-data`'s withholding idiom). `included` is
 /// truthful in both cases, so a consumer never needs to know which door
 /// produced the file.
-pub fn emit(
+pub fn build_document(
     file: &std::path::Path,
     profile: &str,
-    out: Option<&std::path::Path>,
     no_docs: bool,
-) -> Result<()> {
-    use anyhow::Context as _;
-
+) -> Result<ContextDocument> {
     let loaded = crate::config::load(file, profile)?;
     let routes = discoverable_routes(&loaded.def)?;
-    let never_tables = crate::config::never_backed_tables(&loaded.transforms);
-    let direct_attach = loaded.bindings.catalog.is_some();
+    let direct_attach = crate::config::direct_attach(&loaded.bindings);
+    let is_all_never = crate::config::builds_no_snapshot(&loaded.transforms);
     let refs = cell_source_refs(&loaded.def);
 
     // Computed once, up front: it stamps every emitted document
     // (`cell_yaml_digest`) and is the staleness key for the live-verify
     // source-check record below (issue #6) — both need the exact same bytes,
-    // read once.
-    let cell_yaml_bytes =
-        std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-    let cell_yaml_digest = sha256_hex(&cell_yaml_bytes);
+    // read once. `cell_yaml_digest_of` is the same call `serve` (issue #16)
+    // makes at startup, so the two doors can never digest different bytes.
+    let cell_yaml_digest = cell_yaml_digest_of(file)?;
 
     let (provenance, upstreams) = if direct_attach {
         (None, Vec::new())
@@ -847,21 +999,16 @@ pub fn emit(
     // processes (CI: verify against the live warehouse, then emit the
     // document) — the record left under `.cell/source_check.json` is the
     // only thing that carries a passed live check across that boundary.
-    // Embedded only when its digest still matches this `cell.yaml`; a
-    // config edit since the check ran makes the record stale, and a stale
-    // record is silently omitted, never emitted as if it still applied.
-    let source_check = crate::manifest::SourceCheckRecord::load(&loaded.dir).and_then(|r| {
-        if r.cell_yaml_digest == cell_yaml_digest {
-            Some(SourceCheck::from(&r))
-        } else {
-            tracing::info!(
-                "found .cell/source_check.json but its digest no longer matches cell.yaml — \
-                 the config changed since the last `datamk verify`; omitting observed.source_check \
-                 (re-run `datamk verify` for a current one)"
-            );
-            None
-        }
-    });
+    // Embedded only when its digest still matches this `cell.yaml` AND it
+    // was written under this same `profile` (issue #16) — either mismatch
+    // means the record does not attest what's being read right now, and is
+    // silently omitted, never emitted as if it still applied. `fresh_for`
+    // is the one place this match happens (`serve`'s startup load, issue
+    // #16, calls the same function).
+    let source_check =
+        crate::manifest::SourceCheckRecord::fresh_for(&loaded.dir, &cell_yaml_digest, profile)
+            .as_ref()
+            .map(SourceCheck::from);
 
     // Docs fingerprints (ADR 0013 §5): a release-time fact, read from
     // `published.json` when one exists — never recomputed here (computing at
@@ -872,18 +1019,30 @@ pub fn emit(
             .map(|p| p.docs.into_iter().collect())
             .unwrap_or_default();
 
+    // Issue #6/#10: same fresh_for gate as source_check above, same reason —
+    // `datamk verify`'s live bind pass is the only thing that ever observes
+    // upstream descriptions, and it runs as a separate process.
+    let source_descriptions: IndexMap<String, IndexMap<String, String>> =
+        crate::manifest::SourceDescriptionsRecord::fresh_for(
+            &loaded.dir,
+            &cell_yaml_digest,
+            profile,
+        )
+        .map(|r| r.sources.into_iter().collect())
+        .unwrap_or_default();
+
     let mut doc = build(
         &loaded.def,
         &routes,
-        &never_tables,
         provenance,
         source_check,
         /* freshness */ None, // poll telemetry is a lie the instant the file is written
         upstreams,
         docs_fingerprints,
-        /* with_query */ true,
+        source_descriptions,
         /* served_here */ false, // a file serves no rows
         direct_attach,
+        is_all_never,
     );
     doc.data.channels = loaded.bindings.channels.clone();
 
@@ -911,6 +1070,23 @@ pub fn emit(
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
     doc.cell_yaml_digest = Some(cell_yaml_digest);
 
+    Ok(doc)
+}
+
+/// `datamk context` (ADR 0012 §4): emit the document to stdout (`--out` to
+/// write a file). No server, no port, no token — commit it, host it
+/// statically, paste it into an agent's context. A thin wrapper over
+/// `build_document`: everything about the document's *content* lives there;
+/// this function only decides where the serialized bytes go.
+pub fn emit(
+    file: &std::path::Path,
+    profile: &str,
+    out: Option<&std::path::Path>,
+    no_docs: bool,
+) -> Result<()> {
+    use anyhow::Context as _;
+
+    let doc = build_document(file, profile, no_docs)?;
     let json = serde_json::to_string_pretty(&doc)?;
     match out {
         Some(path) => {
@@ -967,7 +1143,6 @@ interface:
         build(
             &def,
             &routes,
-            &HashSet::new(),
             Some(Provenance {
                 execution: 47,
                 snapshot_id: Some(12),
@@ -985,9 +1160,10 @@ interface:
             }),
             /* upstreams */ Vec::new(),
             IndexMap::new(),
-            /* with_query */ true,
+            IndexMap::new(), // source_descriptions
             /* served_here */ true,
             /* direct_attach */ false,
+            false,
         )
     }
 
@@ -1088,14 +1264,14 @@ interface:
         let doc = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
@@ -1119,18 +1295,116 @@ interface:
         let doc = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
             true,
-            true,
+            false,
         );
         assert_eq!(doc.status, Status::Draft);
         assert_eq!(doc.notes, vec![NOTE_DIRECT_ATTACH.to_string()]);
+    }
+
+    /// issue #16/#3: a storage-backed cell with no materializing transforms
+    /// is neither direct-attach nor ever going to publish — it must get its own
+    /// note, not `NOTE_DIRECT_ATTACH` (which would tell the reader to
+    /// "publish with a storage-backed profile", the one thing `run`/
+    /// `release` refuse for this cell class).
+    #[test]
+    fn virtual_cell_document_is_draft_with_its_own_note_not_direct_attach() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(), // source_descriptions
+            true,
+            /* direct_attach */ false,
+            /* is_all_never */ true,
+        );
+        assert_eq!(doc.status, Status::Draft);
+        assert_eq!(doc.notes, vec![NOTE_VIRTUAL_CELL.to_string()]);
+    }
+
+    /// M1: the untested combination — `direct_attach: true` AND
+    /// `is_all_never: true` (a local-dev all-bound cell: every one of this
+    /// file's own fixtures reaches this exact combo, since `catalog:` in
+    /// `profiles/local.yaml` is precisely what makes a profile
+    /// direct-attach). `NOTE_DIRECT_ATTACH` would route the reader to
+    /// "publish with a storage-backed profile," which `run` refuses for
+    /// this cell class regardless of profile — `NOTE_VIRTUAL_CELL` must win
+    /// even though `direct_attach` is also true.
+    #[test]
+    fn virtual_cell_note_wins_over_direct_attach_when_both_are_true() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(), // source_descriptions
+            true,
+            /* direct_attach */ true,
+            /* is_all_never */ true,
+        );
+        assert_eq!(doc.status, Status::Draft);
+        assert_eq!(
+            doc.notes,
+            vec![NOTE_VIRTUAL_CELL.to_string()],
+            "an all-bound cell must never be told to publish with a storage-backed \
+             profile, even when the profile that loaded it happens to be direct-attach"
+        );
+    }
+
+    /// issue #16/#3: `verify.rs`'s grain-uniqueness check only ever runs for
+    /// a column-declared grain (`!export.grain.is_empty()`) — a grainless
+    /// export gets no check at all, so `grain_verified` must not read `true`
+    /// for it just because *some* provenance exists elsewhere in the
+    /// document.
+    #[test]
+    fn grain_verified_is_false_when_a_discoverable_export_declares_no_grain() {
+        let mut def = sample_def();
+        def.interface[0].grain = Vec::new();
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            Some(Provenance {
+                execution: 47,
+                snapshot_id: Some(12),
+                verify_outcome: "passed".to_string(),
+                started_at: "2026-07-13T10:00:00Z".to_string(),
+                finished_at: "2026-07-13T10:00:05Z".to_string(),
+                datamk_version: "0.0.12".to_string(),
+                data_as_of: None,
+            }),
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(), // source_descriptions
+            true,
+            false,
+            false,
+        );
+        assert_eq!(doc.status, Status::Verified);
+        assert!(
+            !doc.grain_verified,
+            "a grainless discoverable export must not report grain_verified: true"
+        );
     }
 
     /// ADR 0012 §4: a `private` export appears nowhere, in any form, not
@@ -1195,14 +1469,14 @@ interface:
         let draft = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         assert_eq!(
@@ -1217,7 +1491,6 @@ interface:
         let verified_at_source = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             Some(SourceCheck {
                 outcome: "passed".to_string(),
@@ -1228,8 +1501,9 @@ interface:
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         assert_eq!(
@@ -1244,14 +1518,14 @@ interface:
         let changed = build(
             &def2,
             &routes2,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         assert_ne!(
@@ -1273,14 +1547,14 @@ interface:
         let base = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
 
@@ -1314,14 +1588,14 @@ interface:
         let with_fp = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             fp,
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         assert_eq!(
@@ -1337,14 +1611,14 @@ interface:
         let renamed = build(
             &def_renamed,
             &routes_renamed,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         assert_ne!(
@@ -1360,14 +1634,14 @@ interface:
         let removed = build(
             &def_removed,
             &routes_removed,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         assert_ne!(
@@ -1386,15 +1660,15 @@ interface:
         let mut doc = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
-            true,
+            IndexMap::new(), // source_descriptions
             false,
             true,
+            false,
         );
         doc.emitted_at = Some("2026-08-06T00:00:00Z".to_string());
         doc.cell_yaml_digest = Some("abc123".to_string());
@@ -1513,20 +1787,19 @@ interface:
         let draft = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         let with_upstreams = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
@@ -1536,8 +1809,9 @@ interface:
                 data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
             }],
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         assert_eq!(
@@ -1561,14 +1835,14 @@ interface:
         let draft = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
             Vec::new(),
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
 
@@ -1583,7 +1857,6 @@ interface:
         let mut loaded = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             Some(SourceCheck {
                 outcome: "passed".to_string(),
@@ -1598,8 +1871,9 @@ interface:
                 data_as_of: Some("2026-08-04 06:00:11+00".to_string()),
             }],
             fp,
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         // Inline docs content too, as `?include=docs` would.
@@ -1629,7 +1903,6 @@ interface:
         let doc = build(
             &def,
             &routes,
-            &HashSet::new(),
             None,
             None,
             None,
@@ -1639,8 +1912,9 @@ interface:
                 data_as_of: None,
             }],
             IndexMap::new(),
+            IndexMap::new(), // source_descriptions
             true,
-            true,
+            false,
             false,
         );
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
@@ -1673,7 +1947,7 @@ interface:
         def.interface[0].docs = Some("docs/orders_daily.md".to_string());
         def.interface[1].docs = Some("docs/internal.md".to_string()); // private export
         let routes = discoverable_routes(&def).unwrap();
-        let d = declared(&def, &routes, true, &HashSet::new());
+        let d = declared(&def, &routes);
 
         assert_eq!(d.include_request, "/context?include=docs");
         assert_eq!(d.docs.len(), 2, "{:?}", d.docs);
@@ -1692,7 +1966,7 @@ interface:
     fn declared_docs_is_empty_but_present_when_nothing_is_declared() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let d = declared(&def, &routes, true, &HashSet::new());
+        let d = declared(&def, &routes);
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["docs"], serde_json::json!([]));
         assert_eq!(v["include_request"], "/context?include=docs");
@@ -1777,7 +2051,7 @@ interface:
     /// for the same reason: this round trip is specifically about the two
     /// commands agreeing through a file on disk, which nothing in-memory
     /// can stand in for.
-    fn all_never_cell_dir(tag: &str) -> PathBuf {
+    fn all_bound_cell_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "datamk-context-source-check-{tag}-{}-{}",
             std::process::id(),
@@ -1791,18 +2065,15 @@ interface:
         std::fs::write(
             dir.join("cell.yaml"),
             "cell: virtual_only\n\
-             transforms:\n\
-             \x20 - sql: sql/virtual_pii.sql\n\
-             \x20   materialize: never\n\
              interface:\n\
              \x20 - name: virtual_pii\n\
              \x20   version: 1.0.0\n\
              \x20   grain: [id]\n\
+             \x20   bind: raw\n\
              sources:\n\
              \x20 raw: ./data.csv\n",
         )
         .unwrap();
-        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM raw").unwrap();
         std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
         std::fs::write(
             dir.join("profiles/local.yaml"),
@@ -1814,7 +2085,7 @@ interface:
 
     #[test]
     fn context_embeds_source_check_and_reports_verified_at_source_after_a_passing_live_verify() {
-        let dir = all_never_cell_dir("fresh");
+        let dir = all_bound_cell_dir("fresh");
         let file = dir.join("cell.yaml");
         crate::verify::run(&file, "local").expect("live-verify the all-never cell");
         assert!(
@@ -1854,7 +2125,7 @@ interface:
         // `cell.yaml` edit between the two must silently invalidate the
         // record rather than let a check of the *previous* contract ride
         // along as if it still applied.
-        let dir = all_never_cell_dir("stale");
+        let dir = all_bound_cell_dir("stale");
         let file = dir.join("cell.yaml");
         crate::verify::run(&file, "local").expect("live-verify the all-never cell");
         assert!(dir.join(".cell/source_check.json").is_file());

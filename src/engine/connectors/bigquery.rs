@@ -114,15 +114,23 @@ fn classify_one_dataset(
     }
     let in_list = in_list_parts.join(", ");
 
-    // One UNION ALL job carries both TABLES (kind) and COLUMNS (BQ-native
-    // type, needed later for cursor-literal rendering) with a discriminator
-    // column, rather than two separate jobs.
+    // One UNION ALL job carries TABLES (kind), COLUMNS (BQ-native type,
+    // needed later for cursor-literal rendering), and COLUMN_FIELD_PATHS
+    // (issue #6/#10: upstream column descriptions) with a discriminator
+    // column, rather than three separate jobs. `field_path = column_name`
+    // keeps only top-level columns — a STRUCT's nested leaves (`col.sub`)
+    // have their own rows in COLUMN_FIELD_PATHS and must not surface as if
+    // they were columns of the table.
     let google = format!(
         "SELECT 'T' AS k, table_name AS n, table_type AS v1, CAST(NULL AS STRING) AS v2 \
          FROM `{proj_ident}.{ds_ident}`.INFORMATION_SCHEMA.TABLES WHERE table_name IN ({in_list}) \
          UNION ALL \
          SELECT 'C', table_name, column_name, data_type \
-         FROM `{proj_ident}.{ds_ident}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name IN ({in_list})"
+         FROM `{proj_ident}.{ds_ident}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name IN ({in_list}) \
+         UNION ALL \
+         SELECT 'D', table_name, column_name, description \
+         FROM `{proj_ident}.{ds_ident}`.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS \
+         WHERE table_name IN ({in_list}) AND field_path = column_name"
     );
     let billing = billing_project.unwrap_or(project);
     let sql = format!(
@@ -148,6 +156,7 @@ fn classify_one_dataset(
 
     let mut table_types: IndexMap<String, String> = IndexMap::new();
     let mut columns: IndexMap<String, IndexMap<String, String>> = IndexMap::new();
+    let mut descriptions: IndexMap<String, IndexMap<String, String>> = IndexMap::new();
     for row in rows {
         let (k, n, v1, v2) = row.context("reading BigQuery metadata classification row")?;
         match k.as_str() {
@@ -159,6 +168,16 @@ fn classify_one_dataset(
             "C" => {
                 if let (Some(col), Some(ty)) = (v1, v2) {
                     columns.entry(n).or_default().insert(col, ty);
+                }
+            }
+            "D" => {
+                // `description` is frequently NULL (most columns are never
+                // documented upstream) — only a non-empty description is
+                // worth carrying, never a NULL/empty placeholder.
+                if let (Some(col), Some(desc)) = (v1, v2) {
+                    if !desc.trim().is_empty() {
+                        descriptions.entry(n).or_default().insert(col, desc);
+                    }
                 }
             }
             _ => {}
@@ -181,11 +200,13 @@ fn classify_one_dataset(
         let kind =
             classify_table_type(table_type).with_context(|| format!("table '{dataset}.{tbl}'"))?;
         let cols = columns.get(*tbl).cloned().unwrap_or_default();
+        let descs = descriptions.get(*tbl).cloned().unwrap_or_default();
         out.insert(
             (*whole).to_string(),
             ObjectMeta {
                 kind,
                 columns: cols,
+                descriptions: descs,
             },
         );
     }
@@ -204,6 +225,38 @@ fn classify_table_type(table_type: &str) -> Result<ObjectKind> {
              BASE TABLE, CLONE, SNAPSHOT (read via the Storage API), VIEW, MATERIALIZED VIEW, \
              EXTERNAL (read via the jobs API)"
         ),
+    }
+}
+
+/// Verify's type authority for a bound export whose source classified
+/// against BigQuery's own `INFORMATION_SCHEMA.COLUMNS.data_type` (issue
+/// #6/#9) — checked against the warehouse's own declared type, never
+/// DuckDB's rendering of it. This is the one case that motivated the
+/// commit: a BigQuery `NUMERIC`/`BIGNUMERIC` column outside DuckDB's
+/// `DECIMAL(38,·)` range degrades silently to DuckDB `VARCHAR` once
+/// attached — under the old DESCRIBE-based check a declared `decimal` would
+/// fail against that degraded `VARCHAR`; here it's compared against the
+/// true native type and passes, correctly, regardless of DuckDB's rendering
+/// limit.
+///
+/// Deliberately narrower than `verify::type_compatible` (the DuckDB-facing
+/// sibling this never modifies): BigQuery has exactly one integer type
+/// (`INT64`, standard SQL has no 32-bit int), so both `int`/`integer` and
+/// `bigint`/`long` accept it — there is no narrower native type to demand.
+/// `timestamp` accepts both `TIMESTAMP` (UTC-aware) and `DATETIME`
+/// (naive) — either is reasonably "a point in time" to an author, and
+/// datamk's declared vocabulary has no naive/aware distinction to enforce.
+pub(super) fn type_compatible(declared: &str, native: &str) -> bool {
+    let n = native.to_uppercase();
+    match declared.to_lowercase().as_str() {
+        "string" | "varchar" | "text" => n == "STRING",
+        "int" | "integer" | "bigint" | "long" => n == "INT64",
+        "decimal" | "numeric" => n == "NUMERIC" || n == "BIGNUMERIC",
+        "double" | "float" => n == "FLOAT64",
+        "bool" | "boolean" => n == "BOOL",
+        "date" => n == "DATE",
+        "timestamp" => n == "TIMESTAMP" || n == "DATETIME",
+        other => n.to_lowercase() == other,
     }
 }
 
@@ -609,6 +662,7 @@ mod tests {
         ObjectMeta {
             kind: ObjectKind::Table,
             columns: IndexMap::new(),
+            descriptions: IndexMap::new(),
         }
     }
 
@@ -619,6 +673,7 @@ mod tests {
                 .iter()
                 .map(|(c, t)| (c.to_string(), t.to_string()))
                 .collect(),
+            descriptions: IndexMap::new(),
         }
     }
 
@@ -1135,6 +1190,85 @@ mod tests {
         assert!(err.contains("FOREIGN"), "{err}");
         assert!(err.contains("BASE TABLE"), "{err}");
         assert!(err.contains("VIEW"), "{err}");
+    }
+
+    // --- issue #6/#9: verify's type authority for a bound export -----------
+    //
+    // Pure, no credentials needed: `type_compatible` only ever sees strings
+    // (the declared type, and BigQuery's own `INFORMATION_SCHEMA.COLUMNS
+    // .data_type`) — no warehouse round trip, no DuckDB attach.
+
+    #[test]
+    fn type_compatible_matches_the_declared_vocabulary_to_bigquery_native_types() {
+        assert!(type_compatible("string", "STRING"));
+        assert!(type_compatible("varchar", "STRING"));
+        assert!(type_compatible("bool", "BOOL"));
+        assert!(type_compatible("boolean", "BOOL"));
+        assert!(type_compatible("date", "DATE"));
+        assert!(!type_compatible("string", "INT64"));
+    }
+
+    /// BigQuery has exactly one integer type (`INT64` — standard SQL has no
+    /// 32-bit int); both `integer` and `bigint` accept it, since there is no
+    /// narrower native type an author could declare instead.
+    #[test]
+    fn type_compatible_accepts_either_integer_or_bigint_for_int64() {
+        assert!(type_compatible("integer", "INT64"));
+        assert!(type_compatible("int", "INT64"));
+        assert!(type_compatible("bigint", "INT64"));
+        assert!(type_compatible("long", "INT64"));
+    }
+
+    /// `timestamp` accepts BigQuery `TIMESTAMP` (UTC-aware) and `DATETIME`
+    /// (naive) alike — datamk's declared vocabulary draws no aware/naive
+    /// distinction to enforce here.
+    #[test]
+    fn type_compatible_accepts_timestamp_or_datetime_for_timestamp() {
+        assert!(type_compatible("timestamp", "TIMESTAMP"));
+        assert!(type_compatible("timestamp", "DATETIME"));
+        assert!(!type_compatible("timestamp", "DATE"));
+    }
+
+    /// The commit's motivating case: a BigQuery `NUMERIC`/`BIGNUMERIC`
+    /// column whose values exceed DuckDB's `DECIMAL(38,·)` range degrades
+    /// silently to DuckDB `VARCHAR` once attached — the old DESCRIBE-based
+    /// check would fail a declared `decimal` against that degraded
+    /// `VARCHAR`. Checked here against BigQuery's own native type instead,
+    /// which is `NUMERIC`/`BIGNUMERIC` regardless of DuckDB's rendering
+    /// limit — this is the whole point, verified without needing a live
+    /// BigQuery connection to actually produce a wide value: the native
+    /// type string is the only input this function ever sees, exactly what
+    /// `SourceWarehouseColumns` carries after classification, whether or
+    /// not any row's value happens to be wide enough to trip the DuckDB
+    /// degradation. A round-trip test against a real wide NUMERIC value
+    /// would need live BigQuery credentials this test suite doesn't have —
+    /// named here rather than silently implied as covered.
+    #[test]
+    fn type_compatible_accepts_decimal_for_numeric_and_bignumeric_regardless_of_width() {
+        assert!(type_compatible("decimal", "NUMERIC"));
+        assert!(type_compatible("decimal", "BIGNUMERIC"));
+        assert!(type_compatible("numeric", "NUMERIC"));
+        // What the old DuckDB-DESCRIBE-based check would have seen for a
+        // wide NUMERIC/BIGNUMERIC value: DuckDB's own degraded rendering.
+        // The native-type authority never sees this string at all — BigQuery
+        // reports its own type regardless of how DuckDB would render any
+        // particular value once attached.
+        assert!(!type_compatible("decimal", "VARCHAR"));
+    }
+
+    #[test]
+    fn type_compatible_is_case_insensitive_on_the_native_type() {
+        assert!(type_compatible("string", "string"));
+        assert!(type_compatible("decimal", "numeric"));
+    }
+
+    #[test]
+    fn type_compatible_falls_back_to_literal_match_for_an_unmapped_declared_type() {
+        // Mirrors `verify::type_compatible`'s own fallback arm for a
+        // declared type outside the mapped vocabulary (e.g. an exotic
+        // BigQuery type like BYTES/JSON/GEOGRAPHY with no datamk alias).
+        assert!(type_compatible("bytes", "BYTES"));
+        assert!(!type_compatible("bytes", "STRING"));
     }
 
     #[test]

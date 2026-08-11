@@ -1,8 +1,7 @@
 use anyhow::{bail, Result};
 
 use crate::config::{
-    is_remote, CellDef, ResolvedBindings, ResolvedConnection, ResolvedSource, ResolvedTransform,
-    SnowflakeAuth,
+    is_remote, CellDef, ResolvedBindings, ResolvedConnection, ResolvedSource, SnowflakeAuth,
 };
 use crate::deploy::target::Workloads;
 
@@ -11,10 +10,17 @@ use crate::deploy::target::Workloads;
 pub struct PreflightInput<'a> {
     pub def: &'a CellDef,
     pub bindings: &'a ResolvedBindings,
-    pub transforms: &'a [ResolvedTransform],
     pub supports: Workloads,
     pub allow_anonymous: bool,
     pub profile: &'a str,
+    /// `config::builds_no_snapshot(&transforms)` — see `DeployContext::
+    /// all_bound`'s doc comment for why this is threaded in from
+    /// `deploy::run` rather than derived here: resolved transforms
+    /// themselves have no other reader on this path (every check that used
+    /// to read `transforms` directly now reads this instead), so carrying
+    /// the slice just to compute one bool at the one call site would be
+    /// dead weight.
+    pub all_bound: bool,
 }
 
 /// Validate the deploy invariants every backend shares (§7/§8) and refuse with an
@@ -32,18 +38,31 @@ pub fn check(i: &PreflightInput) -> Result<()> {
     Ok(())
 }
 
-/// Issue #6 (virtual cells foundation): a cell whose every transform is
-/// `materialize: never` commits no snapshot at all — `run` already refuses
-/// it, before BEGIN (see `engine::run`). Unconditional, alongside
-/// `check_no_catalog`, not gated on `supports.long_lived()`: a Builder-only
-/// (CronJob) target for this cell would crash-loop on every scheduled `run`
-/// just the same as a Server would 404 every route.
+/// Issue #6/#11: a cell with no materializing transforms (every export
+/// bound, under the binding model, or none declared) commits no snapshot at
+/// all — `run` already refuses it, before BEGIN (see `engine::run`). That
+/// alone still refuses a **Builder** for this cell: a Scheduled-only target
+/// would crash-loop on every scheduled `run`. It no longer refuses a
+/// **Server** — the founder decided `/context` is a real payload for an
+/// all-bound cell (declared columns/grain/prose, live-verified against the
+/// bound source — `datamk verify` writes `.cell/source_check.json` for
+/// exactly this), so a target that can host the long-lived workload
+/// (`supports.long_lived()`) is deployable here regardless.
+///
+/// A target reporting `Workloads::Both` (Kubernetes) still needs its own,
+/// target-specific refusal of `schedule:` set together with an all-bound
+/// cell — this agnostic check has no visibility into a target's own
+/// topology config (`schedule:` lives in `deploy/<profile>.yaml`'s
+/// target-specific block, e.g. `KubernetesConfig`) to refuse that
+/// combination itself. See `targets::kubernetes::preflight::
+/// check_no_schedule_for_an_all_bound_cell`.
 fn check_no_all_never(i: &PreflightInput) -> Result<()> {
-    if crate::config::is_all_never(i.transforms) {
+    if i.all_bound && !i.supports.long_lived() {
         bail!(
-            "cell '{c}' has no materialized exports (every transform is `materialize: never`) \
-             — there are no rows to serve, so a deployed Server would 404 every route. Publish \
-             the context document from CI instead:\n  \
+            "cell '{c}' has no materialized exports (no materializing transforms) and this \
+             target cannot host the long-lived Server (`datamk serve`) — there is nothing this \
+             target could ever run for this cell: no rows to build on a schedule, and no \
+             `/context` to serve either. Publish the context document from CI instead:\n  \
              datamk verify  -f cell.yaml -p {p}\n  \
              datamk context -f cell.yaml -p {p} --out context.json",
             c = i.def.cell,
@@ -155,9 +174,25 @@ fn check_auth(i: &PreflightInput) -> Result<()> {
     } else if !i.allow_anonymous {
         // shareable is guaranteed true here (check_servable ran first): an open,
         // unauthenticated endpoint. Require an explicit opt-in.
+        //
+        // Issue #6/#11: for an all-bound cell, "open endpoint" is not a
+        // lesser risk than a materializing one just because no rows are
+        // served — `/context` IS the payload here: every declared column
+        // name, grain, and description (which can itself name upstream
+        // fields, e.g. a customer's `email` column) is exactly what an
+        // anonymous caller gets. Named explicitly so the decision is made
+        // with that in view, not skipped as "there's no data anyway."
+        let virtual_cell_clause = if i.all_bound {
+            " This cell has no materializing transforms — every export is bound rather than \
+             served from a snapshot — but that makes it *more* worth this decision, not less: \
+             `/context` (declared columns, grain, and descriptions, which can themselves name \
+             upstream fields) is the entire payload an anonymous caller would get."
+        } else {
+            ""
+        };
         bail!(
             "cell '{c}' is shareable with empty `access.roles`: this deploys an open, \
-             unauthenticated endpoint.\n\
+             unauthenticated endpoint.{virtual_cell_clause}\n\
              If that's intended, set `allow_anonymous: true` in deploy/{p}.yaml; otherwise add \
              `access.roles:` to cell.yaml.",
             c = i.def.cell,
@@ -176,17 +211,35 @@ mod tests {
     fn input<'a>(
         def: &'a CellDef,
         bindings: &'a ResolvedBindings,
-        transforms: &'a [ResolvedTransform],
+        transforms: &[crate::config::ResolvedTransform],
         profile: &'a str,
         allow_anonymous: bool,
+    ) -> PreflightInput<'a> {
+        input_for(
+            def,
+            bindings,
+            transforms,
+            profile,
+            allow_anonymous,
+            Workloads::Both,
+        )
+    }
+
+    fn input_for<'a>(
+        def: &'a CellDef,
+        bindings: &'a ResolvedBindings,
+        transforms: &[crate::config::ResolvedTransform],
+        profile: &'a str,
+        allow_anonymous: bool,
+        supports: Workloads,
     ) -> PreflightInput<'a> {
         PreflightInput {
             def,
             bindings,
-            transforms,
-            supports: Workloads::Both,
+            supports,
             allow_anonymous,
             profile,
+            all_bound: crate::config::builds_no_snapshot(transforms),
         }
     }
 
@@ -213,25 +266,60 @@ mod tests {
         check(&input(&l.def, &l.bindings, &l.transforms, "prod", true)).unwrap();
     }
 
-    // issue #6: alongside `check_no_catalog`, unconditional — a deployed
-    // Server would 404 every route, and a deployed Builder would crash-loop
-    // on every scheduled `run` (which already refuses an all-never cell).
+    // issue #6/#11: a target that CANNOT host the long-lived Server at all
+    // (Scheduled-only, e.g. a future Airflow/Dagster target) still refuses
+    // an all-bound cell outright — there is nothing that target could ever
+    // run for it: no rows to build on a schedule, and no `/context` to
+    // serve either.
     #[test]
-    fn all_never_cell_is_refused_naming_verify_and_context() {
+    fn all_bound_cell_is_refused_for_a_scheduled_only_target() {
         let l = loaded("prod");
-        let def: CellDef = serde_yaml::from_str(
-            "cell: t\ntransforms:\n  - sql: sql/virtual.sql\n    materialize: never\n",
-        )
-        .unwrap();
-        let never_transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
-        let err = check(&input(&l.def, &l.bindings, &never_transforms, "prod", true))
-            .unwrap_err()
-            .to_string();
+        let def: CellDef = serde_yaml::from_str("cell: t\ninterface: []\n").unwrap();
+        let no_transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
+        let err = check(&input_for(
+            &l.def,
+            &l.bindings,
+            &no_transforms,
+            "prod",
+            true,
+            Workloads::Scheduled,
+        ))
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("has no materialized exports"), "got: {err}");
-        assert!(err.contains("materialize: never"), "got: {err}");
-        assert!(err.contains("would 404 every route"), "got: {err}");
+        assert!(err.contains("no materializing transforms"), "got: {err}");
+        assert!(
+            err.contains("cannot host the long-lived Server"),
+            "got: {err}"
+        );
         assert!(err.contains("datamk verify"), "got: {err}");
         assert!(err.contains("datamk context"), "got: {err}");
+    }
+
+    // issue #6/#11 (the deploy relax): a target that CAN host the Server
+    // (Kubernetes reports `Workloads::Both`) is deployable for an all-bound
+    // cell — `check_no_all_never` no longer refuses it, and the rest of the
+    // agnostic pre-flight (servable, auth) passes for a genuinely servable
+    // all-bound cell.
+    #[test]
+    fn all_bound_cell_passes_for_a_target_that_can_host_the_server() {
+        let l = loaded("prod");
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             interface:\n\
+             \x20 - name: e\n\
+             \x20   version: 1.0.0\n\
+             \x20   bind: raw\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             sources:\n\
+             \x20 raw: ./raw.csv\n\
+             access:\n\
+             \x20 shareable: true\n",
+        )
+        .unwrap();
+        let no_transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
+        check(&input(&def, &l.bindings, &no_transforms, "prod", true)).unwrap();
     }
 
     #[test]
@@ -296,5 +384,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("open, unauthenticated endpoint"), "got: {err}");
+        // orders materializes normally — not the all-bound clause.
+        assert!(
+            !err.contains("entire payload"),
+            "a materializing cell must not get the all-bound wording: got: {err}"
+        );
+    }
+
+    /// Issue #6/#11: the same open-endpoint refusal, but naming the
+    /// document-is-the-payload point for an all-bound cell — `/context`
+    /// (declared columns/grain/descriptions) is exactly what an anonymous
+    /// caller gets, even though no rows are ever served.
+    #[test]
+    fn open_endpoint_refused_names_the_document_as_payload_for_an_all_bound_cell() {
+        let l = loaded("prod");
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             interface:\n\
+             \x20 - name: e\n\
+             \x20   version: 1.0.0\n\
+             \x20   bind: raw\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             sources:\n\
+             \x20 raw: ./raw.csv\n\
+             access:\n\
+             \x20 shareable: true\n",
+        )
+        .unwrap();
+        let no_transforms = crate::config::resolve_transforms(&def.transforms).unwrap();
+        let err = check(&input(&def, &l.bindings, &no_transforms, "prod", false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("open, unauthenticated endpoint"), "got: {err}");
+        assert!(
+            err.contains("entire payload"),
+            "an all-bound cell's open-endpoint refusal must name /context as the payload: \
+             got: {err}"
+        );
+        assert!(err.contains("allow_anonymous"), "got: {err}");
     }
 }

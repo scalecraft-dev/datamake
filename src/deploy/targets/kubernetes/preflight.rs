@@ -70,6 +70,43 @@ pub(crate) async fn check(
 // under ADR 0004 every replica holds its own private local catalog copy, so
 // replica count no longer constrains the catalog at all.
 
+/// Issue #6/#11: the agnostic pre-flight's `check_no_all_never` relax
+/// (`src/deploy/preflight.rs`) stops refusing an all-bound cell outright —
+/// deploying just the Server is now legitimate. But Kubernetes always
+/// reports `Workloads::Both`, so that relax alone would silently let
+/// `schedule:` through for an all-bound cell too: a CronJob invoking
+/// `datamk run` on a cell with no materializing transforms, which `run`
+/// itself already refuses before BEGIN (`engine::run`) — a crash-loop every
+/// scheduled tick, not a build failure caught once at deploy time. This is
+/// the target-specific half the agnostic layer can't do itself (it has no
+/// visibility into `KubernetesConfig.schedule`, which lives in this
+/// target's own topology config).
+///
+/// A pure check (no cluster needed) called directly from `deploy_impl`,
+/// before the `--dry-run` branch — not from the async `check` above, which
+/// only ever runs on a real apply. `--dry-run` never touches a cluster, but
+/// it still renders a CronJob manifest whenever `k8s.schedule` is set
+/// (`render_cronjob` reads it directly, independent of the reconciled
+/// `workloads` list) — refusing here means `--dry-run` catches this
+/// combination too, not just a real apply.
+pub(super) fn check_no_schedule_for_an_all_bound_cell(
+    cell: &str,
+    all_bound: bool,
+    k8s: &KubernetesConfig,
+) -> Result<()> {
+    if all_bound && k8s.schedule.is_some() {
+        bail!(
+            "cell '{cell}' has no materializing transforms (every export is bound) — \
+             `schedule:` would deploy a Builder with nothing to build. `datamk run` already \
+             refuses this cell before BEGIN, so the CronJob would crash-loop on every \
+             scheduled tick.\n\
+             Remove `schedule:` from this deploy overlay — an all-bound cell only needs the \
+             Server (`datamk serve`); there is no Builder to run."
+        );
+    }
+    Ok(())
+}
+
 /// When `access.roles` is set, the profile's `principals:` must equal the path
 /// the principals Secret is actually mounted at in-cluster (ADR 0002 §5) — the
 /// only place that Secret's data lands. Any other value means `serve` starts
@@ -165,6 +202,30 @@ mod tests {
 
     fn orders(profile: &str) -> crate::config::LoadedCell {
         crate::config::load(Path::new("test/integrations/orders/cell.yaml"), profile).unwrap()
+    }
+
+    #[test]
+    fn schedule_on_an_all_bound_cell_is_refused() {
+        let k8s: KubernetesConfig = serde_yaml::from_str("schedule: \"0 * * * *\"").unwrap();
+        let err = check_no_schedule_for_an_all_bound_cell("t", true, &k8s)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cell 't'"), "got: {err}");
+        assert!(err.contains("no materializing transforms"), "got: {err}");
+        assert!(err.contains("crash-loop"), "got: {err}");
+        assert!(err.contains("Remove `schedule:`"), "got: {err}");
+    }
+
+    #[test]
+    fn schedule_on_a_materializing_cell_passes() {
+        let k8s: KubernetesConfig = serde_yaml::from_str("schedule: \"0 * * * *\"").unwrap();
+        check_no_schedule_for_an_all_bound_cell("t", false, &k8s).unwrap();
+    }
+
+    #[test]
+    fn an_all_bound_cell_with_no_schedule_passes() {
+        let k8s = KubernetesConfig::default();
+        check_no_schedule_for_an_all_bound_cell("t", true, &k8s).unwrap();
     }
 
     #[test]

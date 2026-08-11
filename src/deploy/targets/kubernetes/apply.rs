@@ -42,6 +42,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// `skip_init: true` (the operator drives the Builder themselves) skips
 /// applying/waiting on the Job entirely — the Job is still rendered (so
 /// `--dry-run` always shows it), just not applied here.
+///
+/// `m.init_job: None` (issue #6/#11, an all-bound cell) skips it
+/// unconditionally, `skip_init` or not — there is nothing to build, so
+/// nothing was rendered to apply. Distinct from `skip_init`, which the
+/// operator chooses; this is a fact about the cell.
 pub(crate) async fn apply_all(
     client: &kube::Client,
     namespace: &str,
@@ -52,14 +57,20 @@ pub(crate) async fn apply_all(
     let mut applied = Vec::with_capacity(5);
 
     applied.push(apply_one(client, namespace, "ConfigMap", &m.configmap).await?);
-    if skip_init {
-        eprintln!("  init       skipped (--skip-init)");
-    } else {
-        applied.push(
-            apply_and_wait_init(client, namespace, &m.init_job, init_timeout_secs)
-                .await
-                .context("running the init build (datamk run) before applying the Server")?,
-        );
+    match &m.init_job {
+        None => {
+            eprintln!("  init       not needed (no materializing transforms — nothing to build)");
+        }
+        Some(_) if skip_init => {
+            eprintln!("  init       skipped (--skip-init)");
+        }
+        Some(job) => {
+            applied.push(
+                apply_and_wait_init(client, namespace, job, init_timeout_secs)
+                    .await
+                    .context("running the init build (datamk run) before applying the Server")?,
+            );
+        }
     }
     applied.push(apply_one(client, namespace, "Service", &m.service).await?);
     applied.push(apply_one(client, namespace, "Deployment", &m.deployment).await?);

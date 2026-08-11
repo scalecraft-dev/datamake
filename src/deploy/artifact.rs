@@ -42,10 +42,23 @@ pub struct CellArtifact {
     /// the content so a deployed Server serves supported routes at their frozen
     /// snapshot rather than silently downgrading them to latest.
     pub published: Option<ArtifactFile>,
-    /// SHA-256 over (cell_yaml ++ sql ++ docs ++ published), each entry framed
-    /// by its `rel_path`. A stable content identity: re-releasing (a new pin)
-    /// or editing a docs page changes it, which a target uses to roll the
-    /// workload (ADR 0002, ADR 0013 §9).
+    /// `.cell/source_check.json` if a live-verify record exists (issue #16)
+    /// — same "travels with the content" reasoning as `published`, so a
+    /// deployed Server can read it at startup (`serve`'s `SourceCheckRecord
+    /// ::fresh_for`) instead of it being a build artifact the deploy never
+    /// carries. Folded into `content_hash` below: a fresh `datamk verify`
+    /// (a new `checked_at`) must roll the workload the same way a fresh
+    /// release does, since a new attestation is new served content.
+    pub source_check: Option<ArtifactFile>,
+    /// `.cell/source_descriptions.json` if a live-verify record exists
+    /// (issue #6/#10) — sibling of `source_check` immediately above, same
+    /// "travels with the content" reasoning, same fold into `content_hash`.
+    pub source_descriptions: Option<ArtifactFile>,
+    /// SHA-256 over (cell_yaml ++ sql ++ docs ++ published ++ source_check
+    /// ++ source_descriptions), each entry framed by its `rel_path`. A
+    /// stable content identity: re-releasing (a new pin), a new live-verify
+    /// record, or editing a docs page changes it, which a target uses to
+    /// roll the workload (ADR 0002, ADR 0013 §9, issue #16, issue #10).
     pub content_hash: String,
 }
 
@@ -84,14 +97,33 @@ impl CellArtifact {
         } else {
             None
         };
+        let source_check = if dir.join(".cell").join("source_check.json").exists() {
+            Some(read_artifact(dir, ".cell/source_check.json")?)
+        } else {
+            None
+        };
+        let source_descriptions = if dir.join(".cell").join("source_descriptions.json").exists() {
+            Some(read_artifact(dir, ".cell/source_descriptions.json")?)
+        } else {
+            None
+        };
 
-        let content_hash = content_hash(&cell_yaml, &sql, &docs, &published);
+        let content_hash = content_hash(
+            &cell_yaml,
+            &sql,
+            &docs,
+            &published,
+            &source_check,
+            &source_descriptions,
+        );
         Ok(CellArtifact {
             dir: dir.to_path_buf(),
             cell_yaml,
             sql,
             docs,
             published,
+            source_check,
+            source_descriptions,
             content_hash,
         })
     }
@@ -112,6 +144,8 @@ fn content_hash(
     sql: &[ArtifactFile],
     docs: &[ArtifactFile],
     published: &Option<ArtifactFile>,
+    source_check: &Option<ArtifactFile>,
+    source_descriptions: &Option<ArtifactFile>,
 ) -> String {
     let mut h = Sha256::new();
     feed(&mut h, cell_yaml);
@@ -122,6 +156,12 @@ fn content_hash(
         feed(&mut h, f);
     }
     if let Some(f) = published {
+        feed(&mut h, f);
+    }
+    if let Some(f) = source_check {
+        feed(&mut h, f);
+    }
+    if let Some(f) = source_descriptions {
         feed(&mut h, f);
     }
     let mut out = String::with_capacity(64);
@@ -168,12 +208,12 @@ mod tests {
             bytes: b"x".to_vec(),
         };
         assert_eq!(
-            content_hash(&a, &[], &[], &None),
-            content_hash(&a, &[], &[], &None)
+            content_hash(&a, &[], &[], &None, &None, &None),
+            content_hash(&a, &[], &[], &None, &None, &None)
         );
         assert_ne!(
-            content_hash(&a, &[], &[], &None),
-            content_hash(&b, &[], &[], &None)
+            content_hash(&a, &[], &[], &None, &None, &None),
+            content_hash(&b, &[], &[], &None, &None, &None)
         );
     }
 
@@ -220,6 +260,38 @@ mod tests {
         assert_ne!(
             art1.content_hash, art2.content_hash,
             "a docs-only prose edit must change content_hash"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #16: `collect` picks up `.cell/source_check.json` exactly like
+    /// `.cell/published.json` — present-when-it-exists, absent otherwise.
+    /// The consequence that actually matters (a target must roll on a fresh
+    /// live-verify) is covered end to end at the render layer
+    /// (`kubernetes::render`'s `configmap_carries_source_check_and_content_hash_moves_when_it_changes`);
+    /// this pins the collection half in isolation.
+    #[test]
+    fn collect_picks_up_source_check_when_present() {
+        let dir = tempdir("source-check");
+        let yaml = "cell: c\ninterface: []\n";
+        std::fs::write(dir.join("cell.yaml"), yaml).unwrap();
+        let def: CellDef = serde_yaml::from_str(yaml).unwrap();
+
+        let without = CellArtifact::collect(&dir, "cell.yaml", &def).unwrap();
+        assert!(without.source_check.is_none());
+
+        std::fs::create_dir_all(dir.join(".cell")).unwrap();
+        std::fs::write(
+            dir.join(".cell/source_check.json"),
+            r#"{"outcome":"passed","checked_at":"t","datamk_version":"v","cell_yaml_digest":"d","profile":"p"}"#,
+        )
+        .unwrap();
+        let with = CellArtifact::collect(&dir, "cell.yaml", &def).unwrap();
+        assert!(with.source_check.is_some());
+        assert_eq!(
+            with.source_check.unwrap().rel_path,
+            ".cell/source_check.json"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

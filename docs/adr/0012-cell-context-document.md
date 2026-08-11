@@ -101,20 +101,22 @@ hosted unverified prose wearing our route name.
   derived from whether data routes are mounted (honest by construction);
   `channels` (where rows actually live when not served here) is environment
   and binds in the profile, never in `cell.yaml`.
-- **A `query` block per export states the served affordances exactly**:
-  `filters` (the grain columns), `filter_semantics` ("exact equality only —
-  no ranges, no operators, no non-grain columns"), `limit` default/max,
-  `offset`. This is the line that stops an agent inventing
-  `?order_date__gte=`. It also carries **`sample_request`** — the smallest
-  legal call, e.g. `/flight_spend@1?limit=10`, a pure function of the route
-  key and the limit defaults, honest in every mode where the data routes
-  are mounted. The `query` block is the grammar; `sample_request` is one
-  grounded sentence in it, and agents copy sentences. The whole block is
-  omitted under `--no-data` — it describes HTTP affordances that do not
-  exist there. Its prose claims (`filter_semantics`, the limit caps)
-  restate what `build_query` enforces (`src/serve/mod.rs:18-19`,
-  `:361-386`); a fixture test binds the two so a change to either fails
-  loudly (§7).
+- **A `query` block per export states the query grammar exactly**: `filters`
+  (the grain columns), `filter_semantics` ("exact equality only — no ranges,
+  no operators, no non-grain columns"), `limit` default/max, `offset`. This
+  is the line that stops an agent inventing `?order_date__gte=`. It also
+  carries **`sample_request`** — the smallest legal call, e.g.
+  `/flight_spend@1?limit=10`, a pure function of the route key and the limit
+  defaults. The `query` block is the grammar; `sample_request` is one
+  grounded sentence in it, and agents copy sentences. Its prose claims
+  (`filter_semantics`, the limit caps) restate what `build_query` enforces
+  (`src/serve/mod.rs:18-19`, `:361-386`); a fixture test binds the two so a
+  change to either fails loudly (§7). **Unconditional** — present for every
+  export whose table is not `materialize: never` (that nulls it: no query
+  affordance exists for a virtual export, ever). *Not* gated on `--no-data`
+  (amended; see "Amendment" below) — it is interface grammar, not a claim
+  about whether this surface currently mounts the route, and `served_here`
+  already carries that claim honestly.
 - **`notes[]` is engine-emitted only.** No author-supplied strings land
   there, ever — author prose lives in `declared`, where it is labeled as a
   claim.
@@ -207,12 +209,14 @@ graveyard and the same treadmill shape ADR 0011 rejected for connectors.
   exists). The 404 body and the document's `data` block carry the same
   engine-emitted sentence: rows are not served by this endpoint by design;
   fetch via `data.channels` (`channels: []` stays empty when the profile
-  declares none — never fabricated). The document omits the `query` block
-  (§2) and the probe's `values` lists (§5): value lists are row-derived
-  data, and shipping them from a mode whose whole point is that rows stay
-  put would exfiltrate a projection of the withheld rows. `coverage`
-  (min/max dates, row count) stays — the aggregate that turns an empty
-  mesh answer into a diagnosable miss, and it names no entity.
+  declares none — never fabricated). The document omits the probe's
+  `values` lists (§5): value lists are row-derived data, and shipping them
+  from a mode whose whole point is that rows stay put would exfiltrate a
+  projection of the withheld rows. `coverage` (min/max dates, row count)
+  stays — the aggregate that turns an empty mesh answer into a diagnosable
+  miss, and it names no entity. The `query` block does **not** depend on
+  `--no-data` (amended; see "Amendment" below) — `data.served_here: false`
+  and the 404 already carry "not here."
 - **Auth: the same tier as the data, exactly `authorize()`.** The document is
   the map — grain, columns, prose, upstream refs. No lower "docs" tier, no
   pre-auth serving, no crawling. `access.shareable` keeps its single meaning
@@ -506,3 +510,147 @@ unbuilt cell refuses to start (cannot attach a nonexistent catalog
 read-only) and binds no listener. (a), (c), (d) are commitments about the
 live use case and the build, not locally testable — they stay open as the
 reversal conditions above.
+
+## Amendment (2026-08-10): the `query` block is unconditional
+
+§2 and §4 originally said the per-export `query` block is *"omitted under
+`--no-data` — it describes HTTP affordances that do not exist there,"* and
+§2 separately says the digest covers `declared`, `query` included,
+deliberately excluding `observed` so a data refresh never churns it. Held
+together those two statements contradict themselves the moment `query`
+tracks a *serving* fact (`--no-data`) rather than an *interface* fact:
+`interface_digest` moves when `--no-data` flips, even though nothing about
+the declared interface changed — the exact class of churn §2's digest
+scoping exists to prevent. Found during the same work that closed the
+`served_here`/`direct_attach` divergences between the two doors
+(`datamk context` vs. hosted `/context`); flagged by a design partner
+building against both.
+
+This reverses course: `query` is dropped from being conditional on
+`--no-data` and becomes unconditional interface grammar, present for every
+export that is not bound (`Export::bind`, see the binding-model amendment
+below — at the time this section was first written that export shape was
+spelled `materialize: never`; the mechanism this paragraph describes did not
+change, only the `cell.yaml` syntax naming it did). Two mechanisms already
+carry "not here": `data.served_here` (§2, now itself corrected to be honest
+under a second reason a route can be absent — every export bound directly to
+an existing object — not just the flag) and the unmounted-route 404 (§4,
+same engine-emitted sentence in both places). `served_here` is deliberately
+still part of `interface_digest` — a servability change is a genuine fact
+about this surface, the same reasoning that already put `channels` in
+`data` — so the digest is **not** claimed to be fully stable across
+`--no-data`; it still moves for that one, honest reason. What's fixed is
+narrower: `query` was a *second*, redundant mechanism saying the same "not
+here" a second way, and *that* movement — a data-format grammar field
+churning on a deploy flag with no interface change behind it — was the
+actual contradiction with §2's digest-scoping rule. It's gone; `served_here`
+alone now carries the "mounted here" fact into the digest.
+
+`query` still nulls for a bound export, unchanged — that omission is a
+genuine interface fact (this export has no query affordance, ever,
+regardless of any flag, since datamk owns its contract, not its rows), not a
+serving-mode artifact, and stays governed by whether the export is bound,
+never by `--no-data`.
+
+**Consequence, accepted openly:** a `--no-data` server's `interface_digest`,
+`ETag`, and `/openapi.json` `info.version` move on upgrade to this behavior
+(same bytes served, first request after the binary changes) — a one-time
+shift, not a recurring one. `--no-data` toggled at deploy time still moves
+the digest afterward too, same as before this amendment — only now via
+`served_here` alone, not `served_here` and `query` disagreeing about
+whether that was one fact or two.
+
+## Amendment (2026-08-10): `materialize: never` is retired; virtual cells become bindings
+
+Everywhere above (§2's `query` description, the previous amendment) an
+export with no materializing transform is described as `materialize:
+never`. That keyword no longer parses to a working cell — `datamk run`
+refuses it with a migration error naming the offending export and
+transform. The mechanism this document describes throughout —
+`query: null`, `data.served_here` false for that route, the unmounted-route
+404 with the engine-emitted "not served by this endpoint by design"
+sentence, `status: verified_at_source` when `datamk verify` live-checks it
+— is **unchanged in shape**. Only the `cell.yaml` syntax that produces it,
+and what a datamk process is willing to run for it, changed.
+
+**Why.** SQL that isn't materialized is fine only if something runs it: the
+Builder computes and stores it (an ordinary materializing transform), the
+warehouse hosts it as a view (a `Connection` source with `table:` pointed at
+one), or a datamk process executes it per request (not offered — datamk
+doesn't run ad hoc query jobs against a caller's request). `materialize:
+never` was none of those — it declared a transform, parsed a `SELECT`, and
+then guaranteed nothing would ever run it again after the one dry-run
+`datamk verify` performed at check time. Every semantic the document above
+attaches to that export (`status`, a live-checked interface) was a promise
+the mechanism itself didn't keep between checks.
+
+**The replacement.** `Export.bind: <source name>` names an existing
+`sources:` entry directly — no transform, no `SELECT`, nothing datamk
+computes or stores. Mirroring how `sources:` already splits contract from
+environment: *which* upstream object (the source's logical name) is
+contract, in `cell.yaml`; *where* it resolves (project/dataset/instance) is
+environment, in the profile's `connections:` map, exactly as it already was
+for a normal `sources:` entry. Bindable today: a raw file (`Source::Raw`) or
+a `Connection` source with `table:` set — not a `query:`-shaped connection
+(ad hoc SQL nobody runs, the same problem `materialize: never` had) and not
+another cell's table (`Source::Cell`; read it through a materializing
+transform instead). A cell whose every export is bound has no
+materializing transforms and therefore no snapshot to commit — `datamk run`
+refuses it outright (§2's "unbuilt cells assert their status positively"
+now has a permanent resident: a cell that will never be anything but
+`draft` or `verified_at_source`, never `verified`), and its document carries
+`NOTE_VIRTUAL_CELL` pointing at `datamk verify` as the one command that
+moves it off `draft`.
+
+**Downstream of this decision, landed in the same arc:**
+
+- **verify's type authority** (issue #9): a bound export's declared type is
+  checked against the connector's own native metadata (BigQuery's
+  `INFORMATION_SCHEMA.COLUMNS.data_type`) when one exists, not DuckDB's
+  `DESCRIBE` of the bound session view — DuckDB's rendering can lose
+  information the warehouse's own type didn't (a wide BigQuery
+  `NUMERIC`/`BIGNUMERIC` degrades to DuckDB `VARCHAR`; checked against the
+  warehouse authority, it correctly passes a declared `decimal`). Postgres
+  and Snowflake run no metadata job (existing connector architecture, ADR
+  0010) and keep DuckDB's `DESCRIBE` as the only authority — not a lesser
+  fallback, there is genuinely no other source of truth to consult there.
+- **`observed.source_descriptions`** (issue #10): upstream column
+  descriptions, source name -> column name -> description, from the same
+  metadata job §9 already pays for. Machine-observed, timestamped,
+  digest-and-profile-gated exactly like `observed.source_check` (same
+  `.cell/`-persisted, artifact-shipped, fail-closed pattern) — never folded
+  into `declared` (author-reviewed prose) and never into `docs:`
+  (file-backed, allowlist-validated, feeds `description_digest` at release):
+  an upstream comment edit must never move datamk's own release gate.
+- **A bound cell becomes deployable** (issue #11): the deploy pre-flight no
+  longer refuses an all-bound cell outright — only when the target cannot
+  host the long-lived Server at all. On Kubernetes, the one-shot init Job
+  that otherwise initializes the catalog ahead of the Server is not
+  rendered or applied at all for an all-bound cell (`render_init_job`
+  returns `None`, the same `Option` idiom `cronjob` already uses) — a
+  rendered Job would only ever run `datamk run`'s own refusal inside the
+  pod, fail after its retries are exhausted, and leave a partial apply
+  behind (ConfigMap applied, Service and Deployment never reached). A
+  target that always reports both workloads (Kubernetes) separately
+  refuses `schedule:` set together with an all-bound cell (nothing for a
+  Builder to build; `datamk run` already refuses it, so the CronJob would
+  crash-loop every scheduled tick) and never reports a Builder workload for
+  such a cell. The open-endpoint refusal (§8) names the document itself as
+  the payload for a bound cell — declared columns, grain, and prose (which
+  can itself name upstream fields) is exactly what an anonymous caller
+  gets, even though no rows ever are.
+- **`declared.exports[].route`'s documentation, corrected** (issue #12): it
+  was documented as unconditionally "the serving route key." For a bound
+  export it never was — `/openapi.json`'s paths already excluded it, making
+  `/context` the surface that disagreed. `route` stays present for every
+  export (it is also the export's docs `target`, ADR 0013 §5, independent
+  of servability), but its meaning is now stated precisely: `query` (`null`
+  for exactly the bound exports, by construction) is the field that answers
+  "does `GET /{route}` exist," never `route`'s mere presence.
+
+Internal identifiers renamed for the same reason (mechanical, no behavior
+change): `never_backed_routes` -> `bound_routes`, `note_never_backed` ->
+`note_bound_export`. `check_no_materialize_never` and
+`describe_never_offender` keep their names — they name the literal rejected
+`materialize: never` keyword the migration error matches on, which is
+correct as long as that error exists.

@@ -1,9 +1,10 @@
-mod connectors;
+pub(crate) mod connectors;
 pub mod run_summary;
 
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +49,11 @@ pub struct Cell {
     /// Published-artifact mode state (ADR 0004): present iff the profile has
     /// no `catalog:`.
     pub published: Option<PublishedState>,
+    /// `config::direct_attach(&bindings)` at open time — the same predicate
+    /// `context::emit` uses, stamped here so `serve` reads it instead of
+    /// re-deriving it from `published` (see that function's doc comment for
+    /// why `published.is_none()` is not an equivalent signal).
+    pub direct_attach: bool,
     /// Run-scoped local scratch (downloaded artifacts live here). Removed on
     /// drop.
     scratch: PathBuf,
@@ -149,15 +155,18 @@ pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
     let loaded = crate::config::load(file, profile)?;
     let conn = open_duckdb(loaded.bindings.gcs.as_ref())?;
     let scratch = new_scratch_dir(&loaded.def.cell)?;
-    // Issue #6 (live-verify core): an all-`never` cell has no snapshot and
-    // never will — `run` refuses to build one (the check near the top of
-    // `run`, above). A read-only open (standalone `verify`/`context`) of one
-    // must not hard-require a catalog that can never come to exist; `setup`
-    // tolerates a missing/unpublished catalog for exactly this case,
-    // attaching no `lake` at all rather than failing. Every other cell keeps
-    // today's behavior: a missing catalog is still a hard failure — a
-    // snapshot-backed export genuinely has nothing to check without one.
-    let tolerate_missing_catalog = read_only && crate::config::is_all_never(&loaded.transforms);
+    // Issue #6 (binding model): a cell with no materializing transforms
+    // (`builds_no_snapshot`) has no snapshot and never will — `run` refuses
+    // to build one (the check near the top of `run`, above). A read-only
+    // open (standalone `verify`/`context`) of one must not hard-require a
+    // catalog that can never come to exist; `setup` tolerates a
+    // missing/unpublished catalog for exactly this case, attaching no `lake`
+    // at all rather than failing. Every other cell keeps today's behavior: a
+    // missing catalog is still a hard failure — a snapshot-backed export
+    // genuinely has nothing to check without one.
+    let tolerate_missing_catalog =
+        read_only && crate::config::builds_no_snapshot(&loaded.transforms);
+    let direct_attach = crate::config::direct_attach(&loaded.bindings);
     let published = setup(
         &conn,
         &loaded.bindings,
@@ -177,6 +186,7 @@ pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
         s3: loaded.bindings.s3.clone(),
         gcs: loaded.bindings.gcs.clone(),
         published,
+        direct_attach,
         scratch,
     })
 }
@@ -184,8 +194,9 @@ pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
 /// `tolerate_missing_catalog` (issue #6): when set, a catalog that does not
 /// exist yet (direct-attach) or has never been published (published mode) is
 /// not an error — `lake` is simply left unattached. Set only for a read-only
-/// open of an all-`never` cell (see `open` above), which never reads or
-/// writes `lake` at all, so there is nothing lost by proceeding without it.
+/// open of a cell with no materializing transforms (see `open` above),
+/// which never reads or writes `lake` at all, so there is nothing lost by
+/// proceeding without it.
 fn setup(
     conn: &Connection,
     b: &ResolvedBindings,
@@ -256,9 +267,9 @@ fn setup(
                 Err(e) if tolerate_missing_catalog => {
                     tracing::info!(
                         catalog = %catalog, error = %e,
-                        "no catalog to attach yet for this all-`materialize: never` cell — \
-                         proceeding without `lake` (a virtual cell's live-verify checks never \
-                         read or write it; issue #6)"
+                        "no catalog to attach yet for this cell (no materializing transforms) \
+                         — proceeding without `lake` (its bound exports' live-verify checks \
+                         never read or write it; issue #6)"
                     );
                     Ok(None)
                 }
@@ -283,16 +294,17 @@ fn setup(
             let data_path = format!("{storage}/data");
             let (local, execution) = match store.latest()? {
                 Some(n) => (store.download_execution(n, scratch)?, Some(n)),
-                // Issue #6: an all-`never` cell's `verify` never publishes,
-                // so `catalog/LATEST` never comes to exist — proceed with no
-                // `lake` attached rather than the usual "run the Builder
-                // first" refusal, which would be permanently, not just
-                // currently, true for this cell.
+                // Issue #6: a cell with no materializing transforms never
+                // publishes (`run` refuses it), so `catalog/LATEST` never
+                // comes to exist — proceed with no `lake` attached rather
+                // than the usual "run the Builder first" refusal, which
+                // would be permanently, not just currently, true for this
+                // cell.
                 None if tolerate_missing_catalog => {
                     tracing::info!(
                         storage = %storage,
-                        "no published catalog yet for this all-`materialize: never` cell — \
-                         proceeding without `lake` (issue #6)"
+                        "no published catalog yet for this cell (no materializing transforms) \
+                         — proceeding without `lake` (issue #6)"
                     );
                     return Ok(None);
                 }
@@ -534,26 +546,31 @@ fn create_gcs_secret(conn: &Connection, gcs: Option<&ResolvedGcs>) -> Result<()>
 }
 
 /// What `--full-refresh` actually does for this cell (ADR 0005 §3, ADR 0008
-/// §6) — three states, not two: re-reading incremental sources takes
-/// priority when both are present (its "rewriting watermarks" note already
-/// covers the run), a cell with declarative tables but no incremental
-/// *sources* still gets a real, from-scratch rebuild (a file-sourced or
-/// cell-sourced `materialize:` entry), and only a cell with neither has
-/// truly nothing for the flag to do. Pure — unit-testable without a `Cell`.
+/// §6): re-reading incremental sources takes priority when both are present
+/// (its "rewriting watermarks" note already covers the run); otherwise a
+/// cell with declarative tables but no incremental *sources* still gets a
+/// real, from-scratch rebuild (a file-sourced or cell-sourced `materialize:`
+/// entry). Pure — unit-testable without a `Cell`.
+///
+/// Two states, not three: a cell with neither incremental sources nor
+/// declarative tables (`declarative_count == 0`) no longer reaches this
+/// function at all (binding model, issue #6) — `run` already refuses a cell
+/// with no materializing transforms before this point
+/// (`config::builds_no_snapshot`), so `declarative_count` is always > 0
+/// here. There used to be a third `NoEffect` state for exactly that input;
+/// it's gone because the input it covered can't happen anymore, not because
+/// the case was ever handled differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FullRefreshEffect {
     IncrementalSources(usize),
     DeclarativeOnly(usize),
-    NoEffect,
 }
 
 fn full_refresh_effect(incremental_count: usize, declarative_count: usize) -> FullRefreshEffect {
     if incremental_count > 0 {
         FullRefreshEffect::IncrementalSources(incremental_count)
-    } else if declarative_count > 0 {
-        FullRefreshEffect::DeclarativeOnly(declarative_count)
     } else {
-        FullRefreshEffect::NoEffect
+        FullRefreshEffect::DeclarativeOnly(declarative_count)
     }
 }
 
@@ -574,22 +591,29 @@ pub fn run(
     let cell = open(file, profile, false)?;
     tracing::info!(cell = %cell.def.cell, profile, "running pipeline");
 
-    // Issue #6 (virtual cells foundation): a cell whose every transform is
-    // `materialize: never` produces no snapshot at all — spiked and
-    // confirmed (`spike_a_transaction_that_only_creates_a_temp_view_
-    // advances_no_snapshot`): a transaction that only creates TEMP views
-    // never advances DuckLake's snapshot history. Without this refusal,
-    // published mode would still call `publish_execution` and write a
-    // `RunSummary` claiming a real build stands behind an unchanged
-    // artifact — the exact invariant break the team review flagged. Refused
-    // before BEGIN (before even the store probe below, which is pure
-    // overhead for a cell this command can never build), not caught after
-    // the fact.
-    if crate::config::is_all_never(&cell.transforms) {
+    // Issue #6 (binding model): a cell with no materializing transforms
+    // (every export bound, or none declared) produces no snapshot at all.
+    // Without this refusal, published mode would still call
+    // `publish_execution` and write a `RunSummary` claiming a real build
+    // stands behind an unchanged artifact — the exact invariant break the
+    // team review flagged. Refused before BEGIN (before even the store
+    // probe below, which is pure overhead for a cell this command can never
+    // build), not caught after the fact.
+    //
+    // Issue #6/#11 (H1): this is also, deliberately, the reason
+    // `deploy::targets::kubernetes::render::render_init_job` renders no Job
+    // at all for a cell where `all_bound` is true — a rendered Job would
+    // only ever run this exact bail inside a pod (`restartPolicy: Never` +
+    // `backoffLimit: 2`, then the deploy fails once the pod exhausts its
+    // retries, same crash-loop shape the conditional-PUT probe below
+    // legitimately can hit for other reasons). Kept in sync by construction
+    // (`render_init_job` and this refusal share the one predicate,
+    // `config::builds_no_snapshot`), not by these two comments agreeing —
+    // but they should, so: they do.
+    if crate::config::builds_no_snapshot(&cell.transforms) {
         anyhow::bail!(
-            "cell '{}' has no materializing transforms (every transform is `materialize: \
-             never`) — there is no snapshot to commit. Run `datamk verify` to check the \
-             contract, and `datamk context` to emit the document.",
+            "cell '{}' has no materializing transforms — there is no snapshot to commit. Run \
+             `datamk verify` to check the contract, and `datamk context` to emit the document.",
             cell.def.cell
         );
     }
@@ -634,8 +658,11 @@ pub fn run(
     let declarative_count = cell.transforms.len();
 
     // ADR 0005 §3: the most expensive flag this engine has must never be
-    // silent. Announce before binding, and warn (rather than silently
-    // no-op) only when the flag truly has nothing to do.
+    // silent. Announce before binding what it actually does — always
+    // something now (binding model, issue #6): a cell with neither
+    // incremental sources nor declarative tables already refused above
+    // (`builds_no_snapshot`), so there is no "no effect" state left to warn
+    // about here.
     if opts.full_refresh {
         match full_refresh_effect(incremental_count, declarative_count) {
             FullRefreshEffect::IncrementalSources(n) => tracing::info!(
@@ -645,9 +672,6 @@ pub fn run(
                 "full refresh: rebuilding {n} declarative table(s) from scratch; no incremental \
                  watermarks to rewind"
             ),
-            FullRefreshEffect::NoEffect => tracing::warn!(
-                "--full-refresh has no effect: this cell declares no incremental sources"
-            ),
         }
     }
     if opts.verify_replay && incremental_count == 0 {
@@ -656,7 +680,7 @@ pub fn run(
 
     // Sources are session-local TEMP VIEWs: visible to transforms, never committed
     // to the catalog.
-    let (advances, source_infos) = bind_sources(&cell, opts.full_refresh)?;
+    let (advances, source_infos, warehouse_columns) = bind_sources(&cell, opts.full_refresh)?;
 
     // The shrink detector (ADR 0005 §2 item 2): truncation (`CREATE OR REPLACE
     // ... FROM <incremental view>`) is idempotent and invisible to
@@ -714,14 +738,13 @@ pub fn run(
 
     tracing::info!("verifying interface");
     // Verify gates publish (ADR 0004 §4): a failed contract check must never
-    // enter published history. Still on the same connection the `never`
-    // transforms above bound their TEMP VIEWs into, pre-DETACH — a
-    // never-backed export's contract IS checked here (spike:
+    // enter published history. Still on the same connection `bind_sources`
+    // above bound every declared source's TEMP VIEW into — a bound export's
+    // contract IS checked here (spike:
     // `spike_temp_view_resolves_unqualified_ahead_of_use_lake`), unlike a
     // standalone `datamk verify` run afterward (see `verify::check`'s doc
     // comment).
-    let never_tables = crate::config::never_backed_tables(&cell.transforms);
-    crate::verify::check(&cell.conn, &cell.def, &never_tables)?;
+    crate::verify::check(&cell.conn, &cell.def, &warehouse_columns)?;
 
     // --verify-replay (ADR 0005 §2 item 1): after COMMIT and after
     // verify::check, before compact()/DETACH — pinned ordering. It needs the
@@ -847,10 +870,16 @@ fn execute_transform(
             &entry.table,
             full_refresh,
         ),
-        // `never` (issue #6) is its own shape, same reason `replace` is: no
-        // staging, no key, no guards — plus, unlike every other strategy,
-        // no `lake` catalog mutation at all.
-        MaterializeStrategy::Never => execute_never(conn, dir, &entry.sql, &entry.table),
+        // Rejected before this ever runs — `verify::check_no_materialize_
+        // never`, called from `config::mod::load`, refuses any `never`-
+        // strategy transform with a migration error naming the affected
+        // export(s). No `ResolvedTransform` with this strategy reaches
+        // `execute_transform` by construction.
+        MaterializeStrategy::Never => unreachable!(
+            "materialize: never is rejected at config-load time \
+             (verify::check_no_materialize_never) — the binding model has no path that reaches \
+             execute_transform with this strategy"
+        ),
     }
 }
 
@@ -908,37 +937,6 @@ fn execute_replace(conn: &Connection, dir: &Path, sql_path: &str, table: &str) -
 
     let artifact = write_eject_artifact(dir, table, &[], &[stmt])?;
     log_eject_notice(table, &artifact);
-    Ok(())
-}
-
-/// `materialize: never` (issue #6, virtual cells foundation): bind the
-/// transform's SELECT as a session-local `TEMP VIEW` and stop — the `lake`
-/// catalog is never touched, so this transform contributes nothing to the
-/// snapshot this run produces (spike:
-/// `spike_a_transaction_that_only_creates_a_temp_view_advances_no_snapshot`
-/// confirms a transaction that only does this advances no DuckLake
-/// snapshot). Downstream transforms in the same run read the view by name
-/// exactly like any materialized table — TEMP views resolve unqualified
-/// regardless of `USE lake` being the session's active default catalog
-/// (spike: `spike_temp_view_resolves_unqualified_ahead_of_use_lake`). No
-/// staging, no key, no guards, no schema-drift check — same shape as
-/// `execute_replace` for the same reasons, minus the one thing `replace`
-/// still does that this doesn't: no eject artifact. ADR 0008 §7's artifact
-/// documents DML that ran *against the lake*, runnable by hand there; a
-/// `never` transform ran nothing against the lake to eject.
-fn execute_never(conn: &Connection, dir: &Path, sql_path: &str, table: &str) -> Result<()> {
-    let table_q = quote_ident(table);
-    let select_path = dir.join(sql_path);
-    let select_text = std::fs::read_to_string(&select_path)
-        .with_context(|| format!("reading transform {}", select_path.display()))?;
-    let stmt = format!("CREATE OR REPLACE TEMP VIEW {table_q} AS ({select_text});");
-    tracing::info!(table = %table, sql = %stmt, "materialize: never");
-    conn.execute_batch(&stmt).with_context(|| {
-        composition_error_context(
-            &format!("binding '{table}' as a session view (materialize: never) from '{sql_path}'"),
-            &select_text,
-        )
-    })?;
     Ok(())
 }
 
@@ -1065,8 +1063,8 @@ fn execute_materialize(
                  takes no key and needs none of this function's staging/guards"
             ),
             MaterializeStrategy::Never => unreachable!(
-                "execute_transform routes `never` to execute_never, never here — never takes no \
-                 key and writes nothing to the lake at all"
+                "materialize: never is rejected at config-load time — no `ResolvedTransform` \
+                 with this strategy reaches execute_materialize, or anywhere else in the engine"
             ),
         };
         tracing::info!(table = %table, strategy = %strategy, sql = %stmt, "materialize: strategy");
@@ -1556,6 +1554,36 @@ fn select_expirable(snapshots: &[(i64, i64)], pins: &[i64], cutoff_unix: i64) ->
 struct BindOutcome {
     advance: Option<WatermarkAdvance>,
     info: SourceRunInfo,
+    warehouse_columns: Option<SourceWarehouseColumns>,
+}
+
+/// A source's warehouse-native column types, captured during `bind_sources`
+/// — verify's type authority for a bound export (issue #6/#9).
+/// `ObjectMeta.columns` (from `ClassifyCache::classify`) already holds
+/// exactly this; before this struct existed it was a local inside
+/// `bind_source`, read for cursor-predicate rendering and then discarded.
+/// Only ever non-empty for a `ConnectionTarget::Table` source whose
+/// classification job actually ran and returned columns — today, real data
+/// only for BigQuery. Postgres/Snowflake's own `classify_objects` never
+/// populates `ObjectMeta.columns` (ADR 0010: both read-through
+/// unconditionally, no metadata job), so `verify::check` falls through to
+/// DuckDB's own `DESCRIBE` for them — correctly, not as a fallback of last
+/// resort: there is no other authority to consult for a connector with no
+/// metadata job.
+pub(crate) struct SourceWarehouseColumns {
+    /// `ResolvedConnection::type_name()` — which per-connector type
+    /// vocabulary applies. Only `"bigquery"` has one today
+    /// (`connectors::bigquery::type_compatible`); kept explicit rather than
+    /// inferred from "columns is non-empty" so a future connector gaining a
+    /// metadata job can't silently borrow BigQuery's type rules by accident.
+    pub connector: &'static str,
+    /// column name -> connector-native `data_type` string.
+    pub columns: IndexMap<String, String>,
+    /// column name -> upstream description (issue #6/#10), from the same
+    /// metadata job as `columns` where one exists. Empty for a connector
+    /// with no metadata job (Postgres, Snowflake — ADR 0010), same as
+    /// `columns`.
+    pub descriptions: IndexMap<String, String>,
 }
 
 /// Bind one source as a TEMP VIEW. Raw sources read a path directly; cell sources
@@ -1584,6 +1612,11 @@ fn bind_source(
     // this; a plain outer variable is simpler than threading it back up
     // through three levels of match-as-expression.
     let mut advance: Option<WatermarkAdvance> = None;
+    // Only the `ConnectionTarget::Table` arm ever sets this, once `meta` is
+    // available — same "plain outer variable" reasoning as `advance` above;
+    // captured regardless of `meta.kind`/`incremental` since classification
+    // fetches column types for the whole sibling batch in one job either way.
+    let mut warehouse_columns: Option<SourceWarehouseColumns> = None;
     // Raw/cell sources have no warehouse read to narrate — `None` fields
     // throughout, never a fabricated table/view/query kind or a zero row
     // count. Connection sources overwrite this per arm below.
@@ -1830,9 +1863,23 @@ fn bind_source(
                             ObjectMeta {
                                 kind: ObjectKind::Table,
                                 columns: IndexMap::new(),
+                                descriptions: IndexMap::new(),
                             }
                         }
                     };
+                    // Issue #6/#9/#10: verify's type authority and
+                    // `observed.source_descriptions` both read this —
+                    // captured here, once, regardless of `meta.kind`/
+                    // `incremental` below, since classification already
+                    // fetched column types and descriptions for the whole
+                    // sibling batch in one job.
+                    if !meta.columns.is_empty() {
+                        warehouse_columns = Some(SourceWarehouseColumns {
+                            connector: config.type_name(),
+                            columns: meta.columns.clone(),
+                            descriptions: meta.descriptions.clone(),
+                        });
+                    }
 
                     match incremental {
                         None => match meta.kind {
@@ -1966,8 +2013,21 @@ fn bind_source(
             }
         }
     };
-    Ok(BindOutcome { advance, info })
+    Ok(BindOutcome {
+        advance,
+        info,
+        warehouse_columns,
+    })
 }
+
+/// `bind_sources`'s return, named to keep the signature readable (clippy
+/// `type_complexity`): each source's watermark advance, `SourceRunInfo`, and
+/// (issue #6/#9) warehouse-native column types.
+pub(crate) type BindResult = (
+    Vec<WatermarkAdvance>,
+    Vec<SourceRunInfo>,
+    HashMap<String, SourceWarehouseColumns>,
+);
 
 /// Bind every declared source as a session TEMP VIEW: `connectors::prepare`
 /// (ADC/key-file setup, process-global and cheap) plus the per-source
@@ -1981,13 +2041,16 @@ fn bind_source(
 /// Returns each source's watermark advance — `run` persists these
 /// (`persist_watermarks`, inside its transaction, before COMMIT); a
 /// **dry pass never does**, which is exactly what makes this safe to call
-/// against a read-only-attached `lake` (standalone `verify` opens one) — and
+/// against a read-only-attached `lake` (standalone `verify` opens one) —
 /// each source's `SourceRunInfo`, threaded into the published run summary by
-/// `run` and simply discarded by a dry pass with no summary to write.
-pub(crate) fn bind_sources(
-    cell: &Cell,
-    full_refresh: bool,
-) -> Result<(Vec<WatermarkAdvance>, Vec<SourceRunInfo>)> {
+/// `run` and simply discarded by a dry pass with no summary to write — and
+/// (issue #6/#9) each source's warehouse-native column types, keyed by
+/// source name (the same name `Export::bind` names), for `verify::check`'s
+/// per-bound-export type authority. Sources with no warehouse metadata (raw,
+/// cell, `query:`-shaped, or a connector with no classification job) are
+/// simply absent from the map — `verify::check` falls through to DuckDB's
+/// `DESCRIBE` for those, correctly, not as a lesser fallback.
+pub(crate) fn bind_sources(cell: &Cell, full_refresh: bool) -> Result<BindResult> {
     connectors::prepare(&cell.sources, &cell.dir)?;
     // View-backed connection sources (BigQuery views/materialized
     // views/external tables): classification is batched at most once per
@@ -1996,6 +2059,7 @@ pub(crate) fn bind_sources(
     let mut classify_cache = ClassifyCache::new(&cell.sources);
     let mut advances: Vec<WatermarkAdvance> = Vec::new();
     let mut source_infos: Vec<SourceRunInfo> = Vec::new();
+    let mut warehouse_columns: HashMap<String, SourceWarehouseColumns> = HashMap::new();
     for (i, (name, src)) in cell.sources.iter().enumerate() {
         let outcome = bind_source(
             &cell.conn,
@@ -2013,35 +2077,12 @@ pub(crate) fn bind_sources(
         if let Some(adv) = outcome.advance {
             advances.push(adv);
         }
+        if let Some(cols) = outcome.warehouse_columns {
+            warehouse_columns.insert(name.clone(), cols);
+        }
         source_infos.push(outcome.info);
     }
-    Ok((advances, source_infos))
-}
-
-/// Execute every `materialize: never` transform's SELECT as a session TEMP
-/// VIEW, in declared order — "run everything minus BEGIN/COMMIT/lake
-/// writes" (issue #6, live-verify core). Declared order is dependency
-/// order, the same assumption `run`'s transform loop already makes: a
-/// `never` transform may read a now-bound source (via `bind_sources`, called
-/// first by every caller of this), an already-materialized lake table (built
-/// by an earlier `datamk run` — a mixed cell's snapshot-backed exports are
-/// unaffected and checked against the lake exactly as today), or an earlier
-/// `never` view created in this same pass.
-///
-/// Materializing transforms (`replace`/`upsert`/`append`) are deliberately
-/// **not** re-run here: their output already exists in the lake (an
-/// all-`never` cell has none to begin with — `run` refuses to build one, so
-/// there is nothing this function could re-run for it even if it wanted to).
-/// Re-running them would be pure waste in the mixed-cell case and a second,
-/// un-transacted write attempt against a connection standalone `verify`
-/// opens read-only in the all-`never` case.
-pub(crate) fn dry_run_never_transforms(cell: &Cell) -> Result<()> {
-    for t in &cell.transforms {
-        if matches!(t.strategy, MaterializeStrategy::Never) {
-            execute_never(&cell.conn, &cell.dir, &t.sql, &t.table)?;
-        }
-    }
-    Ok(())
+    Ok((advances, source_infos, warehouse_columns))
 }
 
 /// The classification-denied fallback's safety net: probe the real table
@@ -3765,7 +3806,15 @@ mod tests {
         assert_eq!(lines[1], "WARNING: 1 table shrank during this run:");
     }
 
-    // --- --full-refresh's three states (ADR 0005 §3, ADR 0008 §6) ----------
+    // --- --full-refresh's two states (ADR 0005 §3, ADR 0008 §6) ------------
+    //
+    // `full_refresh_effect_is_no_effect_with_neither` (pre-binding-model) is
+    // gone, not converted: it pinned `full_refresh_effect(0, 0) ==
+    // NoEffect`, and `NoEffect` no longer exists — `run` now refuses a cell
+    // with no materializing transforms (`declarative_count == 0`) before
+    // `full_refresh_effect` is ever called (`FullRefreshEffect`'s doc
+    // comment explains why), so there is no state left for that test to
+    // pin.
 
     #[test]
     fn full_refresh_effect_prefers_incremental_sources_when_present() {
@@ -3793,11 +3842,6 @@ mod tests {
             full_refresh_effect(0, 1),
             FullRefreshEffect::DeclarativeOnly(1)
         );
-    }
-
-    #[test]
-    fn full_refresh_effect_is_no_effect_with_neither() {
-        assert_eq!(full_refresh_effect(0, 0), FullRefreshEffect::NoEffect);
     }
 
     /// R5: no new connection type — this drives the incremental seam
@@ -3840,6 +3884,7 @@ mod tests {
         ObjectMeta {
             kind: ObjectKind::Table,
             columns: IndexMap::new(),
+            descriptions: IndexMap::new(),
         }
     }
 
@@ -5245,126 +5290,24 @@ mod tests {
         );
     }
 
-    // --- issue #6: `materialize: never` -------------------------------------
+    // --- issue #6: the binding model ----------------------------------------
 
+    /// Replaces the removed `materialize_never_writes_no_lake_table_but_a_
+    /// downstream_transform_reads_it_in_run`: that test's mechanism (a
+    /// `never` transform creating a mid-transaction TEMP VIEW a downstream
+    /// transform then read) no longer exists — `bind_sources` binds every
+    /// declared source, `raw` included, *before* `BEGIN`, exactly like any
+    /// other source (spike: `spike_temp_view_resolves_unqualified_ahead_of_
+    /// use_lake` already covers that a pre-BEGIN TEMP VIEW is readable
+    /// mid-transaction; nothing `never`-specific is left to spike). What
+    /// still needs its own regression pin is the invariant the deleted test
+    /// protected: a bound export's declared object never reaches the lake
+    /// catalog, only the materialized table does — through the real `run()`
+    /// entry point (`materialize_test_cell`/`run_transforms` deliberately
+    /// skip `bind_sources`, so they can't exercise a binding at all).
     #[test]
-    fn materialize_never_writes_no_lake_table_but_a_downstream_transform_reads_it_in_run() {
-        // MIXED cell (the shape the ADR 0012/issue #6 review required): a
-        // real `stg` table, a `never` transform over PII the cell must not
-        // hold, and a normal `replace` rollup reading the never-backed view
-        // downstream — same transaction, same run.
-        let cell = materialize_test_cell(
-            "mat-never-mixed",
-            "  - sql/stg.sql\n  - sql: sql/virtual_pii.sql\n    materialize: never\n  - sql/agg.sql\n",
-            &[
-                (
-                    "stg.sql",
-                    "SELECT * FROM (VALUES (1, 'alice@x.com', 10), (2, 'bob@x.com', 20)) \
-                     AS t(id, email, amount)",
-                ),
-                ("virtual_pii.sql", "SELECT id, email, amount FROM stg"),
-                (
-                    "agg.sql",
-                    "SELECT count(*) AS n, sum(amount) AS total FROM virtual_pii",
-                ),
-            ],
-        );
-        run_transforms(&cell, false)
-            .expect("a never transform must not block the transaction it runs inside");
-
-        // The lake contains only the materialized tables — `virtual_pii`
-        // never reached the DuckLake catalog (spike:
-        // `spike_a_transaction_that_only_creates_a_temp_view_advances_no_
-        // snapshot`).
-        let lake_tables: Vec<String> = {
-            let mut stmt = cell
-                .conn
-                .prepare(
-                    "SELECT table_name FROM information_schema.tables \
-                     WHERE table_catalog = 'lake' ORDER BY table_name",
-                )
-                .unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(0))
-                .unwrap()
-                .collect::<duckdb::Result<_>>()
-                .unwrap()
-        };
-        assert_eq!(
-            lake_tables,
-            vec!["agg".to_string(), "stg".to_string()],
-            "virtual_pii must never reach the lake catalog — only materialized tables do: \
-             {lake_tables:?}"
-        );
-
-        // Downstream `agg` (a normal `replace` table) read the never-backed
-        // view exactly like any materialized table, in the same transaction
-        // (spike: `spike_temp_view_resolves_unqualified_ahead_of_use_lake`).
-        let (n, total): (i64, f64) = cell
-            .conn
-            .query_row("SELECT n, total FROM agg", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(n, 2, "agg must see both rows virtual_pii exposed");
-        assert_eq!(
-            total, 30.0,
-            "agg's aggregate must reflect virtual_pii's rows"
-        );
-    }
-
-    #[test]
-    fn run_refuses_an_all_never_cell_before_begin() {
-        // The invariant the team review flagged: without this refusal,
-        // `run` on an all-never cell would proceed through an empty-of-lake
-        // -writes transaction (spiked: it creates no snapshot at all) and,
-        // in published mode, still call `publish_execution` and write a
-        // `RunSummary` claiming a verified build stands behind an unchanged
-        // artifact. Refused before BEGIN instead.
-        let dir = probe_scratch_dir("run-all-never-refusal");
-        std::fs::create_dir_all(dir.join("sql")).unwrap();
-        std::fs::create_dir_all(dir.join("profiles")).unwrap();
-        std::fs::write(
-            dir.join("cell.yaml"),
-            "cell: virtual_only\n\
-             transforms:\n\
-             \x20 - sql: sql/pii.sql\n\
-             \x20   materialize: never\n\
-             interface:\n\
-             \x20 - name: pii\n\
-             \x20   version: 1.0.0\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("sql/pii.sql"),
-            "SELECT * FROM (VALUES (1, 'a')) AS t(id, val)",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("profiles/local.yaml"),
-            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
-        )
-        .unwrap();
-
-        let err = run(&dir.join("cell.yaml"), "local", None, RunOptions::default())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("cell 'virtual_only' has no materializing transforms"),
-            "got: {err}"
-        );
-        assert!(err.contains("materialize: never"), "got: {err}");
-        assert!(err.contains("there is no snapshot to commit"), "got: {err}");
-        assert!(err.contains("datamk verify"), "got: {err}");
-        assert!(err.contains("datamk context"), "got: {err}");
-    }
-
-    #[test]
-    fn run_builds_a_mixed_cell_normally_committing_only_the_materializing_tables() {
-        // The mixed-cell counterpart to the all-never refusal above: a cell
-        // with at least one materializing transform must run to completion
-        // (through the real `run()` entry point, verify included), and the
-        // resulting snapshot must contain only the materialized table.
-        let dir = probe_scratch_dir("run-mixed-cell-normal");
+    fn run_builds_a_mixed_cell_leaving_the_bound_export_out_of_the_lake() {
+        let dir = probe_scratch_dir("run-mixed-bound-lake-purity");
         std::fs::create_dir_all(dir.join("sql")).unwrap();
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
         std::fs::write(
@@ -5372,19 +5315,28 @@ mod tests {
             "cell: mixed\n\
              transforms:\n\
              \x20 - sql/stg.sql\n\
-             \x20 - sql: sql/virtual_pii.sql\n\
-             \x20   materialize: never\n\
              interface:\n\
              \x20 - name: stg\n\
-             \x20   version: 1.0.0\n",
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20 - name: virtual_pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20   bind: raw\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
         )
         .unwrap();
         std::fs::write(
             dir.join("sql/stg.sql"),
-            "SELECT * FROM (VALUES (1, 'a')) AS t(id, val)",
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
         )
         .unwrap();
-        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM stg").unwrap();
+        std::fs::write(
+            dir.join("data.csv"),
+            "id,email,amount\n1,alice@x.com,10\n2,bob@x.com,20\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("profiles/local.yaml"),
             "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
@@ -5392,12 +5344,10 @@ mod tests {
         .unwrap();
 
         run(&dir.join("cell.yaml"), "local", None, RunOptions::default())
-            .expect("a mixed cell (at least one materializing transform) must run to completion");
+            .expect("mixed cell (materializing + bound) must build cleanly");
 
-        // Read back through a fresh connection, the way `verify`/`serve`
-        // would — proves the snapshot itself, not just the run's own
-        // session state.
-        let cell = open(&dir.join("cell.yaml"), "local", true).expect("reopen the built cell");
+        let cell =
+            open(&dir.join("cell.yaml"), "local", true).expect("reopen read-only to inspect lake");
         let lake_tables: Vec<String> = {
             let mut stmt = cell
                 .conn
@@ -5414,10 +5364,131 @@ mod tests {
         assert_eq!(
             lake_tables,
             vec!["stg".to_string()],
-            "the committed snapshot must contain only the materializing table, never \
-             virtual_pii: {lake_tables:?}"
+            "the bound export's declared object must never reach the lake catalog — only the \
+             materialized table does: {lake_tables:?}"
         );
     }
+
+    /// A1 (review-flagged real coverage loss, not a rename): the deleted
+    /// `materialize_never_writes_no_lake_table_but_a_downstream_transform_
+    /// reads_it_in_run` asserted more than lake purity — it proved a
+    /// downstream *materializing* transform could actually read real rows
+    /// through the virtual/bound layer in the same `run`
+    /// (`assert_eq!(n, 2)`, `assert_eq!(total, 30.0)`). The replacement
+    /// above only asserts the lake table list; this invariant — a
+    /// `sources:` entry simultaneously `bind`-ed by an export AND read by a
+    /// materializing transform — was pinned nowhere. Restored here against
+    /// the binding model: `stg` reads `raw` directly (`bind_sources` binds
+    /// it as a `TEMP VIEW` before `BEGIN`, readable mid-transaction exactly
+    /// like any other source — the same pre-BEGIN-binding mechanism
+    /// `spike_temp_view_resolves_unqualified_ahead_of_use_lake` already
+    /// spikes), while `virtual_pii` binds the same `raw` source for an
+    /// export that never materializes.
+    #[test]
+    fn run_lets_a_materializing_transform_read_the_same_source_an_export_binds() {
+        let dir = probe_scratch_dir("run-mixed-bound-downstream-read");
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: mixed\n\
+             transforms:\n\
+             \x20 - sql/stg.sql\n\
+             interface:\n\
+             \x20 - name: stg\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20 - name: virtual_pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20   bind: raw\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        // Reads the exact source `virtual_pii` also binds — the shape the
+        // deleted test covered and the replacement dropped.
+        std::fs::write(dir.join("sql/stg.sql"), "SELECT id, amount FROM raw").unwrap();
+        std::fs::write(
+            dir.join("data.csv"),
+            "id,email,amount\n1,alice@x.com,10\n2,bob@x.com,20\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+
+        run(&dir.join("cell.yaml"), "local", None, RunOptions::default())
+            .expect("mixed cell (materializing reads the bound source) must build cleanly");
+
+        let cell =
+            open(&dir.join("cell.yaml"), "local", true).expect("reopen read-only to inspect lake");
+        let (n, total): (i64, f64) = cell
+            .conn
+            .query_row("SELECT COUNT(*), SUM(amount) FROM lake.stg", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("stg must have actually read raw's rows, not an empty relation");
+        assert_eq!(n, 2, "stg must materialize both of raw's rows");
+        assert_eq!(
+            total, 30.0,
+            "stg must read raw's real values, not a coincidentally-empty read"
+        );
+    }
+
+    #[test]
+    fn run_refuses_an_all_bound_cell_before_begin() {
+        // The invariant the team review flagged: without this refusal,
+        // `run` on an all-bound cell (binding model: no materializing
+        // transforms at all) would proceed through an empty-of-lake-writes
+        // transaction (spiked: it creates no snapshot at all) and, in
+        // published mode, still call `publish_execution` and write a
+        // `RunSummary` claiming a verified build stands behind an unchanged
+        // artifact. Refused before BEGIN instead.
+        let dir = probe_scratch_dir("run-all-bound-refusal");
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: virtual_only\n\
+             interface:\n\
+             \x20 - name: pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   bind: raw\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("data.csv"), "id,val\n1,a\n").unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+
+        let err = run(&dir.join("cell.yaml"), "local", None, RunOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cell 'virtual_only' has no materializing transforms"),
+            "got: {err}"
+        );
+        assert!(err.contains("there is no snapshot to commit"), "got: {err}");
+        assert!(err.contains("datamk verify"), "got: {err}");
+        assert!(err.contains("datamk context"), "got: {err}");
+    }
+
+    // `run_builds_a_mixed_cell_normally_committing_only_the_materializing_
+    // tables` (pre-binding-model) is gone, not converted: its fixture had a
+    // private `never` transform with no corresponding export at all, which
+    // the binding model has no equivalent for (a bound export is *always*
+    // declared in `interface:`, never a private, unexported thing). Its
+    // invariant — a mixed cell's committed snapshot contains only the
+    // materializing table — is the same one
+    // `run_builds_a_mixed_cell_leaving_the_bound_export_out_of_the_lake`
+    // above now pins, through a real bound export.
 
     // --- ADR 0008: the uniform naming invariant (raw-path tests removed) ---
     //
@@ -5574,12 +5645,8 @@ mod tests {
         );
 
         // Green: `datamk verify`'s actual check, not just "it ran".
-        crate::verify::check(
-            &cell.conn,
-            &cell.def,
-            &crate::config::never_backed_tables(&cell.transforms),
-        )
-        .expect("bootstrap output must verify cleanly against the declared interface");
+        crate::verify::check(&cell.conn, &cell.def, &HashMap::new())
+            .expect("bootstrap output must verify cleanly against the declared interface");
 
         // Second delivery: an update to key 1 (upsert must replace, not
         // duplicate) plus a brand-new key 3. Simulates what the next run's
@@ -5624,12 +5691,8 @@ mod tests {
             "one group per distinct region across all 3 accumulated rows"
         );
 
-        crate::verify::check(
-            &cell.conn,
-            &cell.def,
-            &crate::config::never_backed_tables(&cell.transforms),
-        )
-        .expect("post-accumulation output must still verify cleanly");
+        crate::verify::check(&cell.conn, &cell.def, &HashMap::new())
+            .expect("post-accumulation output must still verify cleanly");
     }
 
     #[test]

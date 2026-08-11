@@ -55,6 +55,14 @@ pub struct DeployContext<'a> {
     /// against the rendered mount).
     #[allow(dead_code)]
     pub bindings: &'a ResolvedBindings,
+    /// `config::builds_no_snapshot(&transforms)` — every export bound, no
+    /// materializing transforms declared (issue #6/#11). Derived exactly
+    /// once, in `deploy::run` (the one place resolved transforms exist on
+    /// this path — `DeployContext` itself carries none), and threaded here
+    /// rather than re-derived by a target: a target re-deriving it from
+    /// `def` alone would need its own copy of `builds_no_snapshot`'s
+    /// resolve-time logic, and the two could drift.
+    pub all_bound: bool,
     pub cfg: &'a DeployConfig,
     /// The `--profile` name (e.g. `prod`). Not part of `bindings` — a target
     /// needs the **name** itself (to build the profile Secret's name and the

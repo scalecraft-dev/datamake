@@ -64,6 +64,16 @@ pub(crate) struct RenderInput<'a> {
     /// `None` on this pure-render path (dry-run, unit tests) — step 3's apply
     /// reads the live Secret and fills it in before rendering the Deployment.
     pub secret_checksum: Option<&'a str>,
+    /// `config::builds_no_snapshot(&transforms)` (issue #6/#11), threaded
+    /// from `DeployContext::all_bound` (derived once in `deploy::run`,
+    /// never re-derived here). The one thing this decides: whether
+    /// `render_init_job` renders a Job at all. An all-bound cell has no
+    /// materializing transforms — `datamk run` refuses it before BEGIN
+    /// (`engine::run`) — so a rendered init Job for one would only ever run
+    /// that refusal inside a Kubernetes Job pod: `restartPolicy: Never` +
+    /// `backoffLimit: 2` means three failed pods, then `apply_and_wait_init`
+    /// bails and the Server never gets applied at all.
+    pub all_bound: bool,
 }
 
 /// The five typed manifests a cell's topology can produce, bundled so the async
@@ -77,7 +87,13 @@ pub(crate) struct Manifests {
     /// is ever applied — it initializes the DuckLake catalog so `serve`'s
     /// `READ_ONLY` attach doesn't crash-loop on a fresh catalog DB (the gap the
     /// `kind` e2e harness found; see `apply::apply_and_wait_init`).
-    pub(crate) init_job: Job,
+    ///
+    /// `None` for an all-bound cell (issue #6/#11, `RenderInput::all_bound`):
+    /// `datamk run` refuses such a cell before BEGIN, so a rendered init Job
+    /// would only ever run that refusal inside a Job pod and fail the whole
+    /// deploy — same `Option` idiom as `cronjob` below, for the same "this
+    /// workload does not apply to this cell" reason.
+    pub(crate) init_job: Option<Job>,
     pub(crate) service: Service,
     pub(crate) deployment: Deployment,
     pub(crate) cronjob: Option<CronJob>,
@@ -115,11 +131,9 @@ impl Manifests {
             &self.configmap.metadata,
             &self.configmap,
         )?);
-        docs.push(rendered_doc(
-            "Job",
-            &self.init_job.metadata,
-            &self.init_job,
-        )?);
+        if let Some(job) = &self.init_job {
+            docs.push(rendered_doc("Job", &job.metadata, job)?);
+        }
         docs.push(rendered_doc(
             "Service",
             &self.service.metadata,
@@ -267,6 +281,20 @@ fn artifact_files(art: &CellArtifact) -> Vec<&ArtifactFile> {
     if let Some(pin) = &art.published {
         files.push(pin);
     }
+    // Issue #16: `.cell/source_check.json` travels the same way `published`
+    // does — `serve`'s startup load (`SourceCheckRecord::fresh_for`) needs
+    // it mounted at `/cell/.cell/source_check.json` to surface it on the
+    // hosted `/context` at all.
+    if let Some(check) = &art.source_check {
+        files.push(check);
+    }
+    // Issue #6/#10: `.cell/source_descriptions.json` travels the same way
+    // `source_check` immediately above does — same sibling reasoning,
+    // `serve`'s startup load needs it mounted to surface
+    // `observed.source_descriptions` on the hosted door.
+    if let Some(descriptions) = &art.source_descriptions {
+        files.push(descriptions);
+    }
     files
 }
 
@@ -320,7 +348,14 @@ fn decode_text(f: &ArtifactFile) -> Result<String> {
 /// No checksum annotations — unlike the Server's Deployment, this Job never
 /// gets mutated in place; a content change gets an entirely new, content-
 /// addressed name (`init_job_name`) instead.
-fn render_init_job(input: &RenderInput) -> Job {
+///
+/// `None` for an all-bound cell (issue #6/#11) — see `RenderInput::
+/// all_bound`'s doc comment for why rendering a Job here at all would be
+/// wrong, not just unnecessary, for such a cell.
+fn render_init_job(input: &RenderInput) -> Option<Job> {
+    if input.all_bound {
+        return None;
+    }
     let container = Container {
         name: "init".to_string(),
         image: Some(input.k8s.image_ref()),
@@ -336,7 +371,7 @@ fn render_init_job(input: &RenderInput) -> Job {
         content_hash_short(&input.artifact.content_hash).to_string(),
     );
 
-    Job {
+    Some(Job {
         metadata: ObjectMeta {
             name: Some(init_job_name(input.cell, &input.artifact.content_hash)),
             namespace: Some(input.k8s.namespace().to_string()),
@@ -362,7 +397,7 @@ fn render_init_job(input: &RenderInput) -> Job {
             ..Default::default()
         }),
         ..Default::default()
-    }
+    })
 }
 
 // --- Service -----------------------------------------------------------------
@@ -685,6 +720,7 @@ mod tests {
             artifact,
             has_roles: false,
             secret_checksum: None,
+            all_bound: false,
         }
     }
 
@@ -744,6 +780,142 @@ mod tests {
         } else {
             assert!(!data.contains_key(".cell_published.json"));
         }
+        // orders has no never-backed exports, so `datamk verify` never
+        // writes `.cell/source_check.json` for it — same present-only-when
+        // discipline as `published`, mirrored here (issue #16).
+        if art.source_check.is_some() {
+            assert!(data.contains_key(".cell_source_check.json"));
+        } else {
+            assert!(!data.contains_key(".cell_source_check.json"));
+        }
+        // Same present-only-when discipline (issue #6/#10): orders has no
+        // bound exports, so verify never has anything to bind and describe.
+        if art.source_descriptions.is_some() {
+            assert!(data.contains_key(".cell_source_descriptions.json"));
+        } else {
+            assert!(!data.contains_key(".cell_source_descriptions.json"));
+        }
+    }
+
+    /// Issue #16: `.cell/source_check.json` ships in the ConfigMap when
+    /// present, and — the actual point — a change to *only* that file moves
+    /// `content_hash`, so a fresh `datamk verify` rolls the workload the
+    /// same way a fresh release does (a new attestation is new served
+    /// content, ADR 0012's live-verify slice).
+    #[test]
+    fn configmap_carries_source_check_and_content_hash_moves_when_it_changes() {
+        let dir = Path::new("test/integrations/orders");
+        let def = CellDef::load(&dir.join("cell.yaml")).unwrap();
+
+        // Synthesize a source_check.json in a scratch copy of the fixture
+        // dir rather than mutating the committed one.
+        let scratch = std::env::temp_dir().join(format!(
+            "datamk-render-source-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(scratch.join(".cell")).unwrap();
+        for entry in ["cell.yaml", "sql/stg_orders.sql", "sql/orders_daily.sql"] {
+            let src = dir.join(entry);
+            let dst = scratch.join(entry);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(&src, &dst).unwrap();
+        }
+        std::fs::write(
+            scratch.join(".cell/source_check.json"),
+            r#"{"outcome":"passed","checked_at":"2026-08-10T00:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod"}"#,
+        )
+        .unwrap();
+
+        let art_without = {
+            std::fs::remove_file(scratch.join(".cell/source_check.json")).unwrap();
+            CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap()
+        };
+        std::fs::write(
+            scratch.join(".cell/source_check.json"),
+            r#"{"outcome":"passed","checked_at":"2026-08-10T00:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod"}"#,
+        )
+        .unwrap();
+        let art_with = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();
+
+        assert!(art_without.source_check.is_none());
+        assert!(art_with.source_check.is_some());
+        assert_ne!(
+            art_without.content_hash, art_with.content_hash,
+            "adding source_check.json alone must move content_hash"
+        );
+
+        let k8s = KubernetesConfig::default();
+        let cm = render_configmap(&input(&k8s, &art_with)).unwrap();
+        assert!(cm.data.unwrap().contains_key(".cell_source_check.json"));
+
+        // A second, later checked_at (a re-verify) must also move the hash.
+        std::fs::write(
+            scratch.join(".cell/source_check.json"),
+            r#"{"outcome":"passed","checked_at":"2026-08-10T01:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod"}"#,
+        )
+        .unwrap();
+        let art_later = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();
+        assert_ne!(
+            art_with.content_hash, art_later.content_hash,
+            "a re-verify (new checked_at) alone must move content_hash"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Issue #6/#10: `.cell/source_descriptions.json` ships in the
+    /// ConfigMap when present, and — the actual point, sibling of the
+    /// `source_check` test immediately above — a change to *only* that file
+    /// moves `content_hash`, so `serve`'s startup load in a fresh pod can
+    /// only ever see a current record.
+    #[test]
+    fn configmap_carries_source_descriptions_and_content_hash_moves_when_it_changes() {
+        let dir = Path::new("test/integrations/orders");
+        let def = CellDef::load(&dir.join("cell.yaml")).unwrap();
+
+        let scratch = std::env::temp_dir().join(format!(
+            "datamk-render-source-descriptions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(scratch.join(".cell")).unwrap();
+        for entry in ["cell.yaml", "sql/stg_orders.sql", "sql/orders_daily.sql"] {
+            let src = dir.join(entry);
+            let dst = scratch.join(entry);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(&src, &dst).unwrap();
+        }
+
+        let art_without = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();
+        std::fs::write(
+            scratch.join(".cell/source_descriptions.json"),
+            r#"{"written_at":"2026-08-10T00:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod","sources":{"raw":{"amount":"Gross order amount before tax."}}}"#,
+        )
+        .unwrap();
+        let art_with = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();
+
+        assert!(art_without.source_descriptions.is_none());
+        assert!(art_with.source_descriptions.is_some());
+        assert_ne!(
+            art_without.content_hash, art_with.content_hash,
+            "adding source_descriptions.json alone must move content_hash"
+        );
+
+        let k8s = KubernetesConfig::default();
+        let cm = render_configmap(&input(&k8s, &art_with)).unwrap();
+        assert!(cm
+            .data
+            .unwrap()
+            .contains_key(".cell_source_descriptions.json"));
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -973,7 +1145,7 @@ mod tests {
     fn init_job_name_is_content_addressed() {
         let art = orders_artifact();
         let k8s = KubernetesConfig::default();
-        let job = render_init_job(&input(&k8s, &art));
+        let job = render_init_job(&input(&k8s, &art)).expect("not an all-bound input");
         assert_eq!(
             job.metadata.name.unwrap(),
             format!("orders-init-{}", &art.content_hash[..12])
@@ -984,7 +1156,7 @@ mod tests {
     fn init_job_args_are_run_file_profile() {
         let art = orders_artifact();
         let k8s = KubernetesConfig::default();
-        let job = render_init_job(&input(&k8s, &art));
+        let job = render_init_job(&input(&k8s, &art)).expect("not an all-bound input");
         let spec = job.spec.unwrap().template.spec.unwrap();
         assert_eq!(
             spec.containers[0].args.clone().unwrap(),
@@ -1004,7 +1176,7 @@ mod tests {
     fn init_job_restart_policy_and_cleanup_are_set() {
         let art = orders_artifact();
         let k8s = KubernetesConfig::default();
-        let job = render_init_job(&input(&k8s, &art));
+        let job = render_init_job(&input(&k8s, &art)).expect("not an all-bound input");
         let spec = job.spec.clone().unwrap();
         assert_eq!(spec.backoff_limit, Some(2));
         assert_eq!(spec.ttl_seconds_after_finished, Some(3600));
@@ -1023,7 +1195,7 @@ mod tests {
         let mut i = input(&scheduled, &art);
         i.has_roles = true;
 
-        let job = render_init_job(&i);
+        let job = render_init_job(&i).expect("not an all-bound input");
         let cronjob = render_cronjob(&i).unwrap();
 
         let job_spec = job.spec.unwrap().template.spec.unwrap();
@@ -1072,7 +1244,7 @@ mod tests {
     fn init_job_label_value_fits_the_kubernetes_63_byte_limit() {
         let art = orders_artifact();
         let k8s = KubernetesConfig::default();
-        let job = render_init_job(&input(&k8s, &art));
+        let job = render_init_job(&input(&k8s, &art)).expect("not an all-bound input");
         for (k, v) in job.metadata.labels.unwrap() {
             assert!(
                 v.len() <= 63,
@@ -1096,6 +1268,44 @@ mod tests {
         assert_eq!(
             kinds,
             vec!["ConfigMap", "Job", "Service", "Deployment", "CronJob"]
+        );
+    }
+
+    /// Issue #6/#11 (H1, the deploy-relax regression): `manifests()` — not
+    /// just the pure `render_init_job` unit — renders no init Job at all for
+    /// an all-bound cell, on both `--dry-run`'s and a real apply's shared
+    /// path. `render_init_job`'s own unit tests only ever inspected the
+    /// typed struct in isolation with `all_bound: false`, which is exactly
+    /// how a Kubernetes-specific no-op regression survived undetected:
+    /// nothing at the `manifests()`/`docs()` level ever asserted `init_job`
+    /// stays `None` end to end.
+    #[test]
+    fn manifests_render_no_init_job_for_an_all_bound_cell() {
+        let art = orders_artifact();
+        let k8s = KubernetesConfig::default();
+
+        let mut normal = input(&k8s, &art);
+        normal.all_bound = false;
+        let m = manifests(&normal).unwrap();
+        assert!(m.init_job.is_some(), "a materializing cell needs a Builder");
+        let docs = m.docs().unwrap();
+        let kinds: Vec<_> = docs.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["ConfigMap", "Job", "Service", "Deployment"]);
+
+        let mut all_bound = input(&k8s, &art);
+        all_bound.all_bound = true;
+        let m = manifests(&all_bound).unwrap();
+        assert!(
+            m.init_job.is_none(),
+            "an all-bound cell has nothing to build — rendering a Job here \
+             would only ever run `datamk run`'s own refusal inside the pod"
+        );
+        let docs = m.docs().unwrap();
+        let kinds: Vec<_> = docs.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["ConfigMap", "Service", "Deployment"],
+            "no Job doc must be rendered for an all-bound cell"
         );
     }
 

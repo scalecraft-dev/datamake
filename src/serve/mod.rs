@@ -35,16 +35,16 @@ struct AppState {
     /// scratch (artifact file) — resident generations are bounded at two.
     cell: Mutex<engine::Cell>,
     /// route key (`name@major`) -> export — every discoverable export,
-    /// including a `materialize: never` one (issue #6): the dispatch map
-    /// needs to tell "no such export" (404, unknown route) apart from "this
-    /// export exists but is not routed here" (404, `never_backed_routes`,
-    /// after `authorize()`).
+    /// bound ones included (issue #6): the dispatch map needs to tell "no
+    /// such export" (404, unknown route) apart from "this export exists but
+    /// is not routed here" (404, `bound_routes`, after
+    /// `authorize()`).
     routes: HashMap<String, Export>,
-    /// route keys sourced from a `materialize: never` table (issue #6): not
-    /// mounted, described only. Checked post-`authorize()` in
+    /// route keys for bound exports (issue #6): not mounted, described
+    /// only. Checked post-`authorize()` in
     /// `serve_export_inner` — a pre-auth check here would let an
     /// unauthenticated caller enumerate which exports are virtual.
-    never_backed_routes: HashSet<String>,
+    bound_routes: HashSet<String>,
     /// route key -> pinned snapshot id (from the release manifest)
     published: BTreeMap<String, i64>,
     openapi: serde_json::Value,
@@ -82,8 +82,21 @@ struct AppState {
     /// there is nothing here to probe (see `mounted_routes`'s doc comment).
     route_list: Vec<(String, Export)>,
     /// Whether the data routes are mounted (`false` under `--no-data`,
-    /// ADR 0012 §4). Drives `data.served_here` honestly, by construction.
+    /// ADR 0012 §4).
     data_mounted: bool,
+    /// `context::served_here(data_mounted, &route_list)`, computed once at
+    /// construction and read from both the digest-feeding `DataBlock` (built
+    /// alongside this in `build_state`) and every per-request document
+    /// (`context_doc`) — never recomputed from `data_mounted` alone, which is
+    /// what let an all-bound cell claim `served_here: true` while
+    /// every data route 404'd (issue #17). Stable for the process lifetime:
+    /// `route_list` is structural (from `cell.def`), never touched by the
+    /// poller.
+    served_here: bool,
+    /// `config::builds_no_snapshot(&cell.transforms)`, computed once at
+    /// construction. See `context::Facts::is_all_never`'s doc comment for why
+    /// this is distinct from `direct_attach` and needs its own note.
+    is_all_never: bool,
     /// Profile-declared locations rows actually live when not served here.
     channels: Vec<String>,
     /// Swap-time probe results (ADR 0012 §5): computed at open and at swap
@@ -113,6 +126,28 @@ struct AppState {
     /// request path. `"<interface_digest>~docs.<this>"` is the docs-variant
     /// ETag; the plain digest (no suffix) is the default variant's.
     docs_bundle_sha12: String,
+    /// The live-verify source-check record (issue #6/#16), read once at
+    /// startup via `SourceCheckRecord::fresh_for` — `None` unless a fresh
+    /// (digest- and profile-matched) `.cell/source_check.json` shipped in
+    /// this deploy artifact. Startup-only, not poller-refreshed: see
+    /// `build_state`'s doc comment for why.
+    source_check: Option<crate::context::SourceCheck>,
+    /// The live-verify source-descriptions record (issue #6/#10), read once
+    /// at startup via `SourceDescriptionsRecord::fresh_for` — same
+    /// discipline, same artifact-shipping, same reason as `source_check`
+    /// immediately above (they are sibling files written by the same
+    /// `datamk verify` run).
+    source_descriptions: indexmap::IndexMap<String, indexmap::IndexMap<String, String>>,
+    /// H3: a short hash over `source_check`/`source_descriptions`,
+    /// precomputed at startup exactly like `docs_bundle_sha12` — folded
+    /// into every `/context` `ETag`, not just the `?include=docs` variant.
+    /// Without this, `interface_digest` (declared/data only, ADR 0012 §2)
+    /// is byte-identical across the rollout that first ships a passing
+    /// live-verify record (`cell.yaml` is unchanged), so a caching client's
+    /// `If-None-Match` would 304 straight past the entire fact this state
+    /// exists to surface. `None` when neither observed input is present —
+    /// the common case keeps today's byte-identical default `ETag`.
+    observed_bundle_sha12: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -196,7 +231,7 @@ pub async fn run(
     no_data: bool,
 ) -> Result<()> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
-    let (state, store) = build_state(cell, no_data)?;
+    let (state, store) = build_state(cell, no_data, file, profile)?;
 
     // Initial run-summary fetch (ADR 0012 §5): serve startup already talks to
     // the store (`engine::open` downloaded the artifact), so one more GET here
@@ -229,9 +264,18 @@ pub async fn run(
 /// in-process smoke tests can stand up the exact router `serve` binds,
 /// without a socket. Returns the store handle separately (published mode)
 /// so `run` can hand it to the poller.
+///
+/// `file`/`profile` are `run`'s own params, threaded through (not read from
+/// `cell`, which carries none of this): issue #16 needs them to compute
+/// `cell_yaml_digest_of(file)` and gate `.cell/source_check.json` on
+/// `profile`, both at startup only — matching the customer's own read that
+/// a Server's `/context` should mean "verified against the exact bytes this
+/// pod ships with," not drift independently between rollouts.
 fn build_state(
     cell: engine::Cell,
     no_data: bool,
+    file: &Path,
+    profile: &str,
 ) -> Result<(Arc<AppState>, Option<Arc<crate::store::Store>>)> {
     let published = load_published(&cell.dir);
     let data_mounted = !no_data;
@@ -239,29 +283,30 @@ fn build_state(
     // The one visibility-filtered route list (ADR 0012 §4): the router's
     // dispatch map, the OpenAPI doc, and the context document all derive
     // from this single call — never three independent predicates. Includes
-    // `materialize: never` exports (issue #6) — `declared` is unconditional
+    // bound exports (issue #6, binding model) — `declared` is unconditional
     // (datamk owns the contract regardless of who owns the rows); `mounted`
     // is the snapshot-backed subset actually routed over HTTP.
     let all_routes = crate::context::discoverable_routes(&cell.def)?;
-    let never_tables = crate::config::never_backed_tables(&cell.transforms);
-    let mounted = crate::context::mounted_routes(&all_routes, &never_tables);
-    let never_backed_routes: HashSet<String> = all_routes
+    let is_all_never = crate::config::builds_no_snapshot(&cell.transforms);
+    let mounted = crate::context::mounted_routes(&all_routes);
+    let bound_routes: HashSet<String> = all_routes
         .iter()
-        .filter(|(_, e)| never_tables.contains(e.source_object()))
+        .filter(|(_, e)| e.is_bound())
         .map(|(route, _)| route.clone())
         .collect();
     let routes: HashMap<String, Export> = all_routes.iter().cloned().collect();
-    // Under --no-data the query block is omitted (it describes HTTP
-    // affordances that do not exist there — ADR 0012 §4); per-export it's
-    // also omitted for a never-backed export regardless of --no-data.
-    let declared = crate::context::declared(
-        &cell.def,
-        &all_routes,
-        /* with_query */ data_mounted,
-        &never_tables,
-    );
+    // The query block is unconditional interface grammar (ADR 0012 §2,
+    // amended) — never gated on --no-data. It's still null per-export for a
+    // bound export, regardless of --no-data: that's a genuine interface
+    // fact (issue #6), not a serving-mode one.
+    let declared = crate::context::declared(&cell.def, &all_routes);
+    // Computed once, stored, and read from both the digest (below, via
+    // `data`) and the per-request document (`context_doc`'s `s.served_here`)
+    // — one fact, not two calls that could independently drift, since the
+    // document must never disagree with its own ETag.
+    let served_here = crate::context::served_here(data_mounted, &mounted);
     let data = crate::context::DataBlock {
-        served_here: data_mounted,
+        served_here,
         channels: cell.channels.clone(),
     };
     let digest = crate::context::interface_digest(&cell.def.cell, &declared, &data);
@@ -287,7 +332,7 @@ fn build_state(
         .unwrap_or(0);
 
     let data_as_of = query_data_as_of(&cell.conn);
-    let direct_attach = cell.published.is_none();
+    let direct_attach = cell.direct_attach;
     // The open-time probe run (ADR 0012 §5) — same measurements the poller
     // repeats at every swap. `--no-data` withholds the row-derived `values`
     // lists; coverage and counts stay (aggregates that name no entity).
@@ -315,6 +360,31 @@ fn build_state(
             .map(|p| p.docs.into_iter().collect())
             .unwrap_or_default();
 
+    // Issue #16: the live-verify source-check record, read once at startup
+    // — matches `docs_pages`/`docs_fingerprints` above, not the poller-
+    // refreshed `run_summary` cache. Startup-only is deliberate, not a
+    // shortcut: the record ships inside the same deploy artifact as
+    // `cell.yaml` (`.cell/source_check.json`, folded into `content_hash`),
+    // so a new verify-check can only ever reach a running pod through a
+    // rollout — polling for it independently would just be a slower way to
+    // notice the same rollout the checksum annotation already rolls on.
+    // `fresh_for` is the one place the digest+profile match happens
+    // (`context::build_document` calls the same function).
+    let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
+    let source_check =
+        crate::manifest::SourceCheckRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
+            .as_ref()
+            .map(crate::context::SourceCheck::from);
+    // Issue #6/#10: same fresh_for gate, same reason, sibling file — see
+    // `source_check` immediately above.
+    let source_descriptions: indexmap::IndexMap<String, indexmap::IndexMap<String, String>> =
+        crate::manifest::SourceDescriptionsRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
+            .map(|r| r.sources.into_iter().collect())
+            .unwrap_or_default();
+    // H3: precomputed once here, from the exact two values above — never
+    // recomputed on the request path, same discipline as `docs_bundle_sha12`.
+    let observed_bundle_sha12 = observed_bundle_sha12(source_check.as_ref(), &source_descriptions);
+
     let state = Arc::new(AppState {
         // Under --no-data the OpenAPI paths are empty: the spec describes
         // the callable HTTP surface, and the data routes are not mounted.
@@ -328,7 +398,7 @@ fn build_state(
         ),
         cell_name: cell.def.cell.clone(),
         routes,
-        never_backed_routes,
+        bound_routes,
         published,
         shareable: cell.def.access.shareable,
         allowed_roles: cell.def.access.roles.clone(),
@@ -345,12 +415,17 @@ fn build_state(
         data_as_of: Mutex::new(data_as_of),
         route_list: mounted,
         data_mounted,
+        served_here,
+        is_all_never,
         channels: cell.channels.clone(),
         probes: Mutex::new(probes),
         upstream_refs,
         docs_pages,
         docs_fingerprints,
         docs_bundle_sha12,
+        source_check,
+        source_descriptions,
+        observed_bundle_sha12,
         cell: Mutex::new(cell),
     });
     Ok((state, store))
@@ -370,6 +445,32 @@ fn docs_bundle_sha12(pages: &[crate::config::docs::DocsPage]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     crate::context::sha256_hex(joined.as_bytes())[..12].to_string()
+}
+
+/// The `observed`-variant `ETag` suffix (issue #16 H3): a short hash over
+/// the two observed inputs that are fixed at startup but arrive via a
+/// rollout with `cell.yaml` byte-identical — `source_check.checked_at` and
+/// `source_descriptions` — same idiom as `docs_bundle_sha12` (truncated
+/// sha256, precomputed at startup, never on the request path). `None` when
+/// neither observed input is present at all, so a cell with no live-verify
+/// record keeps the exact byte-identical default `ETag` it always had —
+/// this only ever adds a suffix where there is something new to invalidate
+/// a cache over.
+fn observed_bundle_sha12(
+    source_check: Option<&crate::context::SourceCheck>,
+    source_descriptions: &indexmap::IndexMap<String, indexmap::IndexMap<String, String>>,
+) -> Option<String> {
+    if source_check.is_none() && source_descriptions.is_empty() {
+        return None;
+    }
+    let checked_at = source_check.map(|sc| sc.checked_at.as_str()).unwrap_or("");
+    // `source_descriptions` is deterministic within one process's lifetime
+    // (built once, at startup, from a `BTreeMap`-sorted record) — good
+    // enough for a cache-invalidation hash, which only needs to change when
+    // the content genuinely does, not to be canonical across processes.
+    let descriptions_json = serde_json::to_string(source_descriptions).unwrap_or_default();
+    let joined = format!("{checked_at}|{descriptions_json}");
+    Some(crate::context::sha256_hex(joined.as_bytes())[..12].to_string())
 }
 
 /// The swap-time probe (ADR 0012 §5): per export, the row count, min/max of
@@ -778,15 +879,25 @@ async fn context_doc(
     let want_docs = sections.iter().any(|s| s == "docs");
 
     // The interface digest names the interface; the ETag names a
-    // representation of it (ADR 0013 §6) — the default variant's ETag stays
-    // byte-identical to today (mesh.rs copies it verbatim into
-    // `context_digest`), and the docs variant appends a suffix over the
-    // *content* bundle, precomputed at startup, never on the request path.
-    let etag = if want_docs {
-        format!("\"{}~docs.{}\"", s.digest, s.docs_bundle_sha12)
-    } else {
-        format!("\"{}\"", s.digest)
-    };
+    // representation of it (ADR 0013 §6) — both suffixes are precomputed at
+    // startup, never on the request path, and layer independently:
+    // `~observed.<hash>` (H3) folds in `source_check`/`source_descriptions`
+    // — startup-fixed facts that can newly appear across a rollout with
+    // `cell.yaml` byte-identical, which `interface_digest` alone would miss
+    // entirely (declared/data only, ADR 0012 §2) — and is present on every
+    // variant, default included, whenever there's an observed input to
+    // cover; `~docs.<bundle sha>` (ADR 0013 §6) adds the docs-content
+    // bundle only for `?include=docs`. A cell with neither observed input
+    // present keeps the exact byte-identical default ETag it always had
+    // (mesh.rs copies this verbatim into `context_digest`).
+    let mut etag = format!("\"{}", s.digest);
+    if let Some(obs) = &s.observed_bundle_sha12 {
+        etag.push_str(&format!("~observed.{obs}"));
+    }
+    if want_docs {
+        etag.push_str(&format!("~docs.{}", s.docs_bundle_sha12));
+    }
+    etag.push('"');
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -853,30 +964,47 @@ async fn context_doc(
         .unwrap_or_default();
 
     let probes = s.probes.lock().expect("probes mutex poisoned").clone();
-    let mut doc = crate::context::assemble(
-        s.cell_name.clone(),
-        s.declared.clone(),
+    let mut doc = crate::context::assemble(crate::context::Facts {
+        cell: s.cell_name.clone(),
+        declared: s.declared.clone(),
         provenance,
-        // Issue #6: `observed.source_check` is wired for the portable
-        // `datamk verify` -> `datamk context` CI path only in this slice —
-        // the Server stays credential-light and never performs a live
-        // warehouse check itself (Q1's whole point). Reading a persisted
-        // `.cell/source_check.json` here to surface it on the hosted
-        // `/context` too is a reasonable follow-up, deliberately deferred.
-        /* source_check */
-        None,
+        // Issue #16: the record `datamk verify` persisted, read once at
+        // startup (`build_state`) — not a live warehouse check performed by
+        // `serve` itself, which stays credential-light exactly as issue #6
+        // Q1 decided. This closes the gap where an all-`never` cell's
+        // hosted `/context` was permanently `draft` even though `datamk
+        // context` reported `verified_at_source` from the same record, at
+        // the same moment, in the same directory.
+        source_check: s.source_check.clone(),
         freshness,
         upstreams,
         probes,
-        s.docs_fingerprints.clone(),
-        /* served_here */ s.data_mounted,
-        s.channels.clone(),
-        s.direct_attach,
-    );
+        docs_fingerprints: s.docs_fingerprints.clone(),
+        source_descriptions: s.source_descriptions.clone(),
+        served_here: s.served_here,
+        channels: s.channels.clone(),
+        direct_attach: s.direct_attach,
+        is_all_never: s.is_all_never,
+    });
     if !s.data_mounted {
         // The same engine-emitted sentence the unmounted routes' 404 body
         // carries (ADR 0012 §4).
         doc.notes.push(crate::context::NOTE_NO_DATA.to_string());
+    } else if !s.served_here && !s.routes.is_empty() {
+        // issue #17: `data_mounted` is true (no `--no-data`) but nothing is
+        // mounted anyway. `mounted` (issue #6) is `s.routes` filtered to
+        // non-bound exports, so `mounted.is_empty()` while `s.routes` is
+        // non-empty can only mean every discoverable export is bound —
+        // that inference only actually holds when `s.routes` itself is
+        // non-empty (M2): a cell with zero *discoverable* exports at all
+        // (every one `visibility: private`, materializing or not) also
+        // reaches `!served_here` with nothing bound anywhere, and the note
+        // below would be a false claim about that cell's exports. Distinct
+        // from `NOTE_NO_DATA`: this names the cell's own definition as the
+        // reason, not an operator flag the reader could change with a
+        // deploy argument.
+        doc.notes
+            .push(crate::context::NOTE_NO_ROUTES_MOUNTED.to_string());
     }
     if want_docs {
         // `200`, empty pages when the cell declares none — not an error;
@@ -983,15 +1111,15 @@ async fn serve_export_inner(
     };
 
     // issue #6: this export exists and is declared (it's in `s.routes`), but
-    // its transform is `materialize: never` — no lake table backs it, so
-    // there is no data route to serve. Runs post-`authorize()` (the caller
+    // it's bound, not materialized — no lake table backs it, so there is no
+    // data route to serve. Runs post-`authorize()` (the caller
     // of this function already checked): a pre-auth 404 here, unlike the
     // cell-wide --no-data check above, would let an unauthenticated caller
     // enumerate which exports are virtual one route at a time.
-    if s.never_backed_routes.contains(&route) {
+    if s.bound_routes.contains(&route) {
         return (
             StatusCode::NOT_FOUND,
-            crate::context::note_never_backed(&route),
+            crate::context::note_bound_export(&route),
         )
             .into_response();
     }
@@ -1185,6 +1313,7 @@ mod tests {
             name: "orders_daily".to_string(),
             version: "2.1.0".to_string(),
             source: Some("orders_daily".to_string()),
+            bind: None,
             description: None,
             docs: None,
             grain: vec!["order_date".to_string(), "region".to_string()],
@@ -1518,10 +1647,10 @@ mod smoke {
     /// (how the auth tests flip `shareable`/`roles` without a second cell).
     fn router_mode(no_data: bool, mutate: impl FnOnce(&mut engine::Cell)) -> Router {
         let scaffold = built_cell();
-        let mut cell = engine::open(&scaffold.dir.join("cell.yaml"), "local", true)
-            .expect("open built cell read-only");
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell = engine::open(&cell_yaml, "local", true).expect("open built cell read-only");
         mutate(&mut cell);
-        let (state, _store) = build_state(cell, no_data).expect("build state");
+        let (state, _store) = build_state(cell, no_data, &cell_yaml, "local").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -1530,8 +1659,8 @@ mod smoke {
     }
 
     /// A MIXED cell (issue #6): one materializing export (`stg`) and one
-    /// `materialize: never` export (`virtual_pii`) — the shape "described,
-    /// not routed" is built to test against, not simulated. Built once
+    /// bound export (`virtual_pii`) — the shape "described, not routed" is
+    /// built to test against, not simulated. Built once
     /// (`engine::run`), same discipline as `built_cell()`.
     fn built_never_cell() -> &'static Scaffold {
         use std::sync::OnceLock;
@@ -1552,8 +1681,6 @@ mod smoke {
                 "cell: virtual_smoke\n\
                  transforms:\n\
                  \x20 - sql/stg.sql\n\
-                 \x20 - sql: sql/virtual_pii.sql\n\
-                 \x20   materialize: never\n\
                  interface:\n\
                  \x20 - name: stg\n\
                  \x20   version: 1.0.0\n\
@@ -1567,8 +1694,11 @@ mod smoke {
                  \x20   description: PII rows datamk verifies but never stores.\n\
                  \x20   grain: [id]\n\
                  \x20   schema:\n\
-                 \x20     id: integer\n\
+                 \x20     id: bigint\n\
                  \x20     val: string\n\
+                 \x20   bind: raw\n\
+                 sources:\n\
+                 \x20 raw: ./data.csv\n\
                  access:\n\
                  \x20 shareable: true\n",
             )
@@ -1578,7 +1708,7 @@ mod smoke {
                 "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, val)",
             )
             .unwrap();
-            std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM stg").unwrap();
+            std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
             std::fs::write(
                 dir.join("profiles/local.yaml"),
                 "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
@@ -1590,17 +1720,230 @@ mod smoke {
                 None,
                 crate::engine::RunOptions::default(),
             )
-            .expect("build the mixed (materializing + never) scaffold cell");
+            .expect("build the mixed (materializing + bound) scaffold cell");
             Scaffold { dir }
         })
     }
 
     fn never_router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
         let scaffold = built_never_cell();
-        let mut cell = engine::open(&scaffold.dir.join("cell.yaml"), "local", true)
-            .expect("open built never-cell read-only");
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell =
+            engine::open(&cell_yaml, "local", true).expect("open built never-cell read-only");
         mutate(&mut cell);
-        let (state, _store) = build_state(cell, /* no_data */ false).expect("build state");
+        let (state, _store) =
+            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    /// An ALL-BOUND cell (issue #6, issue #17): every export is bound, so
+    /// `mounted` is empty regardless of `--no-data`. No `engine::run` here,
+    /// unlike `built_never_cell` — `run` refuses to build a cell with no
+    /// materializing transforms (no snapshot to commit); `engine::open`
+    /// tolerates the missing/never-published catalog for exactly this cell
+    /// class, so opening it read-only is enough to serve it.
+    fn built_all_never_cell() -> &'static Scaffold {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Scaffold> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-all-never-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sql")).unwrap();
+            std::fs::create_dir_all(dir.join("profiles")).unwrap();
+            std::fs::write(
+                dir.join("cell.yaml"),
+                "cell: virtual_only_smoke\n\
+                 interface:\n\
+                 \x20 - name: virtual_pii\n\
+                 \x20   version: 1.0.0\n\
+                 \x20   description: PII rows datamk verifies but never stores.\n\
+                 \x20   grain: [id]\n\
+                 \x20   schema:\n\
+                 \x20     id: bigint\n\
+                 \x20     val: string\n\
+                 \x20   bind: raw\n\
+                 sources:\n\
+                 \x20 raw: ./data.csv\n\
+                 access:\n\
+                 \x20 shareable: true\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
+            std::fs::write(
+                dir.join("profiles/local.yaml"),
+                "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+            )
+            .unwrap();
+            Scaffold { dir }
+        })
+    }
+
+    /// The same all-`never` shape as `built_all_never_cell`, but with
+    /// `datamk verify` actually run once at fixture-build time — so
+    /// `.cell/source_check.json` exists and is fresh (issue #16). A
+    /// separate fixture, not a mutation of `built_all_never_cell`: that one
+    /// is relied on elsewhere (issue #17's tests, `two_doors`'s own
+    /// draft-case test) to stay in the unverified, `draft` state.
+    fn built_all_never_cell_verified() -> &'static Scaffold {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Scaffold> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-all-never-verified-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sql")).unwrap();
+            std::fs::create_dir_all(dir.join("profiles")).unwrap();
+            std::fs::write(
+                dir.join("cell.yaml"),
+                "cell: virtual_verified_smoke\n\
+                 interface:\n\
+                 \x20 - name: virtual_pii\n\
+                 \x20   version: 1.0.0\n\
+                 \x20   description: PII rows datamk verifies but never stores.\n\
+                 \x20   grain: [id]\n\
+                 \x20   schema:\n\
+                 \x20     id: bigint\n\
+                 \x20     val: string\n\
+                 \x20   bind: raw\n\
+                 sources:\n\
+                 \x20 raw: ./data.csv\n\
+                 access:\n\
+                 \x20 shareable: true\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
+            std::fs::write(
+                dir.join("profiles/local.yaml"),
+                "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+            )
+            .unwrap();
+            crate::verify::run(&dir.join("cell.yaml"), "local")
+                .expect("live-verify the all-bound scaffold, writing .cell/source_check.json");
+            Scaffold { dir }
+        })
+    }
+
+    fn all_never_router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        let scaffold = built_all_never_cell();
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell =
+            engine::open(&cell_yaml, "local", true).expect("open built all-never cell read-only");
+        mutate(&mut cell);
+        let (state, _store) =
+            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    fn all_never_verified_router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        let scaffold = built_all_never_cell_verified();
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell = engine::open(&cell_yaml, "local", true)
+            .expect("open built all-never-verified cell read-only");
+        mutate(&mut cell);
+        let (state, _store) =
+            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    /// The same scaffold as `built_all_never_cell_verified`, plus a
+    /// `.cell/source_descriptions.json` (issue #6/#10) written directly via
+    /// `SourceDescriptionsRecord::write` rather than a live BigQuery round
+    /// trip — this fixture's `bind: raw` source is a local CSV, which never
+    /// populates `SourceWarehouseColumns` (only a BigQuery `Connection`
+    /// source's classify job does), so there is no credential-free way to
+    /// produce this file through the real bind path. What's under test here
+    /// is not the BigQuery metadata job (already pinned in
+    /// `bigquery.rs`'s own unit tests) but the loading/serving wiring: both
+    /// doors reading the same file through the same `fresh_for` gate and
+    /// agreeing on `observed.source_descriptions`.
+    fn built_all_never_cell_with_descriptions() -> &'static Scaffold {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Scaffold> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-all-never-descriptions-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sql")).unwrap();
+            std::fs::create_dir_all(dir.join("profiles")).unwrap();
+            let cell_yaml = dir.join("cell.yaml");
+            std::fs::write(
+                &cell_yaml,
+                "cell: virtual_descriptions_smoke\n\
+                 interface:\n\
+                 \x20 - name: virtual_pii\n\
+                 \x20   version: 1.0.0\n\
+                 \x20   description: PII rows datamk verifies but never stores.\n\
+                 \x20   grain: [id]\n\
+                 \x20   schema:\n\
+                 \x20     id: bigint\n\
+                 \x20     val: string\n\
+                 \x20   bind: raw\n\
+                 sources:\n\
+                 \x20 raw: ./data.csv\n\
+                 access:\n\
+                 \x20 shareable: true\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("data.csv"), "id,val\n1,a\n2,b\n").unwrap();
+            std::fs::write(
+                dir.join("profiles/local.yaml"),
+                "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+            )
+            .unwrap();
+            crate::verify::run(&cell_yaml, "local")
+                .expect("live-verify the all-bound scaffold, writing .cell/source_check.json");
+
+            let cell_yaml_digest = crate::context::cell_yaml_digest_of(&cell_yaml).unwrap();
+            let mut warehouse_columns = std::collections::HashMap::new();
+            warehouse_columns.insert(
+                "raw".to_string(),
+                crate::engine::SourceWarehouseColumns {
+                    connector: "bigquery",
+                    columns: indexmap::IndexMap::new(),
+                    descriptions: indexmap::IndexMap::from([(
+                        "val".to_string(),
+                        "The upstream value column, verbatim from the source system.".to_string(),
+                    )]),
+                },
+            );
+            let def = crate::config::CellDef::load(&cell_yaml).unwrap();
+            crate::manifest::SourceDescriptionsRecord::write(
+                &dir,
+                &cell_yaml_digest,
+                "local",
+                &def,
+                &warehouse_columns,
+            )
+            .expect("write .cell/source_descriptions.json");
+
+            Scaffold { dir }
+        })
+    }
+
+    fn all_never_with_descriptions_router_with(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        let scaffold = built_all_never_cell_with_descriptions();
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell = engine::open(&cell_yaml, "local", true)
+            .expect("open built all-never-with-descriptions cell read-only");
+        mutate(&mut cell);
+        let (state, _store) =
+            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -1883,8 +2226,12 @@ mod smoke {
                 v["data"]["channels"],
                 serde_json::json!(["warehouse: analytics.orders_daily"])
             );
-            // The query block describes HTTP affordances that don't exist here.
-            assert!(v["declared"]["exports"][0].get("query").is_none(), "{body}");
+            // ADR 0012 §2 (amended): `query` is unconditional interface
+            // grammar, not a claim about whether this surface currently
+            // mounts the route — that claim is `data.served_here` (asserted
+            // above) and the route's own 404, not a second, digest-moving
+            // copy of the same fact.
+            assert!(v["declared"]["exports"][0]["query"].is_object(), "{body}");
             let probe = &v["observed"]["exports"]["orders_daily@2"];
             // Value lists are row-derived data — withheld. Coverage stays:
             // an aggregate that names no entity.
@@ -1915,6 +2262,32 @@ mod smoke {
         });
     }
 
+    /// ADR 0012 §2 (amended, commit 4): `query` is interface grammar, not
+    /// mount state — identical whether or not `--no-data` was passed, for
+    /// the same cell content. `data.served_here` legitimately still differs
+    /// (it's the one honest "mounted here" fact, and `data` has always been
+    /// part of `interface_digest` — `channels` too); what's fixed is that
+    /// `query` no longer duplicates that fact a second, digest-moving way.
+    #[test]
+    fn query_grammar_is_stable_across_the_no_data_flag() {
+        let with_data = router_mode(false, |_| {});
+        let without_data = router_mode(true, |_| {});
+        rt().block_on(async {
+            let (_, body_a) = get(&with_data, "/context", None).await;
+            let (_, body_b) = get(&without_data, "/context", None).await;
+            let a: serde_json::Value = serde_json::from_str(&body_a).unwrap();
+            let b: serde_json::Value = serde_json::from_str(&body_b).unwrap();
+            // The fact that changed with the flag: still does.
+            assert_ne!(a["data"]["served_here"], b["data"]["served_here"]);
+            // The fact that must NOT change with the flag anymore: doesn't.
+            assert!(a["declared"]["exports"][0]["query"].is_object(), "{body_a}");
+            assert_eq!(
+                a["declared"]["exports"][0]["query"], b["declared"]["exports"][0]["query"],
+                "query must not depend on --no-data: {body_a} / {body_b}"
+            );
+        });
+    }
+
     #[test]
     fn role_gated_cell_requires_a_known_token_with_the_role() {
         let scaffold = built_cell();
@@ -1940,7 +2313,7 @@ mod smoke {
         });
     }
 
-    // --- issue #6: `materialize: never` — described, not routed ------------
+    // --- issue #6: bound exports — described, not routed --------------------
 
     #[test]
     fn never_backed_export_is_declared_with_null_query_and_absent_from_openapi() {
@@ -1998,7 +2371,7 @@ mod smoke {
             let (status, body) = get(&router, "/virtual_pii@1", None).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
             assert!(body.contains("virtual_pii@1"), "{body}");
-            assert!(body.contains("materialize: never"), "{body}");
+            assert!(body.contains("is `bind`ed to an existing object"), "{body}");
             assert!(body.contains("data.channels"), "{body}");
 
             // The materializing sibling export still serves rows normally.
@@ -2028,14 +2401,146 @@ mod smoke {
             let (status, body) = get(&router, "/virtual_pii@1", None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
             assert!(
-                !body.contains("materialize: never"),
+                !body.contains("is `bind`ed to an existing object"),
                 "an unauthenticated caller must not learn this export is virtual: {body}"
             );
 
             // A correctly-authorized caller reaches the never-backed 404.
             let (status, body) = get(&router, "/virtual_pii@1", Some("good")).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-            assert!(body.contains("materialize: never"), "{body}");
+            assert!(body.contains("is `bind`ed to an existing object"), "{body}");
+        });
+    }
+
+    /// issue #17: an ALL-`never` cell served WITHOUT `--no-data` still
+    /// reports `served_here: false` and explains why with a definitional
+    /// note (not the flag-derived `NOTE_NO_DATA`, since the operator never
+    /// passed a flag here) — the exact reproduction from the filed issue.
+    #[test]
+    fn all_never_cell_served_here_is_false_without_no_data_flag() {
+        let router = all_never_router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["data"]["served_here"], false, "{body}");
+            let notes = v["notes"].as_array().unwrap();
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.as_str() == Some(crate::context::NOTE_NO_ROUTES_MOUNTED)),
+                "expected the definitional note: {body}"
+            );
+            assert!(
+                !notes
+                    .iter()
+                    .any(|n| n.as_str() == Some(crate::context::NOTE_NO_DATA)),
+                "NOTE_NO_DATA is flag-derived and must not fire when --no-data was never \
+                 passed: {body}"
+            );
+
+            // The data route itself already 404s (unchanged, issue #6's
+            // `bound_routes` gate) — `/openapi.json` must agree that
+            // no data path is mounted.
+            let (status, body) = get(&router, "/openapi.json", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let paths = v["paths"].as_object().unwrap();
+            assert!(paths.contains_key("/"), "{body}");
+            assert!(paths.contains_key("/context"), "{body}");
+            assert!(paths.contains_key("/openapi.json"), "{body}");
+            assert!(!paths.contains_key("/virtual_pii@1"), "{body}");
+        });
+    }
+
+    /// issue #16: the exact filed reproduction. A `datamk verify` that
+    /// live-checks an all-`never` cell (writing `.cell/source_check.json`)
+    /// must make the **hosted** `/context` report `verified_at_source` too
+    /// — not just the portable `datamk context` — since a virtual cell has
+    /// no `run` and therefore no other way to ever leave `draft`.
+    #[test]
+    fn all_never_cell_reports_verified_at_source_on_the_hosted_door_after_verify() {
+        let router = all_never_verified_router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["status"], "verified_at_source", "{body}");
+            assert_eq!(v["grain_verified"], true, "{body}");
+            assert_eq!(v["observed"]["source_check"]["outcome"], "passed", "{body}");
+            assert!(
+                v["observed"]["source_check"]["checked_at"].is_string(),
+                "{body}"
+            );
+            // The profile never rides the wire (it's a gate, not a fact).
+            assert!(
+                v["observed"]["source_check"].get("profile").is_none(),
+                "{body}"
+            );
+            // The draft-only notes (NOTE_DIRECT_ATTACH/NOTE_VIRTUAL_CELL/
+            // NOTE_NOTHING_BUILT) are gone now that status isn't Draft — but
+            // NOTE_NO_ROUTES_MOUNTED (issue #17) is not a draft note, it's a
+            // structural serving fact independent of status, and stays true
+            // regardless of how verified this document is.
+            let notes = v["notes"].as_array().unwrap();
+            assert_eq!(notes.len(), 1, "{body}");
+            assert_eq!(notes[0], crate::context::NOTE_NO_ROUTES_MOUNTED, "{body}");
+        });
+    }
+
+    /// M2: `NOTE_NO_ROUTES_MOUNTED`'s wording asserts a specific cause
+    /// ("every export is bound directly to an existing object") — a cell
+    /// with zero *discoverable* exports at all (every one `visibility:
+    /// private`) also reaches `!served_here` with nothing mounted, with
+    /// nothing bound anywhere. The note must not fire and misdescribe such
+    /// a cell as bound.
+    #[test]
+    fn no_routes_mounted_note_does_not_fire_for_an_all_private_cell() {
+        let router = router_with(|cell| {
+            cell.def.interface[0].visibility = crate::config::Visibility::Private;
+        });
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["data"]["served_here"], false, "{body}");
+            let notes = v["notes"].as_array().unwrap();
+            assert!(
+                !notes
+                    .iter()
+                    .any(|n| n.as_str() == Some(crate::context::NOTE_NO_ROUTES_MOUNTED)),
+                "an all-private cell has no bound export to describe — the note must \
+                 not fire: {body}"
+            );
+        });
+    }
+
+    /// issue #16's fail-closed gate, end to end: a record written under one
+    /// profile must not validate a different one, even with a matching
+    /// `cell.yaml` digest and the same directory.
+    #[test]
+    fn source_check_from_a_different_profile_is_not_honored() {
+        let scaffold = built_all_never_cell_verified();
+        std::fs::write(
+            scaffold.dir.join("profiles/other.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let cell = engine::open(&cell_yaml, "other", true)
+            .expect("open the same scaffold under a different profile");
+        let (state, _store) =
+            build_state(cell, /* no_data */ false, &cell_yaml, "other").expect("build state");
+        let router = app(state, DEFAULT_MAX_CONCURRENCY);
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["status"], "draft",
+                "a record verified under 'local' must not validate 'other': {body}"
+            );
+            assert!(v["observed"].is_null(), "{body}");
         });
     }
 
@@ -2113,10 +2618,11 @@ mod smoke {
 
     fn router_docs(no_data: bool, mutate: impl FnOnce(&mut engine::Cell)) -> Router {
         let scaffold = built_cell_with_docs();
-        let mut cell = engine::open(&scaffold.dir.join("cell.yaml"), "local", true)
-            .expect("open docs scaffold read-only");
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell =
+            engine::open(&cell_yaml, "local", true).expect("open docs scaffold read-only");
         mutate(&mut cell);
-        let (state, _store) = build_state(cell, no_data).expect("build state");
+        let (state, _store) = build_state(cell, no_data, &cell_yaml, "local").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -2242,6 +2748,81 @@ mod smoke {
         });
     }
 
+    /// H3: a cell with a live-verify record folds `~observed.<hash>` into
+    /// the default `ETag` too, not just the docs variant — otherwise
+    /// `interface_digest` (declared/data only) stays byte-identical across
+    /// the rollout that first ships `source_check`/`source_descriptions`
+    /// (`cell.yaml` is unchanged), and a caching client's `If-None-Match`
+    /// would 304 straight past `status: verified_at_source` ever appearing.
+    /// A cell with no observed input at all (`router_with`, no live-verify
+    /// record) keeps the exact byte-identical plain digest as its ETag —
+    /// the common case must not pay a suffix it has nothing to invalidate.
+    #[test]
+    fn observed_inputs_fold_into_the_default_etag_and_still_304_correctly() {
+        let plain_router = router_with(|_| {});
+        let verified_router = all_never_verified_router_with(|_| {});
+        rt().block_on(async {
+            let (status, headers, body) = get_with_headers(&plain_router, "/context", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let plain_etag = headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                !plain_etag.contains("~observed."),
+                "a cell with no live-verify record must keep its byte-identical \
+                 default ETag: {plain_etag}"
+            );
+
+            let (status, headers, body) = get_with_headers(&verified_router, "/context", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let observed_etag = headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                observed_etag.contains("~observed."),
+                "a cell with a live-verify record must fold it into the default \
+                 ETag: {observed_etag}"
+            );
+
+            // Round-trips to a real 304 on a match...
+            let (status, _, _) = get_with_headers(
+                &verified_router,
+                "/context",
+                &[("if-none-match", &observed_etag)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED);
+
+            // ...and — the actual regression — a client holding only the
+            // bare `interface_digest` as its cached ETag (what every prior
+            // rollout would have handed it) must NOT 304-match once this
+            // cell has a live-verify record: it would otherwise never learn
+            // `status` moved to `verified_at_source`.
+            let bare_digest_etag = format!(
+                "\"{}\"",
+                observed_etag.trim_matches('"').split('~').next().unwrap()
+            );
+            assert_ne!(bare_digest_etag, observed_etag);
+            let (status, _, _) = get_with_headers(
+                &verified_router,
+                "/context",
+                &[("if-none-match", &bare_digest_etag)],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a stale, observed-unaware cached ETag must never 304-match"
+            );
+        });
+    }
+
     /// `?include=docs` on a cell with no `docs:` fields at all is a normal
     /// 200 with an empty pages map — not an error.
     #[test]
@@ -2306,5 +2887,207 @@ mod smoke {
                 "{body}"
             );
         });
+    }
+
+    /// The two-doors regression (ADR 0012 §4): `datamk context`
+    /// (`context::build_document`) and hosted `GET /context` are two doors
+    /// onto the same cell — every divergence between them that isn't
+    /// explicitly documented here is a bug, not a feature. Compares the two
+    /// **live-computed** documents against each other on real fixtures,
+    /// never against a frozen golden string: an additive, shape-preserving
+    /// change to either representation survives this test as long as both
+    /// doors change together; a real divergence (like issue #16/#17 before
+    /// they landed) fails it.
+    mod two_doors {
+        use super::*;
+
+        /// The hosted door: `GET /context`, optionally requesting the docs
+        /// variant — the exact router `serve` binds, no shortcuts.
+        async fn hosted_doc(router: &Router, include_docs: bool) -> serde_json::Value {
+            let uri = if include_docs {
+                "/context?include=docs"
+            } else {
+                "/context"
+            };
+            let (status, body) = get(router, uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            serde_json::from_str(&body).unwrap()
+        }
+
+        /// The portable door: `context::build_document` against the exact
+        /// same scaffold directory the router was built from — the same
+        /// entry point `datamk context` calls, minus the stdout/`--out`
+        /// choice `emit` layers on top (commit 5's extraction).
+        fn portable_doc(scaffold: &Scaffold, no_docs: bool) -> serde_json::Value {
+            let doc =
+                crate::context::build_document(&scaffold.dir.join("cell.yaml"), "local", no_docs)
+                    .expect("build_document");
+            serde_json::to_value(&doc).unwrap()
+        }
+
+        /// Assert the two documents agree on everything **except** the
+        /// asymmetries this ADR documents as permanent, not as gaps to
+        /// close — asserting each one's documented shape *before* removing
+        /// it, so a change to which fields are asymmetric is itself a
+        /// visible test failure, not a silent pass:
+        ///
+        /// - `emitted_at` / `cell_yaml_digest`: portable-only (ADR 0012 §4)
+        ///   — a hosted response is always "now," a file is not.
+        /// - `data.served_here`: portable is unconditionally `false` (a
+        ///   file serves no rows, by definition); hosted's real value is
+        ///   `serve`'s own concern (issue #17's tests), not re-litigated
+        ///   here.
+        /// - `observed.exports` (swap-time probes): portable never runs
+        ///   them — `build_document` calls `config::load`, never
+        ///   `engine::open`, so there is no DuckDB connection to probe with.
+        ///   Found by this test: stripping `exports` alone left hosted's
+        ///   `observed` as `{"provenance": null}` (a present-but-empty
+        ///   object — `Observed.provenance` has no `skip_serializing_if`,
+        ///   ADR 0012 §5's "always show provenance, never omit it") against
+        ///   portable's `observed: null` — a real shape difference that is
+        ///   an artifact of comparison (probes are the only thing that made
+        ///   `observed` non-`None` on either side here), not a bug in
+        ///   either door, so both are collapsed to `null` together when
+        ///   nothing but `null`s remains.
+        /// - `observed.freshness`: portable never carries poll telemetry
+        ///   (a lie the instant the file is written); on these fixtures
+        ///   (none published-mode) hosted has none either, but the check
+        ///   stays generic rather than assuming that forever.
+        /// - `notes`: hosted alone can carry `NOTE_NO_ROUTES_MOUNTED`
+        ///   (issue #17) — found by this test on the all-`never` fixture.
+        ///   Portable has no analogous note because it never claims
+        ///   `served_here: true` in the first place (unconditionally
+        ///   `false`), so there is no "routes should be here but aren't" to
+        ///   explain; only a *server* that could have mounted routes and
+        ///   didn't needs the sentence.
+        ///
+        /// Everything else — `status`, `grain_verified`, `declared`
+        /// (including `query`, unconditional since commit 4),
+        /// `observed.provenance`/`source_check`, every other note,
+        /// `included`/`docs` — is compared with full equality.
+        ///
+        /// `observed.source_check` populated (issue #16) IS covered —
+        /// `virtual_cell_with_source_check_agrees_across_both_doors`, below
+        /// — now that `serve`'s startup load makes both doors read the same
+        /// `.cell/source_check.json` through the same `fresh_for` gate.
+        fn assert_agree_modulo_documented_asymmetries(
+            mut portable: serde_json::Value,
+            mut hosted: serde_json::Value,
+        ) {
+            assert!(portable["emitted_at"].is_string(), "{portable}");
+            assert!(hosted.get("emitted_at").is_none(), "{hosted}");
+            assert!(portable["cell_yaml_digest"].is_string(), "{portable}");
+            assert!(hosted.get("cell_yaml_digest").is_none(), "{hosted}");
+            assert_eq!(portable["data"]["served_here"], false, "{portable}");
+            assert!(
+                portable["observed"]["exports"]
+                    .as_object()
+                    .is_none_or(|m| m.is_empty()),
+                "{portable}"
+            );
+            assert!(portable["observed"]["freshness"].is_null(), "{portable}");
+            assert!(
+                hosted["observed"]["freshness"].is_null(),
+                "none of this test's fixtures are published-mode, so hosted should have no \
+                 freshness block either — if this fires, add a real asymmetry check instead of \
+                 stripping blind: {hosted}"
+            );
+            assert!(
+                !portable["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.as_str() == Some(crate::context::NOTE_NO_ROUTES_MOUNTED)),
+                "portable must never carry the routes-unmounted note — it never claims \
+                 served_here: true to begin with: {portable}"
+            );
+
+            for doc in [&mut portable, &mut hosted] {
+                let obj = doc.as_object_mut().expect("document is a JSON object");
+                obj.remove("emitted_at");
+                obj.remove("cell_yaml_digest");
+                if let Some(data) = obj.get_mut("data").and_then(|d| d.as_object_mut()) {
+                    data.remove("served_here");
+                }
+                if let Some(observed) = obj.get_mut("observed").and_then(|o| o.as_object_mut()) {
+                    observed.remove("exports");
+                    observed.remove("freshness");
+                    // Collapse to the portable shape (`null`) when nothing
+                    // but always-serialized `null`s remains — see the
+                    // `observed.exports` doc note above.
+                    if observed.values().all(serde_json::Value::is_null) {
+                        obj.insert("observed".to_string(), serde_json::Value::Null);
+                    }
+                }
+                if let Some(notes) = obj.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    notes.retain(|n| n.as_str() != Some(crate::context::NOTE_NO_ROUTES_MOUNTED));
+                }
+            }
+
+            assert_eq!(
+                portable, hosted,
+                "the two doors disagree outside the documented asymmetries"
+            );
+        }
+
+        /// Runs both inclusion variants (default / `?include=docs`) for one
+        /// scaffold + router pair — like-for-like: portable's `no_docs` is
+        /// the inverse of whether docs were requested, so "default" compares
+        /// against "default" and "with docs" against "with docs," never
+        /// portable's default (inline) against hosted's default (omit),
+        /// which differ by ADR 0013 §7 design and would be a false failure.
+        fn check_both_doors(scaffold: &'static Scaffold, router: Router) {
+            rt().block_on(async {
+                for include_docs in [false, true] {
+                    let portable = portable_doc(scaffold, /* no_docs */ !include_docs);
+                    let hosted = hosted_doc(&router, include_docs).await;
+                    assert_agree_modulo_documented_asymmetries(portable, hosted);
+                }
+            });
+        }
+
+        #[test]
+        fn materializing_cell_agrees_across_both_doors() {
+            check_both_doors(built_cell(), router_with(|_| {}));
+        }
+
+        #[test]
+        fn mixed_never_cell_agrees_across_both_doors() {
+            check_both_doors(built_never_cell(), never_router_with(|_| {}));
+        }
+
+        #[test]
+        fn all_never_cell_agrees_across_both_doors() {
+            check_both_doors(built_all_never_cell(), all_never_router_with(|_| {}));
+        }
+
+        /// The fixture the previous version of this test's doc comment said
+        /// was missing (issue #16): a live-verified all-`never` cell, where
+        /// `observed.source_check` is actually populated on both doors.
+        /// Both must reach `status: verified_at_source` from the exact same
+        /// `.cell/source_check.json`, gated through the exact same
+        /// `SourceCheckRecord::fresh_for`.
+        #[test]
+        fn virtual_cell_with_source_check_agrees_across_both_doors() {
+            check_both_doors(
+                built_all_never_cell_verified(),
+                all_never_verified_router_with(|_| {}),
+            );
+        }
+
+        /// Issue #6/#10: `observed.source_descriptions`, populated on both
+        /// doors from the exact same `.cell/source_descriptions.json`
+        /// through the exact same `SourceDescriptionsRecord::fresh_for` gate
+        /// `source_check` already proves out above — no asymmetry allowance
+        /// needed, since `assert_agree_modulo_documented_asymmetries` only
+        /// strips fields with a *documented* reason to differ, and there is
+        /// none here.
+        #[test]
+        fn virtual_cell_with_source_descriptions_agrees_across_both_doors() {
+            check_both_doors(
+                built_all_never_cell_with_descriptions(),
+                all_never_with_descriptions_router_with(|_| {}),
+            );
+        }
     }
 }

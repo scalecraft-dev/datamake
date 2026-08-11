@@ -378,6 +378,7 @@ mod tests {
                 name: format!("e{i}"),
                 version: "1.0.0".to_string(),
                 source: None,
+                bind: None,
                 description: None,
                 docs: Some(name),
                 grain: vec![],

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config::{CellDef, MaterializeStrategy, ResolvedTransform};
@@ -51,6 +51,9 @@ pub(crate) fn apply_declarative_grain_inheritance(
         .collect();
 
     for export in &mut def.interface {
+        if export.is_bound() {
+            continue; // bound to a source, not a transform — no key to inherit.
+        }
         let source = export.source_object().to_string();
         let Some(&key) = keys_by_table.get(source.as_str()) else {
             continue; // raw-sourced export — grain unchanged, still required.
@@ -80,21 +83,223 @@ pub(crate) fn apply_declarative_grain_inheritance(
     Ok(())
 }
 
+/// Issue #6, binding model: `materialize: never` is a rejected legacy value
+/// (see `MaterializeStrategy`'s doc comment) — the founder's decision: SQL
+/// datamk itself never runs is a promise nothing keeps, so a virtual export
+/// now binds directly to an existing object (`Export::bind`) instead.
+/// Called from `config::mod::load`, right after `resolve_transforms`, with
+/// the whole `CellDef` in view — so the error can name the affected
+/// export(s), not just the offending transform file. Batches every offender
+/// into ONE error (the first few, plus a count) rather than firing once per
+/// transform and making the author re-run repeatedly to find the next one.
+pub(crate) fn check_no_materialize_never(
+    def: &CellDef,
+    transforms: &[ResolvedTransform],
+    dir: &Path,
+) -> Result<()> {
+    let offenders: Vec<&ResolvedTransform> = transforms
+        .iter()
+        .filter(|t| matches!(t.strategy, MaterializeStrategy::Never))
+        .collect();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+
+    const SHOWN: usize = 3;
+    let lines: Vec<String> = offenders
+        .iter()
+        .take(SHOWN)
+        .map(|t| describe_never_offender(def, t, dir))
+        .collect();
+    let more = offenders.len().saturating_sub(SHOWN);
+    let mut tail = String::new();
+    if more > 0 {
+        tail.push_str(&format!("\n  ...and {more} more."));
+    }
+
+    bail!(
+        "cell '{cell}' declares {n} `materialize: never` transform{s} — this strategy no \
+         longer exists. `materialize: never` promised to serve rows datamk itself never \
+         computed or stored: the SELECT ran nowhere except inside `verify`'s own session for a \
+         few milliseconds, so a derived column, a rename, or a `WHERE` clause was a promise \
+         nothing kept — on a PII surface, silent over-disclosure. A virtual export now binds \
+         directly to an existing object instead (`bind:`, resolved through `sources:`/\
+         `connections:` the same way every other source is) — there is no SQL to run at all.\n\
+         \n\
+         Fix each of the following:\n\
+         {lines}{tail}\n\
+         \n\
+         For each, choose one:\n  \
+         - `materialize: replace` (or `append`/`upsert`) on the transform, so datamk computes \
+         and serves the rows itself; or\n  \
+         - delete the transform and add `bind: <source>` to the export, pointing at an \
+         existing object declared in `sources:` — push any derivation (renames, computed \
+         columns, filters) upstream into that object.",
+        cell = def.cell,
+        n = offenders.len(),
+        s = if offenders.len() == 1 { "" } else { "s" },
+        lines = lines.join("\n"),
+    );
+}
+
+/// One line naming the export(s) a rejected `never` transform backs, and —
+/// best-effort — whether it looks convertible to a binding.
+fn describe_never_offender(def: &CellDef, t: &ResolvedTransform, dir: &Path) -> String {
+    let exports: Vec<&str> = def
+        .interface
+        .iter()
+        .filter(|e| e.source_object() == t.table)
+        .map(|e| e.name.as_str())
+        .collect();
+    let export_desc = if exports.is_empty() {
+        "no export references it".to_string()
+    } else {
+        format!(
+            "export{} {}",
+            if exports.len() == 1 { "" } else { "s" },
+            exports
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let hint = pure_passthrough_hint(def, t, dir)
+        .map(|h| format!(": {h}"))
+        .unwrap_or_default();
+    format!("  - {export_desc} (transform '{}'){hint}", t.sql)
+}
+
+/// Best-effort migration hint: if a rejected `never` transform's SQL is
+/// exactly `SELECT * FROM <source>` for a declared, bindable source, name it
+/// — the customer's own `qfai_customer` shape. Never blocks and never
+/// mis-fires into a wrong exit; it only ever *adds* a sentence. Anything
+/// else (a rename, a derived column, a `WHERE`, a join, an unreadable file,
+/// a `FROM` target that isn't a declared source) gets no hint, not a wrong
+/// one — the two generic exits above still apply.
+fn pure_passthrough_hint(def: &CellDef, t: &ResolvedTransform, dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(dir.join(&t.sql)).ok()?;
+    let trimmed = content.trim().trim_end_matches(';').trim();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.len() != 4
+        || !tokens[0].eq_ignore_ascii_case("select")
+        || tokens[1] != "*"
+        || !tokens[2].eq_ignore_ascii_case("from")
+    {
+        return None;
+    }
+    let ident = tokens[3];
+    let src = def.sources.get(ident)?;
+    if !source_is_bindable(src) {
+        return None;
+    }
+    Some(format!(
+        "looks like a pure passthrough of source '{ident}' — add `bind: {ident}` to the export \
+         and delete this transform"
+    ))
+}
+
+/// Whether a declared source can back a binding (issue #6): a raw file/glob,
+/// or a `connection:` source with `table:` — an existing, named object.
+/// **Not** a `query:`-shaped connection source (ad hoc SQL nobody runs, the
+/// exact failure the binding model replaces) and **not** (yet) a `cell:`
+/// reference to another datamk cell — see `validate_bound_exports`, which
+/// gives each excluded shape its own actionable error; this is the shared
+/// predicate both it and the migration hint above use, so they can never
+/// disagree on what counts as bindable.
+fn source_is_bindable(src: &crate::config::Source) -> bool {
+    matches!(src, crate::config::Source::Raw(_))
+        || matches!(
+            src,
+            crate::config::Source::Connection {
+                table: Some(_),
+                query: None,
+                ..
+            }
+        )
+}
+
+/// Issue #6, binding model: a bound export (`Export::bind`) must name a real
+/// `sources:` entry of a bindable shape, and must not also set `source` (a
+/// bound export has no transform table to override). Pure, offline — a
+/// source's *shape* (raw/cell/connection, table vs query) is contract
+/// (`cell.yaml`), not environment, so no `ResolvedBindings` is needed here.
+pub(crate) fn validate_bound_exports(def: &CellDef) -> Result<()> {
+    for export in &def.interface {
+        let Some(bind) = &export.bind else {
+            continue;
+        };
+        if export.source.is_some() {
+            bail!(
+                "export '{}': sets both `source` and `bind` — a bound export has no transform \
+                 table to override. Remove `source` (or `bind`, if this export really reads a \
+                 transform's table).",
+                export.name
+            );
+        }
+        let Some(src) = def.sources.get(bind) else {
+            bail!(
+                "export '{}': `bind: {bind}` names no declared source — add `{bind}:` under \
+                 `sources:`, or point `bind:` at an existing one.",
+                export.name
+            );
+        };
+        match src {
+            crate::config::Source::Raw(_) => {}
+            crate::config::Source::Connection {
+                table: Some(_),
+                query: None,
+                ..
+            } => {}
+            crate::config::Source::Connection { query: Some(_), .. } => {
+                bail!(
+                    "export '{}': `bind: {bind}` names a `query:`-shaped connection source — \
+                     that's ad hoc SQL nobody runs, the exact failure the binding model \
+                     replaces, not an existing object to point at. Bind to a `table:`-shaped \
+                     source instead (a real warehouse table or view), or materialize this \
+                     export with a transform.",
+                    export.name
+                );
+            }
+            crate::config::Source::Connection {
+                table: None,
+                query: None,
+                ..
+            } => {
+                // Unreachable in practice — `Source`'s own deserializer
+                // already requires exactly one of `table`/`query`. Kept for
+                // match exhaustiveness, not a real path.
+                bail!(
+                    "export '{}': `bind: {bind}` names a connection source with neither \
+                     `table:` nor `query:` set.",
+                    export.name
+                );
+            }
+            crate::config::Source::Cell { .. } => {
+                bail!(
+                    "export '{}': `bind: {bind}` names a `cell:` source — binding to another \
+                     cell's table isn't supported yet. Read it through a materializing \
+                     transform instead.",
+                    export.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Verify a built cell against its declared interface (read-only).
 ///
-/// A cell with any `materialize: never` export needs more than the plain
-/// read-only open above: standalone `verify` binds no sources and runs no
-/// transforms by default, so a never-backed export's session view (only
-/// ever created by `datamk run`, pre-DETACH — see `engine::run`) does not
-/// exist yet. Issue #6 (live-verify core): bind every declared source
-/// exactly as `run` would (`engine::bind_sources`), then dry-run just the
-/// `never` transforms as session views, in declared order
-/// (`engine::dry_run_never_transforms`) — "run everything minus
-/// BEGIN/COMMIT/lake writes." Materializing transforms are never re-run: in
-/// a mixed cell their tables already exist in `lake`, checked there exactly
-/// as before. Skipped entirely for a cell with no never-backed exports — a
+/// A cell with any bound export (`Export::bind`, issue #6 binding model)
+/// needs more than the plain read-only open above: standalone `verify`
+/// binds no sources by default, so a bound export's session view (only ever
+/// created by `datamk run`'s own unconditional `bind_sources`, or here)
+/// does not exist yet. No dry-run of anything is needed — a bound export
+/// has no transform; `engine::bind_sources` alone leaves a same-named
+/// `TEMP VIEW` for every declared source, `check` below just describes it
+/// directly. Skipped entirely for a cell with no bound exports — a
 /// snapshot-only cell's verify pays no network round trip (and no billed
-/// dry-run scan, ADR 0007 §4) it has never paid before.
+/// scan, ADR 0007 §4) it has never paid before.
 ///
 /// On success, when a live check ran, `datamk context`'s
 /// `observed.source_check` needs a persisted record — `verify` and
@@ -106,46 +311,68 @@ pub(crate) fn apply_declarative_grain_inheritance(
 /// silently omitted rather than misapplied — see `context::emit`.
 pub fn run(file: &Path, profile: &str) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
-    let never_tables = crate::config::never_backed_tables(&cell.transforms);
-    if !never_tables.is_empty() {
-        engine::bind_sources(&cell, false)
-            .context("binding sources for live verify of materialize: never exports (issue #6)")?;
-        engine::dry_run_never_transforms(&cell)
-            .context("dry-running materialize: never transforms for live verify (issue #6)")?;
-    }
-    check(&cell.conn, &cell.def, &never_tables)?;
-    if !never_tables.is_empty() {
-        write_source_check_record(file, &cell.dir)
+    let has_bound_exports = cell.def.interface.iter().any(|e| e.is_bound());
+    let warehouse_columns = if has_bound_exports {
+        let (_, _, warehouse_columns) = engine::bind_sources(&cell, false)
+            .context("binding sources for live verify of bound exports (issue #6)")?;
+        warehouse_columns
+    } else {
+        HashMap::new()
+    };
+    check(&cell.conn, &cell.def, &warehouse_columns)?;
+    if has_bound_exports {
+        write_source_check_record(file, &cell.dir, profile)
             .context("writing the live-verify source-check record (.cell/source_check.json)")?;
+        // Issue #6/#10: the same live bind pass above already carries
+        // `warehouse_columns` — persisted here under the identical
+        // `has_bound_exports` gate (this is the only place standalone
+        // verify binds sources at all, so it's the only place this fact is
+        // ever available to write). A cell whose BigQuery sources feed only
+        // materializing transforms never reaches this branch and so never
+        // gets a `.cell/source_descriptions.json` — the same limitation
+        // `.cell/source_check.json` already has, not a new one.
+        let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
+        crate::manifest::SourceDescriptionsRecord::write(
+            &cell.dir,
+            &cell_yaml_digest,
+            profile,
+            &cell.def,
+            &warehouse_columns,
+        )
+        .context(
+            "writing the live-verify source-descriptions record \
+             (.cell/source_descriptions.json)",
+        )?;
     }
     Ok(())
 }
 
 /// Persist the live-verify source-check record (issue #6): outcome, when,
-/// which `datamk` built it, and the `cell.yaml` digest at check time — the
-/// same digest `datamk context` computes for `cell_yaml_digest`, so
-/// `context::emit` can tell a fresh record from a stale one without
-/// re-deriving anything. `outcome` is `"passed"` by construction, same
-/// discipline as `RunSummary.verify_outcome`: `check` above already bailed
-/// on any failure, so this only ever runs after every check passed.
+/// which `datamk` built it, the `cell.yaml` digest at check time, and the
+/// `profile` it ran under. The digest is the same one `datamk context`
+/// computes for `cell_yaml_digest`, so `SourceCheckRecord::fresh_for` can
+/// tell a fresh record from a stale one without re-deriving anything;
+/// `profile` is the second, independent gate (issue #16) — a check under
+/// `local` must not attest `prod`. `outcome` is `"passed"` by construction,
+/// same discipline as `RunSummary.verify_outcome`: `check` above already
+/// bailed on any failure, so this only ever runs after every check passed.
 /// `data_as_of` stays `None` in this slice — no connector currently threads
 /// a cheap, truthful "as of" timestamp out of the bind path; fabricating one
 /// (or defaulting it to `checked_at`) is exactly what ADR 0012 §2 forbids.
-fn write_source_check_record(file: &Path, dir: &Path) -> Result<()> {
+fn write_source_check_record(file: &Path, dir: &Path, profile: &str) -> Result<()> {
     let path = dir.join(".cell").join("source_check.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let cell_yaml_digest = crate::context::sha256_hex(
-        &std::fs::read(file).with_context(|| format!("reading {}", file.display()))?,
-    );
+    let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
     let record = crate::manifest::SourceCheckRecord {
         outcome: "passed".to_string(),
         checked_at: crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()),
         data_as_of: None,
         datamk_version: env!("CARGO_PKG_VERSION").to_string(),
         cell_yaml_digest,
+        profile: profile.to_string(),
     };
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -156,20 +383,33 @@ fn write_source_check_record(file: &Path, dir: &Path) -> Result<()> {
 /// The interface must not lie: every declared column must exist with a compatible
 /// type, and every declared grain must exist and be unique in the actual output.
 ///
-/// `never_tables` (issue #6): the set of `materialize: never` table names.
-/// Their session view is bound by `execute_never` — inside `datamk run`,
-/// pre-DETACH; inside a standalone `datamk verify`, by the live-verify bind
-/// pass at the top of `run` above (`engine::bind_sources` +
-/// `engine::dry_run_never_transforms`) — so by the time `check` runs here,
-/// every never-backed export named in `never_tables` is expected to already
-/// have a live view. `never_tables` exists only to make a missing one's
-/// error legible: describing a genuinely absent relation is otherwise
-/// indistinguishable from DuckDB's raw "table does not exist" regardless of
-/// cause, which is confusing for a strategy whose whole point is "no table,
-/// on purpose." A describe failure for a name in this set names the
-/// strategy and where the binding was supposed to happen instead of leaving
-/// the caller to guess.
-pub fn check(conn: &Connection, def: &CellDef, never_tables: &HashSet<String>) -> Result<()> {
+/// A bound export (issue #6, `Export::bind`) reads its declared source's
+/// session view, not a transform table — that view is bound by
+/// `engine::bind_sources`, unconditionally inside `datamk run`, and inside
+/// standalone `datamk verify` by the live-verify bind pass at the top of
+/// `run` above — so by the time `check` runs here, every bound export is
+/// expected to already have a live view under its source's name. Describing
+/// which name a bound export actually reads (rather than treating every
+/// export uniformly via `source_object()`) is what makes a missing view's
+/// error legible: a describe failure for a bound export names the binding
+/// and where it was supposed to happen instead of leaving the caller to
+/// guess at a raw "table does not exist."
+///
+/// `warehouse_columns` (issue #6/#9) is `engine::bind_sources`'s third
+/// return value: per-source warehouse-native column types, keyed by source
+/// name. Per-export dispatch, not per-cell — a materialized export always
+/// checks against DuckDB's `DESCRIBE` of `lake` (there is no other
+/// authority for a computed table); a bound export checks against its
+/// source's warehouse-native types when they're available, and against
+/// DuckDB's `DESCRIBE` of the bound view otherwise (a raw file, or a
+/// connector with no classification job — not a lesser fallback, there is
+/// genuinely no other authority to consult there either). Mixed cells hit
+/// both paths in the same loop.
+pub fn check(
+    conn: &Connection,
+    def: &CellDef,
+    warehouse_columns: &HashMap<String, crate::engine::SourceWarehouseColumns>,
+) -> Result<()> {
     // ADR 0005 §1: `__datamk_` is a reserved, enforced namespace — a table
     // matching it other than the watermark table itself is refused before
     // publish.
@@ -184,18 +424,21 @@ pub fn check(conn: &Connection, def: &CellDef, never_tables: &HashSet<String>) -
     check_supported_have_descriptions(def)?;
 
     for export in &def.interface {
-        let source = export.source_object();
+        let source = export
+            .bind
+            .as_deref()
+            .unwrap_or_else(|| export.source_object());
         let actual = match describe(conn, source) {
             Ok(actual) => actual,
-            Err(e) if never_tables.contains(source) => {
+            Err(e) if export.is_bound() => {
                 return Err(e).with_context(|| {
                     format!(
-                        "export '{}': materialize: never — no live binding for '{source}' in \
-                         this session. Inside `datamk run`, `execute_never` binds this pre-\
-                         DETACH; inside standalone `datamk verify`, the live-verify bind pass \
-                         (issue #6) does — this failure means that pass didn't leave a '{source}' \
-                         view behind (a broken/renamed transform file, or no `never` transform \
-                         producing this table at all)",
+                        "export '{}': `bind: {source}` — no live view named '{source}' in this \
+                         session. Inside `datamk run`, `engine::bind_sources` binds every \
+                         declared source unconditionally before transforms run; inside \
+                         standalone `datamk verify`, the live-verify bind pass (issue #6) does \
+                         — this failure means that pass didn't leave a '{source}' view behind \
+                         (a missing/renamed `sources:` entry, or a connector error)",
                         export.name
                     )
                 })
@@ -207,6 +450,13 @@ pub fn check(conn: &Connection, def: &CellDef, never_tables: &HashSet<String>) -
             }
         };
 
+        // Issue #6/#9: the warehouse-native columns for THIS export's bound
+        // source, if any exist — looked up once per export, not per column.
+        let warehouse = export
+            .bind
+            .as_ref()
+            .and_then(|bind| warehouse_columns.get(bind));
+
         for (col, spec) in &export.schema {
             let declared_ty = &spec.ty;
             match actual.iter().find(|(c, _)| c.eq_ignore_ascii_case(col)) {
@@ -214,20 +464,23 @@ pub fn check(conn: &Connection, def: &CellDef, never_tables: &HashSet<String>) -
                     "export '{}': declared column '{col}' missing from source '{source}'",
                     export.name
                 ),
-                // ADR 0012 §7 (breaking change, promoted from a warning): a
-                // declared type asserted to a machine must be true — agents
-                // consume the interface as fact, so a lying type is a silent
-                // wrong number, not a nuisance log line.
-                Some((_, actual_ty)) if !type_compatible(declared_ty, actual_ty) => {
-                    bail!(
-                        "export '{}': declared type '{declared_ty}' for column '{col}' does \
-                         not match actual type '{actual_ty}' in source '{source}' — fix the \
-                         declared schema or the transform so the interface tells the truth \
-                         (previously a warning; promoted to an error by ADR 0012)",
-                        export.name
-                    );
+                Some((_, actual_ty)) => {
+                    let (ok, compared_ty) = column_type_ok(warehouse, col, declared_ty, actual_ty);
+                    // ADR 0012 §7 (breaking change, promoted from a
+                    // warning): a declared type asserted to a machine must
+                    // be true — agents consume the interface as fact, so a
+                    // lying type is a silent wrong number, not a nuisance
+                    // log line.
+                    if !ok {
+                        bail!(
+                            "export '{}': declared type '{declared_ty}' for column '{col}' does \
+                             not match actual type '{compared_ty}' in source '{source}' — fix \
+                             the declared schema or the transform so the interface tells the \
+                             truth (previously a warning; promoted to an error by ADR 0012)",
+                            export.name
+                        );
+                    }
                 }
-                Some(_) => {}
             }
         }
 
@@ -520,6 +773,40 @@ fn grain_counts(conn: &Connection, source: &str, grain: &[String]) -> Result<(i6
     Ok(row)
 }
 
+/// Whether a declared column's type matches its actual type, and which type
+/// string was actually compared against (for the error message — naming
+/// DuckDB's `actual_ty` when a warehouse-native `NUMERIC` genuinely failed
+/// would blame the wrong authority). Issue #6/#9 dispatch, per column: a
+/// bound export whose source has a warehouse-native type for this column
+/// (BigQuery only, today — `native_type_compatible` returns `None` for a
+/// connector with no vocabulary) is checked against THAT authority; every
+/// other column — materialized, raw-bound, or a connector with no
+/// classification job — keeps the existing DuckDB-`DESCRIBE`-based
+/// `type_compatible`, called unmodified below.
+fn column_type_ok<'a>(
+    warehouse: Option<&'a crate::engine::SourceWarehouseColumns>,
+    col: &str,
+    declared_ty: &str,
+    actual_ty: &'a str,
+) -> (bool, &'a str) {
+    if let Some(src) = warehouse {
+        if let Some((_, native_ty)) = src
+            .columns
+            .iter()
+            .find(|(c, _)| c.eq_ignore_ascii_case(col))
+        {
+            if let Some(ok) = crate::engine::connectors::native_type_compatible(
+                src.connector,
+                declared_ty,
+                native_ty,
+            ) {
+                return (ok, native_ty.as_str());
+            }
+        }
+    }
+    (type_compatible(declared_ty, actual_ty), actual_ty)
+}
+
 /// Loose structural compatibility between a declared type name and DuckDB's reported type.
 fn type_compatible(declared: &str, actual: &str) -> bool {
     let a = actual.to_uppercase();
@@ -567,6 +854,271 @@ mod tests {
         ))
         .expect("attach ducklake");
         (conn, dir)
+    }
+
+    // --- issue #6, binding model: the migration error -----------------------
+    //
+    // The customer-facing surface of the founder's decision (`materialize:
+    // never` is gone) — the shape that matters per the coordinator's brief:
+    // name the export and the offending transform, say why in one clause,
+    // give both exits with `materialize:` first, batch multiple offenders.
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-verify-migration-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sql")).unwrap();
+        dir
+    }
+
+    fn resolved(def: &CellDef) -> Vec<ResolvedTransform> {
+        crate::config::resolve_transforms(&def.transforms).unwrap()
+    }
+
+    #[test]
+    fn check_no_materialize_never_passes_when_none_exist() {
+        let dir = tempdir("clean");
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\ntransforms:\n  - sql/a.sql\ninterface:\n  - name: a\n    version: 1.0.0\n",
+        )
+        .unwrap();
+        check_no_materialize_never(&def, &resolved(&def), &dir).expect("no never transforms");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The customer's `qfai_kpis_monthly` shape: derives columns, so no
+    /// automatic hint — both exits are given, `materialize:` first (the one
+    /// that needs no coordination with another team), naming the export.
+    #[test]
+    fn check_no_materialize_never_names_the_export_and_offers_both_exits_materialize_first() {
+        let dir = tempdir("derives");
+        std::fs::write(
+            dir.join("sql/kpis.sql"),
+            "SELECT id, revenue * 1.1 AS revenue_usd FROM raw",
+        )
+        .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             transforms:\n\
+             \x20 - sql: sql/kpis.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: kpis\n\
+             \x20   version: 1.0.0\n\
+             sources:\n\
+             \x20 raw: ./raw.csv\n",
+        )
+        .unwrap();
+        let err = check_no_materialize_never(&def, &resolved(&def), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cell 't'"), "got: {err}");
+        assert!(err.contains("no longer exists"), "got: {err}");
+        assert!(
+            err.contains("rows datamk itself never computed or stored"),
+            "must say why in one clause: got: {err}"
+        );
+        assert!(
+            err.contains("export 'kpis'"),
+            "must name the export: got: {err}"
+        );
+        assert!(
+            err.contains("sql/kpis.sql"),
+            "must name the transform: got: {err}"
+        );
+        assert!(
+            !err.contains("looks like a pure passthrough"),
+            "a column-deriving transform must get no convertibility hint: got: {err}"
+        );
+        let materialize_at = err
+            .find("`materialize: replace`")
+            .expect("materialize exit present");
+        let bind_at = err.find("add `bind:").expect("bind exit present");
+        assert!(
+            materialize_at < bind_at,
+            "materialize: must be listed first (needs no coordination with another team): \
+             got: {err}"
+        );
+    }
+
+    /// The customer's `qfai_customer` shape: a pure passthrough of a
+    /// declared, bindable source — gets the convertibility hint by name.
+    #[test]
+    fn check_no_materialize_never_hints_a_pure_passthrough_as_bindable() {
+        let dir = tempdir("passthrough");
+        std::fs::write(dir.join("sql/customer.sql"), "SELECT * FROM raw").unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             transforms:\n\
+             \x20 - sql: sql/customer.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: customer\n\
+             \x20   version: 1.0.0\n\
+             sources:\n\
+             \x20 raw: ./raw.csv\n",
+        )
+        .unwrap();
+        let err = check_no_materialize_never(&def, &resolved(&def), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("looks like a pure passthrough of source 'raw'"),
+            "got: {err}"
+        );
+        assert!(err.contains("add `bind: raw`"), "got: {err}");
+    }
+
+    /// The hint is best-effort and must never mis-fire: a `FROM` target that
+    /// isn't a declared, bindable source gets no hint, not a wrong one.
+    #[test]
+    fn check_no_materialize_never_gives_no_hint_when_the_from_target_is_not_a_bindable_source() {
+        let dir = tempdir("not-bindable");
+        std::fs::write(dir.join("sql/x.sql"), "SELECT * FROM some_other_table").unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             transforms:\n\
+             \x20 - sql: sql/x.sql\n\
+             \x20   materialize: never\n\
+             interface:\n\
+             \x20 - name: x\n\
+             \x20   version: 1.0.0\n",
+        )
+        .unwrap();
+        let err = check_no_materialize_never(&def, &resolved(&def), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("looks like a pure passthrough"), "got: {err}");
+    }
+
+    #[test]
+    fn check_no_materialize_never_names_no_export_for_an_orphaned_transform() {
+        let dir = tempdir("orphan");
+        std::fs::write(dir.join("sql/orphan.sql"), "SELECT 1 AS x").unwrap();
+        let def: CellDef =
+            serde_yaml::from_str("cell: t\ntransforms:\n  - sql: sql/orphan.sql\n    materialize: never\ninterface: []\n")
+                .unwrap();
+        let err = check_no_materialize_never(&def, &resolved(&def), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no export references it"), "got: {err}");
+    }
+
+    #[test]
+    fn check_no_materialize_never_batches_multiple_offenders_naming_a_few_plus_a_count() {
+        let dir = tempdir("batch");
+        let mut yaml = "cell: t\ntransforms:\n".to_string();
+        let mut interface = "interface:\n".to_string();
+        for i in 0..5 {
+            yaml.push_str(&format!("  - sql: sql/t{i}.sql\n    materialize: never\n"));
+            interface.push_str(&format!("  - name: t{i}\n    version: 1.0.0\n"));
+            std::fs::write(dir.join(format!("sql/t{i}.sql")), "SELECT 1 AS x").unwrap();
+        }
+        yaml.push_str(&interface);
+        let def: CellDef = serde_yaml::from_str(&yaml).unwrap();
+        let err = check_no_materialize_never(&def, &resolved(&def), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("declares 5 `materialize: never` transforms"),
+            "got: {err}"
+        );
+        assert!(err.contains("export 't0'"), "got: {err}");
+        assert!(err.contains("export 't1'"), "got: {err}");
+        assert!(err.contains("export 't2'"), "got: {err}");
+        assert!(
+            !err.contains("export 't3'"),
+            "must not list every offender, only the first few: got: {err}"
+        );
+        assert!(err.contains("...and 2 more"), "got: {err}");
+    }
+
+    // --- issue #6, binding model: `validate_bound_exports` ------------------
+
+    #[test]
+    fn validate_bound_exports_passes_for_a_raw_bound_export() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\ninterface:\n  - name: a\n    version: 1.0.0\n    bind: raw\nsources:\n  raw: ./raw.csv\n",
+        )
+        .unwrap();
+        validate_bound_exports(&def).expect("a raw source can back a binding");
+    }
+
+    #[test]
+    fn validate_bound_exports_passes_for_a_table_connection_bound_export() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             interface:\n\
+             \x20 - name: a\n    version: 1.0.0\n    bind: raw\n\
+             sources:\n\
+             \x20 raw:\n    connection: bq\n    table: dataset.table\n",
+        )
+        .unwrap();
+        validate_bound_exports(&def).expect("a table-shaped connection source can back a binding");
+    }
+
+    #[test]
+    fn validate_bound_exports_rejects_both_source_and_bind_set() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             interface:\n\
+             \x20 - name: a\n    version: 1.0.0\n    source: something\n    bind: raw\n\
+             sources:\n\
+             \x20 raw: ./raw.csv\n",
+        )
+        .unwrap();
+        let err = validate_bound_exports(&def).unwrap_err().to_string();
+        assert!(err.contains("export 'a'"), "got: {err}");
+        assert!(err.contains("both `source` and `bind`"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_bound_exports_rejects_an_undeclared_source_name() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\ninterface:\n  - name: a\n    version: 1.0.0\n    bind: missing\n",
+        )
+        .unwrap();
+        let err = validate_bound_exports(&def).unwrap_err().to_string();
+        assert!(err.contains("export 'a'"), "got: {err}");
+        assert!(err.contains("names no declared source"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_bound_exports_rejects_a_query_shaped_connection_source() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             interface:\n\
+             \x20 - name: a\n    version: 1.0.0\n    bind: raw\n\
+             sources:\n\
+             \x20 raw:\n    connection: bq\n    query: SELECT 1\n",
+        )
+        .unwrap();
+        let err = validate_bound_exports(&def).unwrap_err().to_string();
+        assert!(err.contains("export 'a'"), "got: {err}");
+        assert!(err.contains("ad hoc SQL nobody runs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_bound_exports_rejects_a_cell_shaped_source() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: t\n\
+             interface:\n\
+             \x20 - name: a\n    version: 1.0.0\n    bind: upstream\n\
+             sources:\n\
+             \x20 upstream:\n    cell: other\n    table: fct\n",
+        )
+        .unwrap();
+        let err = validate_bound_exports(&def).unwrap_err().to_string();
+        assert!(err.contains("export 'a'"), "got: {err}");
+        assert!(
+            err.contains("binding to another cell's table isn't supported yet"),
+            "got: {err}"
+        );
     }
 
     // R8: `_` is a LIKE wildcard — the escaped pattern must not over-match a
@@ -637,7 +1189,7 @@ interface:
     #[test]
     fn grain_violation_names_the_incremental_cause_when_one_is_declared() {
         let (conn, _dir) = lake_with_duplicate_grain("grain-hint");
-        let err = check(&conn, &grain_violation_cell(true), &HashSet::new())
+        let err = check(&conn, &grain_violation_cell(true), &HashMap::new())
             .unwrap_err()
             .to_string();
         assert!(err.contains("grain"), "got: {err}");
@@ -648,7 +1200,7 @@ interface:
     #[test]
     fn grain_violation_stays_plain_without_incremental_sources() {
         let (conn, _dir) = lake_with_duplicate_grain("grain-plain");
-        let err = check(&conn, &grain_violation_cell(false), &HashSet::new())
+        let err = check(&conn, &grain_violation_cell(false), &HashMap::new())
             .unwrap_err()
             .to_string();
         assert!(err.contains("is not unique"), "got: {err}");
@@ -737,7 +1289,7 @@ interface:
              \x20       description: A sentence about a column that no longer exists.\n",
         )
         .unwrap();
-        let err = check(&conn, &def, &HashSet::new()).unwrap_err().to_string();
+        let err = check(&conn, &def, &HashMap::new()).unwrap_err().to_string();
         assert!(
             err.contains("declared column 'dropped_col' missing"),
             "got: {err}"
@@ -762,13 +1314,108 @@ interface:
              \x20     label: decimal\n",
         )
         .unwrap();
-        let err = check(&conn, &def, &HashSet::new()).unwrap_err().to_string();
+        let err = check(&conn, &def, &HashMap::new()).unwrap_err().to_string();
         assert!(err.contains("declared type 'decimal'"), "got: {err}");
         assert!(err.contains("column 'label'"), "got: {err}");
         assert!(
             err.contains("promoted to an error by ADR 0012"),
             "got: {err}"
         );
+    }
+
+    // Issue #6/#9: `column_type_ok` wired end to end through `check`, not
+    // just the pure `bigquery::type_compatible` vocabulary in isolation.
+    // Reproduces the commit's motivating case — a wide BigQuery
+    // NUMERIC/BIGNUMERIC value that DuckDB, once attached, can only render
+    // as VARCHAR (the DuckDB-side half of that degradation is reproducible
+    // locally without credentials; the warehouse round trip that would have
+    // produced it in the first place is not, and this test does not claim
+    // to exercise that round trip). Without a warehouse-native authority,
+    // the declared `decimal` fails against the degraded VARCHAR exactly as
+    // it always has; with one claiming the real BigQuery type is NUMERIC,
+    // the same VARCHAR-rendered column passes — proving `check` compares
+    // against the warehouse authority when one is present for a bound
+    // export's source, not DuckDB's `DESCRIBE`.
+    #[test]
+    fn a_bound_exports_declared_decimal_passes_against_warehouse_numeric_despite_a_degraded_duckdb_varchar(
+    ) {
+        let (conn, _dir) = attach_lake("warehouse-numeric");
+        conn.execute_batch(
+            "CREATE VIEW raw AS SELECT 1 AS id, \
+             '123456789012345678901234567890.5' AS amount;",
+        )
+        .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: t\n\
+             \x20   version: 1.0.0\n\
+             \x20   bind: raw\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             \x20     amount: decimal\n",
+        )
+        .unwrap();
+
+        // No warehouse authority: DuckDB's own DESCRIBE sees the degraded
+        // VARCHAR, and the declared `decimal` fails, same as before this
+        // commit.
+        let err = check(&conn, &def, &HashMap::new()).unwrap_err().to_string();
+        assert!(err.contains("declared type 'decimal'"), "got: {err}");
+        assert!(err.contains("actual type 'VARCHAR'"), "got: {err}");
+
+        // With a warehouse authority for this export's bound source: the
+        // same VARCHAR-rendered column passes, because BigQuery's own
+        // native type — NUMERIC — is what actually gets compared.
+        let mut warehouse = HashMap::new();
+        warehouse.insert(
+            "raw".to_string(),
+            crate::engine::SourceWarehouseColumns {
+                connector: "bigquery",
+                columns: indexmap::IndexMap::from([("amount".to_string(), "NUMERIC".to_string())]),
+                descriptions: indexmap::IndexMap::new(),
+            },
+        );
+        check(&conn, &def, &warehouse)
+            .expect("warehouse-native NUMERIC must pass a declared decimal");
+    }
+
+    // The fallback half of the same wiring: a bound export whose source has
+    // no entry in `warehouse_columns` at all (a raw-file bind, or a
+    // connector — Postgres/Snowflake — that never populates `ObjectMeta.
+    // columns`) must keep using DuckDB's own `DESCRIBE` as the authority,
+    // not silently pass because a warehouse map merely exists.
+    #[test]
+    fn a_bound_export_with_no_warehouse_entry_still_uses_duckdbs_own_type() {
+        let (conn, _dir) = attach_lake("no-warehouse-entry");
+        conn.execute_batch("CREATE VIEW raw AS SELECT 1 AS id, 'x' AS amount;")
+            .unwrap();
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: t\n\
+             \x20   version: 1.0.0\n\
+             \x20   bind: raw\n\
+             \x20   schema:\n\
+             \x20     id: integer\n\
+             \x20     amount: decimal\n",
+        )
+        .unwrap();
+
+        // A non-empty warehouse map that simply has no entry for THIS
+        // export's source — e.g. another export's bound BigQuery table.
+        let mut warehouse = HashMap::new();
+        warehouse.insert(
+            "some_other_source".to_string(),
+            crate::engine::SourceWarehouseColumns {
+                connector: "bigquery",
+                columns: indexmap::IndexMap::from([("amount".to_string(), "NUMERIC".to_string())]),
+                descriptions: indexmap::IndexMap::new(),
+            },
+        );
+        let err = check(&conn, &def, &warehouse).unwrap_err().to_string();
+        assert!(err.contains("declared type 'decimal'"), "got: {err}");
+        assert!(err.contains("actual type 'VARCHAR'"), "got: {err}");
     }
 
     #[test]
@@ -786,7 +1433,7 @@ interface:
              \x20     label: string\n",
         )
         .unwrap();
-        check(&conn, &def, &HashSet::new()).expect("compatible declared types must pass");
+        check(&conn, &def, &HashMap::new()).expect("compatible declared types must pass");
     }
 
     #[test]
@@ -967,56 +1614,53 @@ interface:
         apply_declarative_grain_inheritance(&mut def, &transforms).unwrap();
         assert_eq!(def.interface[0].grain, vec!["flight_id".to_string()]);
 
-        check(&conn, &def, &HashSet::new())
+        check(&conn, &def, &HashMap::new())
             .expect("declarative export with inherited grain must verify cleanly");
     }
 
-    // --- issue #6: `materialize: never` and standalone `check` --------------
+    // --- issue #6, binding model: bound exports and standalone `check` ------
 
     #[test]
-    fn check_names_the_strategy_when_a_never_backed_export_has_no_live_binding() {
-        // Issue #6 (live-verify core): `check` no longer silently skips a
-        // never-backed export with no live view — every caller (`run`,
-        // standalone `verify`) is now responsible for binding it first, so a
-        // missing view here is a genuine failure of that binding pass, not
-        // an expected absence. The error must still be legible, though — it
-        // names the strategy and where binding should have happened rather
-        // than surfacing DuckDB's raw "table does not exist".
-        let (conn, _dir) = attach_lake("never-no-binding");
+    fn check_names_the_binding_when_a_bound_export_has_no_live_view() {
+        // Issue #6 (binding model): `check` no longer silently skips a bound
+        // export with no live view — every caller (`run`, standalone
+        // `verify`) is now responsible for binding it first (`engine::
+        // bind_sources`), so a missing view here is a genuine failure of
+        // that binding pass, not an expected absence. The error must still
+        // be legible, though — it names the binding and where it should
+        // have happened rather than surfacing DuckDB's raw "table does not
+        // exist".
+        let (conn, _dir) = attach_lake("bound-no-view");
         let def: CellDef = serde_yaml::from_str(
-            "cell: t\ninterface:\n  - name: virtual_pii\n    version: 1.0.0\n",
+            "cell: t\ninterface:\n  - name: virtual_pii\n    version: 1.0.0\n    bind: raw\n",
         )
         .unwrap();
-        let never_tables: HashSet<String> = ["virtual_pii".to_string()].into_iter().collect();
-        let err = check(&conn, &def, &never_tables).unwrap_err().to_string();
+        let err = check(&conn, &def, &HashMap::new()).unwrap_err().to_string();
         assert!(
-            err.contains("materialize: never") && err.contains("no live binding"),
-            "a missing never-backed view must name the strategy and the gap, not just DuckDB's \
-             raw error: got {err}"
+            err.contains("bind: raw") && err.contains("no live view"),
+            "a missing bound view must name the binding and the gap, not just DuckDB's raw \
+             error: got {err}"
         );
     }
 
     #[test]
-    fn check_still_validates_a_never_backed_export_when_its_view_is_bound() {
-        // The in-run shape (issue #6): once the `never` transform's TEMP
-        // VIEW exists in this session (what `execute_never` leaves behind,
-        // pre-DETACH), `check` validates it exactly like any other export —
-        // schema, grain existence, grain uniqueness — never_tables only
-        // changes behavior on a MISSING relation.
-        let (conn, _dir) = attach_lake("never-bound-and-checked");
-        conn.execute_batch(
-            "CREATE TEMP VIEW virtual_pii AS SELECT * FROM (VALUES (1), (1)) AS t(id);",
-        )
-        .unwrap();
+    fn check_still_validates_a_bound_export_when_its_view_is_bound() {
+        // The in-run shape (issue #6): once `engine::bind_sources` has left
+        // the declared source's TEMP VIEW in this session, `check` validates
+        // it exactly like any other export — schema, grain existence, grain
+        // uniqueness — the bound-export branch only changes behavior on a
+        // MISSING relation.
+        let (conn, _dir) = attach_lake("bound-and-checked");
+        conn.execute_batch("CREATE TEMP VIEW raw AS SELECT * FROM (VALUES (1), (1)) AS t(id);")
+            .unwrap();
         let def: CellDef = serde_yaml::from_str(
-            "cell: t\ninterface:\n  - name: virtual_pii\n    version: 1.0.0\n    grain: [id]\n",
+            "cell: t\ninterface:\n  - name: virtual_pii\n    version: 1.0.0\n    grain: [id]\n    bind: raw\n",
         )
         .unwrap();
-        let never_tables: HashSet<String> = ["virtual_pii".to_string()].into_iter().collect();
-        let err = check(&conn, &def, &never_tables).unwrap_err().to_string();
+        let err = check(&conn, &def, &HashMap::new()).unwrap_err().to_string();
         assert!(
             err.contains("is not unique"),
-            "a bound never-backed view's grain violation must still be caught: got {err}"
+            "a bound export's live grain violation must still be caught: got {err}"
         );
     }
 
@@ -1056,32 +1700,29 @@ interface:
     }
 
     #[test]
-    fn standalone_verify_on_an_all_never_cell_binds_live_and_catches_a_broken_grain() {
-        // Issue #6: an all-`never` cell has no snapshot and can never build
-        // one (`run` refuses) — this is the case the whole live-verify slice
-        // exists for. Standalone `verify::run` must bind `data.csv` as a
-        // live source, dry-run the `never` transform as a session view, and
-        // run the real schema+grain checks against it — not skip.
-        let dir = live_verify_dir("all-never-clean");
+    fn standalone_verify_on_an_all_bound_cell_binds_live_and_catches_a_broken_grain() {
+        // Issue #6, binding model: an all-bound cell has no snapshot and can
+        // never build one (`run` refuses — `builds_no_snapshot`) — this is
+        // the case the whole live-verify slice exists for. Standalone
+        // `verify::run` must bind `data.csv` as a live source and run the
+        // real schema+grain checks against it directly — not skip.
+        let dir = live_verify_dir("all-bound-clean");
         std::fs::write(
             dir.join("cell.yaml"),
             "cell: virtual_only\n\
-             transforms:\n\
-             \x20 - sql: sql/virtual_pii.sql\n\
-             \x20   materialize: never\n\
              interface:\n\
              \x20 - name: virtual_pii\n\
              \x20   version: 1.0.0\n\
              \x20   grain: [id]\n\
+             \x20   bind: raw\n\
              sources:\n\
              \x20 raw: ./data.csv\n",
         )
         .unwrap();
-        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM raw").unwrap();
         write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
 
         let file = dir.join("cell.yaml");
-        run(&file, "local").expect("live-verify of a clean all-never cell must pass");
+        run(&file, "local").expect("live-verify of a clean all-bound cell must pass");
         assert!(
             dir.join(".cell/source_check.json").is_file(),
             "a passing live check must leave a .cell/source_check.json record behind"
@@ -1101,12 +1742,12 @@ interface:
     }
 
     #[test]
-    fn standalone_verify_on_a_mixed_cell_checks_the_never_export_live_and_the_materialized_export_against_the_lake(
+    fn standalone_verify_on_a_mixed_cell_checks_the_bound_export_live_and_the_materialized_export_against_the_lake(
     ) {
-        // Issue #6: a mixed cell (one materializing transform, one `never`
-        // transform) must have BOTH halves checked by a standalone verify —
-        // the materialized export against the lake, exactly as before, and
-        // the never-backed export live, freshly bound.
+        // Issue #6, binding model: a mixed cell (one materializing
+        // transform, one bound export) must have BOTH halves checked by a
+        // standalone verify — the materialized export against the lake,
+        // exactly as before, and the bound export live, freshly bound.
         let dir = live_verify_dir("mixed");
         std::fs::write(
             dir.join("cell.yaml"),
@@ -1114,8 +1755,6 @@ interface:
              transforms:\n\
              \x20 - sql: sql/stg.sql\n\
              \x20   materialize: replace\n\
-             \x20 - sql: sql/virtual_pii.sql\n\
-             \x20   materialize: never\n\
              interface:\n\
              \x20 - name: stg\n\
              \x20   version: 1.0.0\n\
@@ -1123,29 +1762,29 @@ interface:
              \x20 - name: virtual_pii\n\
              \x20   version: 1.0.0\n\
              \x20   grain: [id]\n\
+             \x20   bind: raw\n\
              sources:\n\
              \x20 raw: ./data.csv\n",
         )
         .unwrap();
         std::fs::write(dir.join("sql/stg.sql"), "SELECT * FROM raw").unwrap();
-        std::fs::write(dir.join("sql/virtual_pii.sql"), "SELECT * FROM raw").unwrap();
         write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
 
         let file = dir.join("cell.yaml");
         // The materializing half needs a real build first — unlike the
-        // all-never case, `run` does not refuse a mixed cell, and the
+        // all-bound case, `run` does not refuse a mixed cell, and the
         // materialized export genuinely has nothing to check without one.
         crate::engine::run(&file, "local", None, crate::engine::RunOptions::default())
             .expect("build the mixed cell");
         run(&file, "local").expect("live-verify of a clean mixed cell must pass");
 
-        // Break the never-backed export live (the source, re-read fresh on
-        // every verify) without touching the lake at all.
+        // Break the bound export live (the source, re-read fresh on every
+        // verify) without touching the lake at all.
         write_csv(&dir, "data.csv", &[(1, "a"), (1, "b")]);
         let err = run(&file, "local").unwrap_err().to_string();
         assert!(
             err.contains("export 'virtual_pii'") && err.contains("is not unique"),
-            "the never-backed export's live grain violation must be caught: got {err}"
+            "the bound export's live grain violation must be caught: got {err}"
         );
 
         // Restore the source, then corrupt the MATERIALIZED table directly
