@@ -6,6 +6,40 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added — `datamk interface import` (issue #18)
+
+Emit a ready-to-edit bound export block from a warehouse object's own live
+types:
+
+```
+datamk interface import -p prod --bind gold_customer --as qfai_customer
+```
+
+`--bind` names a `sources:` entry (optional when the cell declares exactly
+one); `--as` names the new export (default: the source's own name). Types
+come from the same warehouse-native authority `verify` already uses for a
+bound export (issue #9) — a column with no clean datamk type name is
+emitted as `type: unmapped` with the real type named in a comment, never
+dropped and never guessed. Prints the YAML block to stdout (pipeable
+straight into `cell.yaml`) with everything else on stderr; `--write`
+splices it directly into the file's `interface:` list instead — a
+byte-range textual edit, never a full re-serialize, so every existing
+comment in the file survives untouched. Refuses an existing export of the
+same name unless `--force`.
+
+**Deliberately never emits a description.** Copying warehouse prose into
+`cell.yaml` is the exact rot ADR 0012 §3 warns about; types are safe to
+copy because `verify` checks them against the warehouse every run; a copied
+description has no such check and would go stale silently. The emitted
+block carries `# description:` commented out as a prompt — the warehouse's
+own column documentation already rides `observed.source_descriptions`
+(issue #10), live, every time `datamk verify` runs. Correspondingly,
+`contract: supported` no longer requires a locally authored description on
+a bound export whose source already has warehouse-documented columns —
+meaning available at the source satisfies the promotion gesture exactly as
+well as meaning restated in `cell.yaml`, and forcing the restatement would
+have made `interface import` re-introduce the rot it exists to avoid.
+
 ### Changed — BREAKING: `materialize: never` is retired; virtual cells become bindings (issue #6)
 
 A transform declared `materialize: never` no longer parses into a working

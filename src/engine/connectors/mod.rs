@@ -201,6 +201,22 @@ pub(crate) fn native_type_compatible(
     }
 }
 
+/// `datamk interface import`'s (issue #18) type authority, dispatched the
+/// same way and for the same reason as `native_type_compatible` immediately
+/// above — one real arm, not a per-vendor obligation. `None` means no
+/// connector-specific inverse mapping exists (no vocabulary at all, or a
+/// native type within that vocabulary this connector's `declared_type_for`
+/// itself can't map) — the caller emits `type: unmapped` rather than
+/// guessing or falling back to a DuckDB-rendering-based guess, which is
+/// exactly the kind of silent-wrong-type the type authority exists to
+/// prevent.
+pub(crate) fn declared_type_for(connector: &str, native: &str) -> Option<&'static str> {
+    match connector {
+        "bigquery" => bigquery::declared_type_for(native),
+        _ => None,
+    }
+}
+
 impl ResolvedConnection {
     /// The connector's `type:` name, for logs and errors.
     pub fn type_name(&self) -> &'static str {
