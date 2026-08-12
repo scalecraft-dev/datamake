@@ -1,6 +1,6 @@
 mod openapi;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -148,6 +148,12 @@ struct AppState {
     /// exists to surface. `None` when neither observed input is present —
     /// the common case keeps today's byte-identical default `ETag`.
     observed_bundle_sha12: Option<String>,
+    /// The URL prefix this cell is mounted at — `""` for a single cell,
+    /// `"/weather"` in a project (ADR 0014). Read only by response headers
+    /// and the OpenAPI `servers` block: it is deployment, never contract, so
+    /// it must never reach `interface_digest` (see
+    /// `context::INCLUDE_DOCS_REQUEST`).
+    base_path: String,
 }
 
 #[derive(Default, Clone)]
@@ -231,7 +237,22 @@ pub async fn run(
     no_data: bool,
 ) -> Result<()> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
-    let (state, store) = build_state(cell, no_data, file, profile)?;
+    let cell_name = cell.def.cell.clone();
+    // Single-cell mode mounts at the root (ADR 0014): nesting it would break
+    // every deployed URL, every Kubernetes probe path, and every `mesh emit`
+    // url.
+    let (state, store) = build_state(cell, no_data, file, profile, /* base_path */ "")?;
+
+    print_banner(
+        port,
+        &[BannerRow {
+            mount: "/".to_string(),
+            cell: cell_name,
+            profile: profile.to_string(),
+            no_data,
+        }],
+        /* project */ false,
+    );
 
     // Initial run-summary fetch (ADR 0012 §5): serve startup already talks to
     // the store (`engine::open` downloaded the artifact), so one more GET here
@@ -248,16 +269,252 @@ pub async fn run(
             file.to_path_buf(),
             profile.to_string(),
             poll_interval.max(1),
+            engine::Budget::default(),
+            /* stagger */ 0,
         );
     }
 
     let app = app(state, max_concurrency);
+    bind_and_serve(app, port).await
+}
 
+/// Serve N cells from one process, each mounted at its own prefix
+/// (ADR 0014). Every cell keeps its own connection, catalog, poller,
+/// principals file, authorization policy, and concurrency cap — the process
+/// is shared, nothing else is. Nothing here fetches a cell over HTTP or
+/// aggregates across cells: that would be the server-side aggregator ADR
+/// 0012 §6 refuses by name.
+/// A project's mounted cells: mount segment (no leading `/`) paired with its
+/// serving state.
+type MountedCells = Vec<(String, Arc<AppState>)>;
+
+pub async fn run_project(
+    project: &crate::project::Project,
+    port: u16,
+    poll_interval: u64,
+    max_concurrency: usize,
+    no_data: bool,
+) -> Result<()> {
+    let n = project.cells.len();
+    let budget = project_budget(n)?;
+
+    // Cells open **sequentially**, never concurrently: every `setup` runs
+    // `INSTALL ducklake; INSTALL json` against the shared
+    // `~/.duckdb/extensions` directory, and N simultaneous installs race on
+    // the same files.
+    let mut mounted: MountedCells = Vec::new();
+    let mut rows: Vec<BannerRow> = Vec::new();
+    let mut pollers = Vec::new();
+    for (nth, pc) in project.cells.iter().enumerate() {
+        // Every listed cell must open or the server does not start. The
+        // precedent is `load_principals` two functions up: a swallowed
+        // startup error yields a process that looks healthy on `/` while
+        // serving a 404 no caller can tell from a typo. An operator who wants
+        // a cell out removes it from the project file — an explicit,
+        // reviewable act.
+        let cell = engine::open_with(&pc.file, &pc.profile, /* read_only */ true, &budget)
+            .with_context(|| {
+                format!(
+                    "opening cells[{}] ({}, profile `{}`) declared in {} — every listed cell \
+                     must open or the server does not start; fix the profile or remove the entry",
+                    pc.index,
+                    pc.file.display(),
+                    pc.profile,
+                    project.file.display()
+                )
+            })?;
+
+        let mount = match &pc.mount {
+            Some(m) => m.clone(),
+            None => {
+                crate::project::check_derived_mount(&cell.def.cell, &pc.file, pc.index)?;
+                cell.def.cell.clone()
+            }
+        };
+        let base_path = format!("/{mount}");
+        let cell_no_data = no_data || pc.no_data;
+        let cell_name = cell.def.cell.clone();
+
+        let (state, store) = build_state(cell, cell_no_data, &pc.file, &pc.profile, &base_path)?;
+        if let Some(store) = &store {
+            fetch_run_summary(&state, store);
+        }
+        if let Some(store) = store {
+            // Stagger the pollers: N threads sleeping on one interval wake
+            // together and issue N simultaneous artifact downloads forever.
+            pollers.push((state.clone(), store, pc.clone(), nth as u64));
+        }
+
+        rows.push(BannerRow {
+            mount: base_path.clone(),
+            cell: cell_name,
+            profile: pc.profile.clone(),
+            no_data: cell_no_data,
+        });
+        mounted.push((mount, state));
+    }
+
+    let mount_index: Vec<(usize, String)> = project
+        .cells
+        .iter()
+        .zip(&mounted)
+        .map(|(pc, (mount, _))| (pc.index, mount.clone()))
+        .collect();
+    crate::project::check_unique_mounts(&mount_index)?;
+
+    for (state, store, pc, nth) in pollers {
+        spawn_poller(
+            state,
+            store,
+            pc.file.clone(),
+            pc.profile.clone(),
+            poll_interval.max(1),
+            budget.clone(),
+            nth,
+        );
+    }
+
+    print_banner(port, &rows, /* project */ true);
+
+    bind_and_serve(project_router(mounted, max_concurrency), port).await
+}
+
+/// Assemble the project's router: `/` (outside every cell's throttle, so no
+/// cell's saturation can shed the process's own liveness route), each cell
+/// nested at its mount with its own throttle, and a fallback that names the
+/// door that does exist. Split from `run_project` so it can be driven with
+/// `oneshot` in tests, same idiom as `build_state`/`app`.
+fn project_router(mounted: MountedCells, max_concurrency: usize) -> Router {
+    let root = Router::new()
+        .route("/", get(project_root))
+        .with_state(Arc::new(mounted.clone()));
+    let mut app = root;
+    for (mount, state) in mounted {
+        // `nest_service`, not `nest`: axum 0.7's `nest` maps the nested `/`
+        // route to the bare prefix only (`/weather`, never `/weather/`) —
+        // `nest_service` registers both, which is the one every operator
+        // typing a mount URL by hand should be able to rely on.
+        app = app.nest_service(
+            &format!("/{mount}"),
+            throttle(cell_router(state), max_concurrency),
+        );
+    }
+    // A wrong mount is a 404 that names the door that does exist, matching
+    // `no export '{route}'` on the data door.
+    app.fallback(project_not_found)
+}
+
+async fn bind_and_serve(app: Router, port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!(%addr, "serving cell");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Divide the operator's DuckDB memory budget across the mounted cells
+/// (ADR 0014). `DATAMK_MEMORY_LIMIT` is applied per connection, so N cells
+/// would otherwise authorize N times what the operator wrote — and the pod
+/// OOM-kills, taking every cell with it. An unparseable value is a hard
+/// startup error rather than a warning: silently handing each of ten cells
+/// the full budget is the exact failure the knob exists to prevent.
+fn project_budget(cells: usize) -> Result<engine::Budget> {
+    let cells = cells.max(1);
+    let memory_limit = match std::env::var("DATAMK_MEMORY_LIMIT") {
+        Ok(raw) if !raw.is_empty() => {
+            let bytes = parse_bytes(&raw).with_context(|| {
+                format!(
+                    "DATAMK_MEMORY_LIMIT='{raw}' cannot be divided across {cells} mounted cells \
+                     — use a value like 3GB, or unset it and let DuckDB size itself"
+                )
+            })?;
+            let each = (bytes / cells as u64).max(1 << 20);
+            Some(format!("{}MiB", (each / (1 << 20)).max(1)))
+        }
+        _ => None,
+    };
+    // DuckDB defaults `threads` to the host's core count per connection.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    Ok(engine::Budget {
+        memory_limit,
+        threads: Some((cores / cells).max(1)),
+    })
+}
+
+/// Parse a DuckDB-style byte size (`3GB`, `512MiB`, `1024`) into bytes.
+/// Decimal and binary suffixes both accepted, both treated as binary — the
+/// 7% difference is noise against a budget being divided N ways, and
+/// over-counting is the unsafe direction.
+fn parse_bytes(raw: &str) -> Result<u64> {
+    let s = raw.trim();
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let num: f64 = num
+        .parse()
+        .with_context(|| format!("'{raw}' does not start with a number"))?;
+    let mult: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" | "KIB" => 1 << 10,
+        "M" | "MB" | "MIB" => 1 << 20,
+        "G" | "GB" | "GIB" => 1 << 30,
+        "T" | "TB" | "TIB" => 1u64 << 40,
+        other => bail!("unknown size unit '{other}'"),
+    };
+    Ok((num * mult as f64) as u64)
+}
+
+/// One row of the startup banner.
+struct BannerRow {
+    mount: String,
+    cell: String,
+    profile: String,
+    no_data: bool,
+}
+
+/// What is mounted where, at which profile — printed before the socket
+/// binds. A per-cell `profile:` override needs to be visible at startup,
+/// not just written down in the project file.
+fn print_banner(port: u16, rows: &[BannerRow], project: bool) {
+    let plural = if rows.len() == 1 { "cell" } else { "cells" };
+    println!(
+        "\nServing {} {plural} on http://0.0.0.0:{port}\n",
+        rows.len()
+    );
+    let w_mount = rows.iter().map(|r| r.mount.len()).max().unwrap_or(5).max(5);
+    let w_cell = rows.iter().map(|r| r.cell.len()).max().unwrap_or(4).max(4);
+    let w_prof = rows
+        .iter()
+        .map(|r| r.profile.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    println!(
+        "  {:<w_mount$}  {:<w_cell$}  {:<w_prof$}  DATA",
+        "MOUNT", "CELL", "PROFILE"
+    );
+    for r in rows {
+        let data = if r.no_data { "no (no_data)" } else { "yes" };
+        println!(
+            "  {:<w_mount$}  {:<w_cell$}  {:<w_prof$}  {data}",
+            r.mount, r.cell, r.profile
+        );
+    }
+    println!();
+    if project {
+        let first = rows.first().map(|r| r.mount.as_str()).unwrap_or("/cell");
+        let root_line = "  GET /".to_string();
+        let context_line = format!("  GET {first}/context");
+        let w = root_line.len().max(context_line.len()) + 3;
+        println!("{root_line:<w$}the mounted cells");
+        println!("{context_line:<w$}a cell's interface");
+    } else {
+        println!("  GET /                  liveness");
+        println!("  GET /context           the cell's interface");
+    }
+    println!();
 }
 
 /// Build the serving state from an opened cell. Split from `run` so the
@@ -276,6 +533,7 @@ fn build_state(
     no_data: bool,
     file: &Path,
     profile: &str,
+    base_path: &str,
 ) -> Result<(Arc<AppState>, Option<Arc<crate::store::Store>>)> {
     let published = load_published(&cell.dir);
     let data_mounted = !no_data;
@@ -395,6 +653,7 @@ fn build_state(
             cell.def.description.as_deref(),
             if data_mounted { &mounted } else { &[] },
             &digest,
+            base_path,
         ),
         cell_name: cell.def.cell.clone(),
         routes,
@@ -426,6 +685,7 @@ fn build_state(
         source_check,
         source_descriptions,
         observed_bundle_sha12,
+        base_path: base_path.to_string(),
         cell: Mutex::new(cell),
     });
     Ok((state, store))
@@ -600,7 +860,11 @@ fn probe_exports(
                         .map(|(g, v)| format!("{g}={}", percent_encode(v.as_deref().unwrap_or(""))))
                         .collect::<Vec<_>>()
                         .join("&");
-                    probe.example_request = Some(format!("/{route}?{params}&limit=10"));
+                    // Relative to the document's own URL, exactly like
+                    // `sample_request` — this one rides `observed` and never
+                    // reaches the digest, but a caller must resolve both the
+                    // same way.
+                    probe.example_request = Some(format!("{route}?{params}&limit=10"));
                 }
             }
         }
@@ -681,6 +945,16 @@ fn fetch_run_summary(state: &AppState, store: &crate::store::Store) {
 /// semaphore makes the cap global across connections. Per-client fairness
 /// is a reverse proxy's job (docs/guides/serving.md), not this socket's.
 fn app(state: Arc<AppState>, max_concurrency: usize) -> Router {
+    throttle(cell_router(state), max_concurrency)
+}
+
+/// One cell's routes, unthrottled. Split from `app` so a project can give
+/// each mounted cell its **own** throttle: a tower layer instance owns one
+/// semaphore, so a shared layer would let one cell's saturation shed every
+/// other cell's requests — including the liveness route Kubernetes probes
+/// (`deploy/targets/kubernetes/render.rs`'s `http_probe`), turning one slow
+/// query into an estate-wide pod restart.
+fn cell_router(state: Arc<AppState>) -> Router {
     // `/context` replaces the old `/interface` stub (ADR 0012 §4): renamed,
     // not duplicated — one document, one route, and the old name 404s (same
     // rule as unmounted data routes: no door, no 403). No reserved-name
@@ -691,20 +965,28 @@ fn app(state: Arc<AppState>, max_concurrency: usize) -> Router {
         .route("/context", get(context_doc))
         .route("/openapi.json", get(openapi_doc))
         .route("/:route", get(serve_export))
-        .layer(
-            tower::ServiceBuilder::new()
-                .layer(axum::error_handling::HandleErrorLayer::new(
-                    |_: tower::BoxError| async {
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "server at capacity — retry with backoff",
-                        )
-                    },
-                ))
-                .load_shed()
-                .concurrency_limit(max_concurrency.max(1)),
-        )
         .with_state(state)
+}
+
+/// The throttle stack (ADR 0012 §7): a concurrency cap with load-shed.
+/// Requests over the cap get an immediate 503 instead of queueing without
+/// bound. Applied per mounted cell (see `cell_router`), so `--max-concurrency`
+/// keeps its single-cell meaning exactly. Per-client fairness is a reverse
+/// proxy's job (docs/guides/serving.md), not this socket's.
+fn throttle(router: Router, max_concurrency: usize) -> Router {
+    router.layer(
+        tower::ServiceBuilder::new()
+            .layer(axum::error_handling::HandleErrorLayer::new(
+                |_: tower::BoxError| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "server at capacity — retry with backoff",
+                    )
+                },
+            ))
+            .load_shed()
+            .concurrency_limit(max_concurrency.max(1)),
+    )
 }
 
 /// The fetch-and-swap poller (ADR 0004 §6): re-read `LATEST` every interval;
@@ -721,73 +1003,88 @@ fn spawn_poller(
     file: std::path::PathBuf,
     profile: String,
     interval_secs: u64,
+    budget: engine::Budget,
+    stagger: u64,
 ) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
-
-        let latest = match store.latest() {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                tracing::warn!("LATEST pointer disappeared; keeping last-good catalog");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "polling LATEST failed; keeping last-good catalog");
-                continue;
-            }
-        };
-
-        {
-            let mut f = state.freshness.lock().expect("freshness mutex poisoned");
-            f.latest_seen = latest;
-            f.last_ok_poll_unix = Some(unix_now());
+    // Every line a poller emits carries `cell` (ADR 0014): N pollers
+    // interleaved on one process's stderr are otherwise unattributable, and
+    // "failed to open newly published execution" is precisely the line an
+    // operator needs to trace to a cell.
+    let cell_name = state.cell_name.clone();
+    std::thread::spawn(move || {
+        // Offset each cell's first tick so N pollers don't wake together and
+        // issue N simultaneous artifact downloads on every interval.
+        if stagger > 0 {
+            let offset = (stagger % interval_secs.max(1)).min(interval_secs);
+            std::thread::sleep(std::time::Duration::from_secs(offset));
         }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(interval_secs));
 
-        let served = state.execution.load(std::sync::atomic::Ordering::Relaxed);
-        if latest != served {
-            // A rollback (§9) moves LATEST backwards; advance or retreat alike,
-            // serve what the pointer names.
-            match engine::open(&file, &profile, /* read_only */ true) {
-                Ok(new_cell) => {
-                    let n = new_cell
-                        .published
-                        .as_ref()
-                        .and_then(|p| p.execution)
-                        .unwrap_or(0);
-                    // Read the new lake's snapshot time and re-run the probes
-                    // before the swap — off the request path, on the
-                    // connection no request holds yet (ADR 0012 §5).
-                    let as_of = query_data_as_of(&new_cell.conn);
-                    let published = load_published(&new_cell.dir);
-                    let probes = probe_exports(
-                        &new_cell.conn,
-                        &state.route_list,
-                        &published,
-                        state.data_mounted,
-                    );
-                    // Swap under the lock: in-flight requests finish on the old
-                    // cell first (they hold the lock for the query's duration);
-                    // dropping it reclaims its scratch artifact.
-                    *state.cell.lock().expect("cell mutex poisoned") = new_cell;
-                    state
-                        .execution
-                        .store(n, std::sync::atomic::Ordering::Relaxed);
-                    *state.data_as_of.lock().expect("data_as_of mutex poisoned") = as_of;
-                    *state.probes.lock().expect("probes mutex poisoned") = probes;
-                    tracing::info!(execution = n, "swapped to newly published execution");
+            let latest = match store.latest() {
+                Ok(Some(n)) => n,
+                Ok(None) => {
+                    tracing::warn!(cell = %cell_name, "LATEST pointer disappeared; keeping last-good catalog");
+                    continue;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, execution = latest,
+                    tracing::warn!(cell = %cell_name, error = %e, "polling LATEST failed; keeping last-good catalog");
+                    continue;
+                }
+            };
+
+            {
+                let mut f = state.freshness.lock().expect("freshness mutex poisoned");
+                f.latest_seen = latest;
+                f.last_ok_poll_unix = Some(unix_now());
+            }
+
+            let served = state.execution.load(std::sync::atomic::Ordering::Relaxed);
+            if latest != served {
+                // A rollback (§9) moves LATEST backwards; advance or retreat alike,
+                // serve what the pointer names.
+                match engine::open_with(&file, &profile, /* read_only */ true, &budget) {
+                    Ok(new_cell) => {
+                        let n = new_cell
+                            .published
+                            .as_ref()
+                            .and_then(|p| p.execution)
+                            .unwrap_or(0);
+                        // Read the new lake's snapshot time and re-run the probes
+                        // before the swap — off the request path, on the
+                        // connection no request holds yet (ADR 0012 §5).
+                        let as_of = query_data_as_of(&new_cell.conn);
+                        let published = load_published(&new_cell.dir);
+                        let probes = probe_exports(
+                            &new_cell.conn,
+                            &state.route_list,
+                            &published,
+                            state.data_mounted,
+                        );
+                        // Swap under the lock: in-flight requests finish on the old
+                        // cell first (they hold the lock for the query's duration);
+                        // dropping it reclaims its scratch artifact.
+                        *state.cell.lock().expect("cell mutex poisoned") = new_cell;
+                        state
+                            .execution
+                            .store(n, std::sync::atomic::Ordering::Relaxed);
+                        *state.data_as_of.lock().expect("data_as_of mutex poisoned") = as_of;
+                        *state.probes.lock().expect("probes mutex poisoned") = probes;
+                        tracing::info!(cell = %cell_name, execution = n, "swapped to newly published execution");
+                    }
+                    Err(e) => {
+                        tracing::warn!(cell = %cell_name, error = %e, execution = latest,
                         "failed to open newly published execution; keeping last-good catalog");
+                    }
                 }
             }
-        }
 
-        // ADR 0012 §5: the run-summary fetch rides every poll tick, never the
-        // swap branch — the summary is written after `publish_execution`
-        // returns, so gating it on the swap would orphan any summary that
-        // lands after `LATEST` advances.
-        fetch_run_summary(&state, &store);
+            // ADR 0012 §5: the run-summary fetch rides every poll tick, never the
+            // swap branch — the summary is written after `publish_execution`
+            // returns, so gating it on the swap would orphan any summary that
+            // lands after `LATEST` advances.
+            fetch_run_summary(&state, &store);
+        }
     });
 }
 
@@ -798,6 +1095,44 @@ fn load_published(dir: &Path) -> BTreeMap<String, i64> {
         .and_then(|raw| serde_json::from_str::<crate::manifest::Published>(&raw).ok())
         .map(|p| p.routes)
         .unwrap_or_default()
+}
+
+/// The project root (ADR 0014): liveness, plus the mounts this caller may
+/// actually reach.
+///
+/// The listing is filtered through each cell's **own** `authorize()`, which
+/// is what keeps it on the right side of ADR 0012 §6's refusal of "a
+/// data-plane route that enumerates other cells… pre-auth crawl bait": an
+/// anonymous caller against an all-private project gets `[]`, and a cell
+/// whose `access.shareable` is false is invisible to everyone, exactly as it
+/// is today. It carries names only — no exports, no descriptions, no
+/// digests. The moment it returns a per-cell summary it *is* a served mesh
+/// manifest, which §6 refuses by name; that document is `datamk mesh emit`'s
+/// job and it is a static file an operator hosts, never this socket.
+///
+/// `status` stays unconditional so a liveness probe needs no credential.
+async fn project_root(
+    State(cells): State<Arc<MountedCells>>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    let visible: Vec<&str> = cells
+        .iter()
+        .filter(|(_, s)| authorize(s, &headers).is_ok())
+        .map(|(mount, _)| mount.as_str())
+        .collect();
+    Json(serde_json::json!({ "status": "ok", "cells": visible }))
+}
+
+/// An unknown mount in a project. Names the door that exists rather than
+/// listing the ones that do — an unauthenticated 404 must not become the
+/// enumeration `project_root` just took care to filter.
+async fn project_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "no such cell or route — each cell mounts its own interface at \
+         /<cell>/context; GET / lists the cells you can reach",
+    )
+        .into_response()
 }
 
 /// Pre-authorize liveness route (`/`). Carries the served execution number —
@@ -1051,10 +1386,18 @@ async fn context_doc(
 fn with_context_headers(s: &AppState, mut resp: Response) -> Response {
     use axum::http::HeaderValue;
     let h = resp.headers_mut();
-    h.insert(
-        header::LINK,
-        HeaderValue::from_static("</context>; rel=\"describedby\""),
-    );
+    // Mount-aware (ADR 0014): a hardcoded `</context>` points at the
+    // *process* root, which in a project is either another cell's document or
+    // a 404 — on the exact responses (400/404) where the back-link is the
+    // whole point.
+    if let Ok(v) = HeaderValue::from_str(&format!("<{}/context>; rel=\"describedby\"", s.base_path))
+    {
+        h.insert(header::LINK, v);
+    }
+    // One origin serves many cells with different auth policies, so a shared
+    // cache keyed on URI alone could hand cell A's rows to a caller holding
+    // only cell B's token (`context_doc`/`openapi_doc` say `private` too).
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
     if let Ok(v) = HeaderValue::from_str(&s.digest) {
         h.insert("x-datamk-context-digest", v);
     }
@@ -1573,7 +1916,7 @@ mod tests {
 
         // The sample request is a legal sentence in the grammar.
         let (path, query) = qb.sample_request.split_once('?').unwrap();
-        assert_eq!(path, "/orders_daily@2");
+        assert_eq!(path, "orders_daily@2");
         let params: HashMap<String, String> = query
             .split('&')
             .map(|kv| kv.split_once('=').unwrap())
@@ -1655,7 +1998,8 @@ mod smoke {
         let cell_yaml = scaffold.dir.join("cell.yaml");
         let mut cell = engine::open(&cell_yaml, "local", true).expect("open built cell read-only");
         mutate(&mut cell);
-        let (state, _store) = build_state(cell, no_data, &cell_yaml, "local").expect("build state");
+        let (state, _store) =
+            build_state(cell, no_data, &cell_yaml, "local", "").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -1737,7 +2081,7 @@ mod smoke {
             engine::open(&cell_yaml, "local", true).expect("open built never-cell read-only");
         mutate(&mut cell);
         let (state, _store) =
-            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
+            build_state(cell, /* no_data */ false, &cell_yaml, "local", "").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -1846,7 +2190,7 @@ mod smoke {
             engine::open(&cell_yaml, "local", true).expect("open built all-never cell read-only");
         mutate(&mut cell);
         let (state, _store) =
-            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
+            build_state(cell, /* no_data */ false, &cell_yaml, "local", "").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -1857,7 +2201,7 @@ mod smoke {
             .expect("open built all-never-verified cell read-only");
         mutate(&mut cell);
         let (state, _store) =
-            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
+            build_state(cell, /* no_data */ false, &cell_yaml, "local", "").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -1948,7 +2292,7 @@ mod smoke {
             .expect("open built all-never-with-descriptions cell read-only");
         mutate(&mut cell);
         let (state, _store) =
-            build_state(cell, /* no_data */ false, &cell_yaml, "local").expect("build state");
+            build_state(cell, /* no_data */ false, &cell_yaml, "local", "").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -1993,7 +2337,7 @@ mod smoke {
             let (status, body) = get(&router, "/context", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(v["datamk_context"], 2);
+            assert_eq!(v["datamk_context"], 3);
             assert_eq!(v["cell"], "smoke");
             assert_eq!(v["status"], "draft");
             assert_eq!(v["grain_verified"], false);
@@ -2001,7 +2345,7 @@ mod smoke {
             assert_eq!(v["declared"]["exports"][0]["route"], "orders_daily@2");
             assert_eq!(
                 v["declared"]["exports"][0]["query"]["sample_request"],
-                "/orders_daily@2?limit=10"
+                "orders_daily@2?limit=10"
             );
             assert_eq!(v["data"]["served_here"], true);
             assert_eq!(v["notes"][0], crate::context::NOTE_DIRECT_ATTACH);
@@ -2198,9 +2542,12 @@ mod smoke {
             let example = probe["example_request"].as_str().unwrap();
             assert_eq!(
                 example,
-                "/orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
+                "orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
             );
-            let (status, rows) = get(&router, example, None).await;
+            // The affordance is document-relative (ADR 0014): resolved
+            // against this cell's own `/context`, which is at the root
+            // here, that is a leading slash away.
+            let (status, rows) = get(&router, &format!("/{example}"), None).await;
             assert_eq!(status, StatusCode::OK, "{rows}");
             let rows: Vec<serde_json::Value> = serde_json::from_str(&rows).unwrap();
             assert_eq!(rows.len(), 1, "the example request must hit a real row");
@@ -2535,7 +2882,7 @@ mod smoke {
         let cell = engine::open(&cell_yaml, "other", true)
             .expect("open the same scaffold under a different profile");
         let (state, _store) =
-            build_state(cell, /* no_data */ false, &cell_yaml, "other").expect("build state");
+            build_state(cell, /* no_data */ false, &cell_yaml, "other", "").expect("build state");
         let router = app(state, DEFAULT_MAX_CONCURRENCY);
         rt().block_on(async {
             let (status, body) = get(&router, "/context", None).await;
@@ -2627,7 +2974,8 @@ mod smoke {
         let mut cell =
             engine::open(&cell_yaml, "local", true).expect("open docs scaffold read-only");
         mutate(&mut cell);
-        let (state, _store) = build_state(cell, no_data, &cell_yaml, "local").expect("build state");
+        let (state, _store) =
+            build_state(cell, no_data, &cell_yaml, "local", "").expect("build state");
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
@@ -3093,6 +3441,267 @@ mod smoke {
                 built_all_never_cell_with_descriptions(),
                 all_never_with_descriptions_router_with(|_| {}),
             );
+        }
+    }
+
+    /// `run_project`'s router (ADR 0014): N cells nested under `/<mount>`,
+    /// driven through `project_router` directly — same `oneshot`, no-socket
+    /// idiom as the rest of this suite.
+    mod project_mode {
+        use super::*;
+
+        /// `test/integrations/orders`, copied to scratch and built fresh —
+        /// a second real cell, independent of `built_cell()`'s init
+        /// scaffold, so multi-cell tests never depend on committed `.cell`
+        /// state.
+        fn built_orders_cell() -> &'static Scaffold {
+            use std::sync::OnceLock;
+            static CELL: OnceLock<Scaffold> = OnceLock::new();
+            CELL.get_or_init(|| {
+                let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("test/integrations/orders");
+                let dir = std::env::temp_dir().join(format!(
+                    "datamk-serve-smoke-orders-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                copy_cell_dir(&src, &dir);
+                crate::engine::run(
+                    &dir.join("cell.yaml"),
+                    "local",
+                    None,
+                    crate::engine::RunOptions::default(),
+                )
+                .expect("build the orders fixture cell");
+                Scaffold { dir }
+            })
+        }
+
+        fn copy_cell_dir(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                if name == ".cell" {
+                    continue; // generated state — `engine::run` produces its own
+                }
+                let (from, to) = (entry.path(), dst.join(&name));
+                if entry.file_type().unwrap().is_dir() {
+                    copy_cell_dir(&from, &to);
+                } else {
+                    std::fs::copy(&from, &to).unwrap();
+                }
+            }
+        }
+
+        /// Open `scaffold` read-only, mutate the parsed definition, and
+        /// build the mounted `(mount, state)` pair `project_router` takes.
+        fn mounted(
+            scaffold: &Scaffold,
+            mount: &str,
+            no_data: bool,
+            mutate: impl FnOnce(&mut engine::Cell),
+        ) -> (String, Arc<AppState>) {
+            let cell_yaml = scaffold.dir.join("cell.yaml");
+            let mut cell = engine::open(&cell_yaml, "local", true).expect("open cell read-only");
+            mutate(&mut cell);
+            let base_path = format!("/{mount}");
+            let (state, _store) =
+                build_state(cell, no_data, &cell_yaml, "local", &base_path).expect("build state");
+            (mount.to_string(), state)
+        }
+
+        #[test]
+        fn each_mount_serves_its_own_context_with_its_own_digest() {
+            let router = project_router(
+                vec![
+                    mounted(built_cell(), "a", false, |_| {}),
+                    mounted(built_orders_cell(), "b", false, |_| {}),
+                ],
+                DEFAULT_MAX_CONCURRENCY,
+            );
+            rt().block_on(async {
+                let (status, headers_a, body_a) =
+                    get_with_headers(&router, "/a/context", &[]).await;
+                assert_eq!(status, StatusCode::OK, "{body_a}");
+                let va: serde_json::Value = serde_json::from_str(&body_a).unwrap();
+                assert_eq!(va["cell"], "smoke");
+
+                let (status, headers_b, body_b) =
+                    get_with_headers(&router, "/b/context", &[]).await;
+                assert_eq!(status, StatusCode::OK, "{body_b}");
+                let vb: serde_json::Value = serde_json::from_str(&body_b).unwrap();
+                assert_eq!(vb["cell"], "orders");
+
+                assert_ne!(
+                    headers_a.get(header::ETAG),
+                    headers_b.get(header::ETAG),
+                    "two different cells must not share a digest"
+                );
+            });
+        }
+
+        /// The whole point of relative request affordances (ADR 0014,
+        /// `datamk_context: 3`): the same cell's digest and declared
+        /// document do not change when it moves from the root to a mount.
+        #[test]
+        fn a_cells_digest_is_identical_mounted_and_unmounted() {
+            // Unmounted: the exact single-cell router `run` binds, base_path "".
+            let router_unmounted = router_with(|_| {});
+            let router_mounted = project_router(
+                vec![mounted(built_cell(), "weather", false, |_| {})],
+                DEFAULT_MAX_CONCURRENCY,
+            );
+            rt().block_on(async {
+                let (_, headers_u, body_u) =
+                    get_with_headers(&router_unmounted, "/context", &[]).await;
+                let (_, headers_m, body_m) =
+                    get_with_headers(&router_mounted, "/weather/context", &[]).await;
+                assert_eq!(
+                    headers_u.get(header::ETAG),
+                    headers_m.get(header::ETAG),
+                    "mounting must not move the digest"
+                );
+                let vu: serde_json::Value = serde_json::from_str(&body_u).unwrap();
+                let vm: serde_json::Value = serde_json::from_str(&body_m).unwrap();
+                assert_eq!(vu["declared"], vm["declared"], "{body_u}\n{body_m}");
+                assert_eq!(
+                    vu["declared"]["exports"][0]["query"]["sample_request"],
+                    vm["declared"]["exports"][0]["query"]["sample_request"],
+                    "the sample request string itself must not change"
+                );
+            });
+        }
+
+        /// An anonymous caller against a project with one open and one
+        /// role-gated cell sees only the one it can actually reach —
+        /// `status` stays `ok` regardless (ADR 0012 §6: `/` is a liveness
+        /// route, never a served mesh manifest).
+        #[test]
+        fn root_lists_only_mounts_the_caller_can_reach() {
+            let principals = built_cell().dir.join("principals_project_mode.json");
+            std::fs::write(&principals, r#"{ "good": ["analyst"] }"#).unwrap();
+            let gated = mounted(built_cell(), "gated", false, |cell| {
+                cell.def.access.roles = vec!["analyst".to_string()];
+                cell.principals = Some(principals.to_string_lossy().into_owned());
+            });
+            let open = mounted(built_cell(), "open", false, |_| {});
+            let router = project_router(vec![open, gated], DEFAULT_MAX_CONCURRENCY);
+
+            rt().block_on(async {
+                let (status, body) = get(&router, "/", None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["status"], "ok");
+                assert_eq!(v["cells"], serde_json::json!(["open"]), "{body}");
+
+                let (status, body) = get(&router, "/", Some("good")).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["status"], "ok");
+                let cells: std::collections::BTreeSet<&str> = v["cells"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    cells,
+                    ["gated", "open"].into_iter().collect(),
+                    "an analyst token sees both mounts: {body}"
+                );
+            });
+        }
+
+        #[test]
+        fn unknown_mount_404s_naming_the_door_that_exists() {
+            let router = project_router(
+                vec![mounted(built_cell(), "a", false, |_| {})],
+                DEFAULT_MAX_CONCURRENCY,
+            );
+            rt().block_on(async {
+                let (status, body) = get(&router, "/nope", None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+                assert!(body.contains("/<cell>/context"), "{body}");
+            });
+        }
+
+        /// `--no-data` (process-wide) and a per-cell `no_data:` (project
+        /// file) union rather than override one another.
+        #[test]
+        fn no_data_unions_the_process_flag_and_the_per_cell_flag() {
+            let router = project_router(
+                vec![
+                    mounted(built_cell(), "a", /* process --no-data */ true, |_| {}),
+                    mounted(built_cell(), "b", /* process --no-data */ true, |_| {}),
+                ],
+                DEFAULT_MAX_CONCURRENCY,
+            );
+            rt().block_on(async {
+                for mount in ["a", "b"] {
+                    let (status, body) =
+                        get(&router, &format!("/{mount}/orders_daily@2"), None).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::NOT_FOUND,
+                        "--no-data must apply to every mounted cell: {body}"
+                    );
+                }
+            });
+        }
+
+        /// axum 0.7's `nest`: a request to the mount with **no** trailing
+        /// slash must still reach the nested router's `/` — every mesh
+        /// `url` and every relative affordance is written without one.
+        #[test]
+        fn nest_without_a_trailing_slash_still_reaches_the_inner_root() {
+            let router = project_router(
+                vec![mounted(built_cell(), "weather", false, |_| {})],
+                DEFAULT_MAX_CONCURRENCY,
+            );
+            rt().block_on(async {
+                let (status, body) = get(&router, "/weather", None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let (status, body) = get(&router, "/weather/", None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            });
+        }
+
+        /// The `Link` back-link and the context digest header must resolve
+        /// under a mount on error responses too, not just 200 — a caller
+        /// debugging a 400/404 needs the same affordance a 200 gets.
+        #[test]
+        fn link_and_digest_headers_resolve_under_a_mount_on_400_and_404() {
+            let router = project_router(
+                vec![mounted(built_cell(), "weather", false, |_| {})],
+                DEFAULT_MAX_CONCURRENCY,
+            );
+            rt().block_on(async {
+                // 400: an unknown query param on a real data route.
+                let (status, headers, body) =
+                    get_with_headers(&router, "/weather/orders_daily@2?bogus=1", &[]).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                let link = headers
+                    .get(header::LINK)
+                    .and_then(|v| v.to_str().ok())
+                    .expect("Link header present on a 400");
+                assert_eq!(link, "</weather/context>; rel=\"describedby\"");
+                assert!(headers.get("x-datamk-context-digest").is_some());
+
+                // 404: an export that does not exist.
+                let (status, headers, body) =
+                    get_with_headers(&router, "/weather/nope@1", &[]).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+                let link = headers
+                    .get(header::LINK)
+                    .and_then(|v| v.to_str().ok())
+                    .expect("Link header present on a 404");
+                assert_eq!(link, "</weather/context>; rel=\"describedby\"");
+                assert!(headers.get("x-datamk-context-digest").is_some());
+            });
         }
     }
 }

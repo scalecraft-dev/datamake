@@ -22,6 +22,7 @@ pub fn generate(
     description: Option<&str>,
     routes: &[(String, Export)],
     version: &str,
+    base_path: &str,
 ) -> Value {
     let mut paths = Map::new();
     paths.insert("/".to_string(), health_path_item());
@@ -30,7 +31,7 @@ pub fn generate(
     for (route, export) in routes {
         paths.insert(format!("/{route}"), path_item(export));
     }
-    json!({
+    let mut doc = json!({
         "openapi": "3.1.0",
         "info": {
             "title": cell,
@@ -38,7 +39,15 @@ pub fn generate(
             "description": description.unwrap_or("Generated from the cell interface")
         },
         "paths": Value::Object(paths)
-    })
+    });
+    // A mounted cell (ADR 0014) declares its base in `servers`, never by
+    // rewriting path keys: those are derived from route keys, which are
+    // contract (`name@major`), and prefixing them would fold the deployment's
+    // mount point into a contract-derived identifier.
+    if !base_path.is_empty() {
+        doc["servers"] = json!([{ "url": base_path }]);
+    }
+    doc
 }
 
 fn health_path_item() -> Value {
@@ -444,7 +453,13 @@ mod tests {
         };
         // The same shared route list `serve` and `/context` read (ADR 0012 §4).
         let routes = crate::context::discoverable_routes(&def).unwrap();
-        let doc = generate(&def.cell, def.description.as_deref(), &routes, "digest123");
+        let doc = generate(
+            &def.cell,
+            def.description.as_deref(),
+            &routes,
+            "digest123",
+            "",
+        );
         assert_eq!(doc["openapi"], "3.1.0");
         assert_eq!(doc["info"]["title"], "orders");
         // ADR 0012 §7: the version is the interface digest, not "0.0.0".
@@ -491,7 +506,7 @@ mod tests {
     /// so a new top-level key can't ship undocumented.
     #[test]
     fn context_schema_names_every_top_level_document_key() {
-        let doc = generate("orders", None, &[], "digest123");
+        let doc = generate("orders", None, &[], "digest123", "");
         let schema = &doc["paths"]["/context"]["get"]["responses"]["200"]["content"]
             ["application/json"]["schema"];
         let props = schema["properties"].as_object().unwrap();
@@ -546,7 +561,7 @@ mod tests {
             access: Default::default(),
         };
         let routes = crate::context::discoverable_routes(&def).unwrap();
-        let doc = generate(&def.cell, None, &routes, "digest123");
+        let doc = generate(&def.cell, None, &routes, "digest123", "");
         let item = &doc["paths"]["/orders_daily@2"];
         assert_eq!(item["x-datamk-version"], "2.1.0");
         assert_eq!(item["x-datamk-contract"], "experimental");
@@ -571,7 +586,7 @@ mod tests {
     /// `/`, `/context`, `/openapi.json` were all live.
     #[test]
     fn generate_emits_meta_paths_with_zero_data_routes() {
-        let doc = generate("orders", None, &[], "digest123");
+        let doc = generate("orders", None, &[], "digest123", "");
         let paths = doc["paths"].as_object().unwrap();
         let keys: std::collections::BTreeSet<&str> = paths.keys().map(|k| k.as_str()).collect();
         let expected: std::collections::BTreeSet<&str> =
@@ -585,7 +600,7 @@ mod tests {
     /// so a change to either fails loudly.
     #[test]
     fn context_include_param_is_generated_from_the_shared_vocabulary() {
-        let doc = generate("orders", None, &[], "digest123");
+        let doc = generate("orders", None, &[], "digest123", "");
         let params = doc["paths"]["/context"]["get"]["parameters"]
             .as_array()
             .unwrap();
@@ -606,5 +621,18 @@ mod tests {
         for code in ["200", "304", "400", "401", "403"] {
             assert!(responses.get(code).is_some(), "missing response {code}");
         }
+    }
+
+    /// A non-empty `base_path` adds `servers` and leaves path keys alone
+    /// (ADR 0014) — the mount lives in `servers[0].url`, never folded into a
+    /// contract-derived route key.
+    #[test]
+    fn base_path_adds_servers_without_touching_path_keys() {
+        let doc = generate("orders", None, &[], "digest123", "/weather");
+        assert_eq!(doc["servers"], json!([{ "url": "/weather" }]));
+        assert!(doc["paths"].as_object().unwrap().contains_key("/context"));
+
+        let unmounted = generate("orders", None, &[], "digest123", "");
+        assert!(unmounted.get("servers").is_none(), "{unmounted}");
     }
 }

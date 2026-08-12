@@ -24,7 +24,12 @@ use crate::engine::run_summary::RunSummary;
 /// deprecation window (ADR 0012 §2).
 ///
 /// **2**: `declared.docs[].path` renamed to `source_path`.
-pub const DATAMK_CONTEXT_VERSION: u32 = 2;
+/// **3**: every emitted request affordance (`declared.include_request`,
+/// `declared.exports[].query.sample_request`, `observed.exports[]
+/// .example_request`) is **relative to the document's own URL** —
+/// `orders_daily@2?limit=10`, not `/orders_daily@2?limit=10`. A re-meaning,
+/// so it bumps. See `INCLUDE_DOCS_REQUEST` for why.
+pub const DATAMK_CONTEXT_VERSION: u32 = 3;
 
 /// The `limit` in every emitted `sample_request` — the smallest useful legal
 /// call, a pure function of the route key and the limit grammar.
@@ -131,9 +136,19 @@ pub struct Declared {
     pub include_request: String,
 }
 
-/// `/context?include=docs` — the one and only door to docs content (ADR
+/// `context?include=docs` — the one and only door to docs content (ADR
 /// 0012 §4: one document, one route; there is no `/docs/:name`).
-const INCLUDE_DOCS_REQUEST: &str = "/context?include=docs";
+///
+/// **Relative, not root-absolute** (ADR 0014, `datamk_context: 3`). This
+/// string lives inside `Declared`, which `interface_digest` serializes
+/// whole, so a root-absolute affordance has no safe form once a cell can be
+/// mounted at a base path: `/context` 404s in a multi-cell server, and
+/// prefixing it with the mount makes the same `cell.yaml` yield a different
+/// digest depending on where it's served — environment leaking into the
+/// contract. A relative reference resolves per RFC 3986 §5 against the
+/// document's own URL and is correct unmounted or mounted with one string;
+/// the digest never sees the base path.
+const INCLUDE_DOCS_REQUEST: &str = "context?include=docs";
 
 /// One declared docs page's identity — never its content or a
 /// content-derived fingerprint (those live at the top-level `docs` field and
@@ -259,9 +274,9 @@ pub struct QueryBlock {
     pub limit_default: usize,
     pub limit_max: usize,
     pub offset_max: usize,
-    /// The smallest legal call, e.g. `/orders_daily@2?limit=10` — one
-    /// grounded sentence in the grammar, honest wherever the data routes are
-    /// mounted.
+    /// The smallest legal call, e.g. `orders_daily@2?limit=10` — one
+    /// grounded sentence in the grammar. Relative to the document's own URL,
+    /// never root-absolute — see `INCLUDE_DOCS_REQUEST`.
     pub sample_request: String,
 }
 
@@ -356,12 +371,13 @@ pub struct ExportProbe {
     /// (shipping them would exfiltrate a projection of the withheld rows).
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub values: IndexMap<String, ColumnValues>,
-    /// The grain-filtered sibling of `sample_request`, drawn jointly from
-    /// ONE real row — never composed from the per-column values
-    /// independently, which can name a combination that co-occurs nowhere
-    /// (manufacturing the exact empty-result-as-zero failure the probe
-    /// exists to kill). Emitted only when every grain column got a value;
-    /// never a placeholder, which an agent pastes literally.
+    /// The grain-filtered sibling of `sample_request` — relative to the
+    /// document's own URL for the same reason, drawn jointly from ONE real
+    /// row, never composed from the per-column values independently (which
+    /// can name a combination that co-occurs nowhere, manufacturing the
+    /// exact empty-result-as-zero failure the probe exists to kill).
+    /// Emitted only when every grain column got a value; never a
+    /// placeholder, which an agent pastes literally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub example_request: Option<String>,
 }
@@ -647,7 +663,7 @@ pub fn query_block(route: &str, export: &Export) -> QueryBlock {
         limit_default: crate::serve::DEFAULT_LIMIT,
         limit_max: crate::serve::MAX_LIMIT,
         offset_max: crate::serve::MAX_OFFSET,
-        sample_request: format!("/{route}?limit={SAMPLE_LIMIT}"),
+        sample_request: format!("{route}?limit={SAMPLE_LIMIT}"),
     }
 }
 
@@ -1256,7 +1272,7 @@ interface:
     fn context_document_serializes_to_the_documented_shape() {
         let json = serde_json::to_string_pretty(&sample_verified()).unwrap();
         let expected = r#"{
-  "datamk_context": 2,
+  "datamk_context": 3,
   "cell": "orders",
   "status": "verified",
   "grain_verified": true,
@@ -1296,7 +1312,7 @@ interface:
           "limit_default": 100,
           "limit_max": 1000,
           "offset_max": 1000000,
-          "sample_request": "/orders_daily@2?limit=10"
+          "sample_request": "orders_daily@2?limit=10"
         }
       }
     ],
@@ -1307,7 +1323,7 @@ interface:
       }
     ],
     "docs": [],
-    "include_request": "/context?include=docs"
+    "include_request": "context?include=docs"
   },
   "observed": {
     "provenance": {
@@ -2032,7 +2048,7 @@ interface:
         let routes = discoverable_routes(&def).unwrap();
         let d = declared(&def, &routes);
 
-        assert_eq!(d.include_request, "/context?include=docs");
+        assert_eq!(d.include_request, "context?include=docs");
         assert_eq!(d.docs.len(), 2, "{:?}", d.docs);
         assert_eq!(d.docs[0].target, "cell");
         assert_eq!(d.docs[0].source_path, "docs/overview.md");
@@ -2052,7 +2068,7 @@ interface:
         let d = declared(&def, &routes);
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["docs"], serde_json::json!([]));
-        assert_eq!(v["include_request"], "/context?include=docs");
+        assert_eq!(v["include_request"], "context?include=docs");
     }
 
     /// ADR 0013 §7: `datamk context` inlines docs by default — a request can

@@ -8,6 +8,7 @@ mod logging;
 mod manifest;
 mod mesh;
 mod ops;
+mod project;
 mod release;
 mod serve;
 mod store;
@@ -87,15 +88,32 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Release(a) => release::run(&a.file, &a.profile),
         Command::Deploy(a) => deploy::run(&a).await,
         Command::Serve(a) => {
-            serve::run(
-                &a.file,
-                &a.profile,
-                a.port,
-                a.poll_interval,
-                a.max_concurrency,
-                a.no_data,
-            )
-            .await
+            let file = match &a.file {
+                Some(f) => f.clone(),
+                None => project::discover()?,
+            };
+            if project::is_project_file(&file)? {
+                let project = project::load(&file, a.profile.as_deref())?;
+                serve::run_project(
+                    &project,
+                    a.port,
+                    a.poll_interval,
+                    a.max_concurrency,
+                    a.no_data,
+                )
+                .await
+            } else {
+                let profile = a.profile.as_deref().unwrap_or("local");
+                serve::run(
+                    &file,
+                    profile,
+                    a.port,
+                    a.poll_interval,
+                    a.max_concurrency,
+                    a.no_data,
+                )
+                .await
+            }
         }
         Command::Status(a) => ops::status(&a.file, &a.profile),
         Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution, a.download),

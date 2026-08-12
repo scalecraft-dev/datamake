@@ -258,7 +258,7 @@ graveyard and the same treadmill shape ADR 0011 rejected for connectors.
 - **The probe also captures one real row's grain values** — a single
   `SELECT {grain columns} FROM {export} LIMIT 1` at swap time — and from
   them emits `observed.probe.example_request`, the grain-filtered sibling
-  of §2's `sample_request` (e.g. `/flight_spend@1?month=2026-06&limit=10`).
+  of §2's `sample_request` (e.g. `flight_spend@1?month=2026-06&limit=10`).
   Jointly drawn from one row, never composed from the per-column `values`
   independently — independently-picked values can name a combination that
   co-occurs nowhere, manufacturing the exact empty-result-as-zero failure

@@ -157,7 +157,7 @@ key" impossible to reject on purpose.
   entry. `target` is `"cell"` or the route key (`name@major`) — route keys
   always carry `@major`, so no collision with the literal string `"cell"`.
   Always present (`[]` when none), alongside an affordance field
-  `declared.include_request: "/context?include=docs"` — the same pattern
+  `declared.include_request: "context?include=docs"` — the same pattern
   `declared.exports[].query` already establishes (an affordance living
   inside `declared`). **No content-derived value here** — no sha256, no
   bytes. `interface_digest` serializes the whole `Declared` struct, and that

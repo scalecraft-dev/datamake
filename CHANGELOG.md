@@ -6,6 +6,68 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added — serve several cells from one process (`datamk.yaml`, ADR 0014)
+
+A root `datamk.yaml` lists the cells one `datamk serve` process mounts behind
+one port, each at `/<mount>/…`:
+
+```yaml
+datamk: 1
+profile: prod
+cells:
+  - datamk-examples/weather
+  - path: dplat-datamake/flight-spend
+    profile: local
+    mount: flights
+    no_data: true
+```
+
+`datamk serve` with no `-f` uses `datamk.yaml` when it's in the current
+directory, else `cell.yaml`; `-f` accepts either and dispatches on the file's
+top-level key. `-p` overrides the project default and every per-cell
+`profile:`. `--no-data` unions with per-cell `no_data:`. `--max-concurrency`
+applies per mounted cell — a shared cap would let one cell's saturation shed
+every other cell's liveness route.
+
+Each cell keeps its own connection, catalog, poller, principals file, and
+authorization policy. `GET /` lists only the mounts the caller's token can
+reach (names only — discovery across cells stays `datamk mesh emit`'s job),
+and every listed cell must open or the server does not start.
+
+**Serving one cell is unchanged** — flat routes, no `servers` block, same
+headers, and the same interface digest a cell has when mounted.
+
+`datamk deploy` does not read this file; it still renders a single-cell
+workload.
+
+### Changed — BREAKING: request affordances in the context document are relative (`datamk_context: 3`)
+
+`declared.include_request`, `declared.exports[].query.sample_request`, and
+`observed.exports[].example_request` no longer carry a leading slash:
+
+```diff
+- "sample_request": "/orders_daily@2?limit=10"
++ "sample_request": "orders_daily@2?limit=10"
+- "include_request": "/context?include=docs"
++ "include_request": "context?include=docs"
+```
+
+**Migrate:** resolve them against the document's own URL (RFC 3986) instead
+of against the origin. A client that concatenated `origin + sample_request`
+now needs `origin + "/" + sample_request` for a root-mounted cell — or, and
+this is the point, any standard URL-resolution call, which is then correct
+for a mounted cell too.
+
+These strings live inside `declared`, which the interface digest hashes
+whole. Root-absolute, they either point at the process root (a 404 in a
+multi-cell server) or force the digest to depend on where a cell happens to
+be served — putting deployment inside the contract. Relative, one string is
+correct in both modes and the digest never sees the mount.
+
+Every interface digest changes once as a result. `mesh emit` copies context
+summaries from documents at version 3 (a version gate previously accepted
+only 1 and 2, and would have silently dropped every copied field).
+
 ### Changed — BREAKING: `materialize: never` is retired; virtual cells become bindings (issue #6)
 
 A transform declared `materialize: never` no longer parses into a working

@@ -87,7 +87,7 @@ omitted or `null` — never fabricated, never zeros.
         "filters": ["order_date", "region"],
         "filter_semantics": "exact equality only — no ranges, no operators, no non-grain columns",
         "limit_default": 100, "limit_max": 1000, "offset_max": 1000000,
-        "sample_request": "/orders_daily@2?limit=10"
+        "sample_request": "orders_daily@2?limit=10"
       }
     }],
     "upstreams": [{ "ref": "flights", "version": null }]
@@ -106,7 +106,7 @@ omitted or `null` — never fabricated, never zeros.
         "coverage": { "order_date": { "min": "2026-06-01", "max": "2026-06-02" } },
         "values":   { "region": { "values": ["eu-west", "us-east", "us-west"],
                                   "complete": true } },
-        "example_request": "/orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
+        "example_request": "orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
       }
     }
   },
@@ -125,7 +125,12 @@ A few parts earn special attention:
   confidently read as a filtered subset).
 - **`sample_request`** is the smallest legal call; **`example_request`** is
   its grain-filtered sibling, drawn jointly from one *real* row at build
-  time — pasting it returns data, never an empty page. The `coverage` and
+  time — pasting it returns data, never an empty page. Both are **relative
+  to the document's own URL**, as is `include_request`: resolve them against
+  the `/context` you fetched (RFC 3986), not against the origin. That is
+  what makes them correct whether the cell is served at the root or mounted
+  at `/weather` in a multi-cell server (ADR 0014), without the mount leaking
+  into the interface digest. The `coverage` and
   `values` measurements turn the worst agent failure — an empty result read
   as a legitimate zero — into a diagnosable miss ("June is outside the data's
   range" instead of "revenue was zero").

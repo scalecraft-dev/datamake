@@ -378,8 +378,8 @@ mod tests {
             download: false,
         });
         let serve = Command::Serve(ServeArgs {
-            file: "cell.yaml".into(),
-            profile: "local".into(),
+            file: Some("cell.yaml".into()),
+            profile: Some("local".into()),
             port: 8080,
             poll_interval: 15,
             max_concurrency: crate::serve::DEFAULT_MAX_CONCURRENCY,

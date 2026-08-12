@@ -148,7 +148,34 @@ fn open_duckdb(gcs: Option<&ResolvedGcs>) -> Result<Connection> {
     }
 }
 
+/// A per-connection resource budget (ADR 0014). `DATAMK_MEMORY_LIMIT` is
+/// applied **per DuckDB connection**, and a multi-cell `serve` holds N of
+/// them in one process — so applying the raw env value N times authorizes N
+/// times the operator's intended budget, and the pod OOM-kills taking every
+/// mounted cell with it (the precise failure the knob exists to prevent).
+/// `serve` divides the budget and passes it here; every other command opens
+/// exactly one cell and passes `Budget::default()`, which reads the env var
+/// unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct Budget {
+    /// Overrides `DATAMK_MEMORY_LIMIT` for this connection when set.
+    pub memory_limit: Option<String>,
+    /// `SET threads`. Unset anywhere else in the tree: one connection per
+    /// process rightly takes the host's cores. N connections in one process
+    /// do not.
+    pub threads: Option<usize>,
+}
+
 pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
+    open_with(file, profile, read_only, &Budget::default())
+}
+
+/// `open`, with an explicit per-connection resource budget. Split out rather
+/// than threaded through a process-global (an env var written at startup)
+/// because the budget genuinely differs per connection, and mutating the
+/// environment to communicate it would be a race the moment anything else
+/// in the process opens a cell.
+pub fn open_with(file: &Path, profile: &str, read_only: bool, budget: &Budget) -> Result<Cell> {
     // The pure parse+resolve prefix lives in `config::load` (no DB); `open` is
     // that plus a connection. `deploy` uses `config::load` directly to inspect a
     // cell without ever opening a database.
@@ -174,6 +201,7 @@ pub fn open(file: &Path, profile: &str, read_only: bool) -> Result<Cell> {
         read_only,
         &scratch,
         tolerate_missing_catalog,
+        budget,
     )?;
     Ok(Cell {
         def: loaded.def,
@@ -204,6 +232,7 @@ fn setup(
     read_only: bool,
     scratch: &Path,
     tolerate_missing_catalog: bool,
+    budget: &Budget,
 ) -> Result<Option<PublishedState>> {
     // INSTALL fetches the extension from the registry on first run (needs network).
     // SET TimeZone: DuckDB's session zone follows the OS locale by default, so
@@ -230,11 +259,23 @@ fn setup(
         esc(&spill_dir.to_string_lossy())
     ))
     .context("setting temp_directory (spill)")?;
-    if let Ok(mem) = std::env::var("DATAMK_MEMORY_LIMIT") {
-        if !mem.is_empty() {
-            conn.execute_batch(&format!("SET memory_limit = '{}';", esc(&mem)))
-                .with_context(|| format!("setting memory_limit from DATAMK_MEMORY_LIMIT={mem}"))?;
-        }
+    // An explicit budget (multi-cell `serve`, ADR 0014) wins over the env
+    // var: it *is* the env var, already divided by the number of mounted
+    // cells.
+    let mem = match &budget.memory_limit {
+        Some(m) => Some(m.clone()),
+        None => std::env::var("DATAMK_MEMORY_LIMIT").ok(),
+    };
+    if let Some(mem) = mem.filter(|m| !m.is_empty()) {
+        conn.execute_batch(&format!("SET memory_limit = '{}';", esc(&mem)))
+            .with_context(|| format!("setting memory_limit to {mem}"))?;
+    }
+    // Only ever set by multi-cell `serve`: DuckDB's default is the host's
+    // core count, which is right for one connection per process and N times
+    // too many for N.
+    if let Some(threads) = budget.threads {
+        conn.execute_batch(&format!("SET threads = {};", threads.max(1)))
+            .with_context(|| format!("setting threads to {threads}"))?;
     }
 
     let storage = resolve_storage(&b.storage, dir)?;

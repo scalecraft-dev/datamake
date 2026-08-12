@@ -238,11 +238,13 @@ fn summarize(entry: CellEntry, fetched: Option<(serde_json::Value, Option<String
     let Some((doc, etag)) = fetched else {
         return cell;
     };
-    // 1 and 2 both parse here: the v2 rename (`docs[].path` -> `source_path`)
-    // touches nothing the emitter copies. Unknown versions still bail.
+    // 1, 2, and 3 all parse here: neither the v2 rename
+    // (`docs[].path` -> `source_path`) nor v3's relative request
+    // affordances touch anything the emitter copies. Unknown versions
+    // still bail.
     if !matches!(
         doc.get("datamk_context").and_then(|v| v.as_u64()),
-        Some(1) | Some(2)
+        Some(1) | Some(2) | Some(3)
     ) {
         tracing::warn!(cell = %cell.name, "unrecognized datamk_context version; emitting name+url only");
         return cell;
@@ -340,6 +342,21 @@ mod tests {
         assert!(cell.description.is_none());
         assert!(cell.exports.is_empty());
         assert!(cell.context_digest.is_none());
+    }
+
+    /// ADR 0014's `datamk_context: 3` (relative request affordances) copies
+    /// nothing new into the manifest — this must not silently regress into
+    /// the unknown-version branch.
+    #[test]
+    fn summarize_accepts_context_version_3() {
+        let mut doc = sample_context();
+        doc["datamk_context"] = serde_json::json!(3);
+        let cell = summarize(entry("orders"), Some((doc, Some("d".into()))));
+        assert_eq!(
+            cell.description.as_deref(),
+            Some("Daily order revenue by region.")
+        );
+        assert_eq!(cell.exports.len(), 1);
     }
 
     #[test]

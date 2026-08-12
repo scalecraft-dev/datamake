@@ -252,12 +252,19 @@ pub struct InitArgs {
 
 #[derive(Args)]
 pub struct ServeArgs {
-    /// Path to the cell definition
-    #[arg(short, long, default_value = "cell.yaml")]
-    pub file: PathBuf,
-    /// Binding profile to use (reads profiles/<name>.yaml)
-    #[arg(short, long, default_value = "local")]
-    pub profile: String,
+    /// Path to the cell definition, or to a project file (top-level `datamk:`)
+    /// that mounts several cells behind one port. With no flag: datamk.yaml in
+    /// the current directory, else cell.yaml.
+    // No `default_value`: "the user asked for cell.yaml" and "clap filled it
+    // in" must stay distinguishable, or discovery can never prefer a project
+    // file. `DeployArgs.profile` set the same precedent.
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
+    /// Binding profile to use (reads profiles/<name>.yaml) [default: local].
+    /// Serving a project, this overrides the project's `profile:` and every
+    /// per-cell `profile:` — every cell is served from this one profile.
+    #[arg(short, long)]
+    pub profile: Option<String>,
     /// Port to bind
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
@@ -276,7 +283,9 @@ pub struct ServeArgs {
     /// 0012): agents learn what exports mean, but rows never leave — for
     /// estates where consumers fetch data through existing warehouse grants.
     /// Unmounted routes return 404; the profile's `channels:` list tells
-    /// callers where rows actually live.
+    /// callers where rows actually live. Serving a project, this applies to
+    /// every mounted cell; a per-cell `no_data: true` applies to that cell
+    /// alone. There is no per-cell way to turn it off.
     #[arg(long)]
     pub no_data: bool,
 }
