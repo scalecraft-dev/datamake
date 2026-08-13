@@ -237,52 +237,58 @@ pub(crate) fn validate_bound_exports(def: &CellDef) -> Result<()> {
                 export.name
             );
         }
-        let Some(src) = def.sources.get(bind) else {
+        check_bind_target(&export.name, bind, def)?;
+    }
+    Ok(())
+}
+
+/// The per-export half of `validate_bound_exports`'s shape check, factored
+/// out so `datamk interface import` (issue #18) can run the exact same gate
+/// against a prospective `--bind` name *before* an export exists to attach
+/// it to — one source of truth for "can this source back a binding," never
+/// two definitions that could drift.
+pub(crate) fn check_bind_target(export_name: &str, bind: &str, def: &CellDef) -> Result<()> {
+    let Some(src) = def.sources.get(bind) else {
+        bail!(
+            "export '{export_name}': `bind: {bind}` names no declared source — add `{bind}:` \
+             under `sources:`, or point `bind:` at an existing one.",
+        );
+    };
+    match src {
+        crate::config::Source::Raw(_) => {}
+        crate::config::Source::Connection {
+            table: Some(_),
+            query: None,
+            ..
+        } => {}
+        crate::config::Source::Connection { query: Some(_), .. } => {
             bail!(
-                "export '{}': `bind: {bind}` names no declared source — add `{bind}:` under \
-                 `sources:`, or point `bind:` at an existing one.",
-                export.name
+                "export '{export_name}': `bind: {bind}` names a `query:`-shaped connection \
+                 source — that's ad hoc SQL nobody runs, the exact failure the binding model \
+                 replaces, not an existing object to point at. Bind to a `table:`-shaped \
+                 source instead (a real warehouse table or view), or materialize this export \
+                 with a transform.",
             );
-        };
-        match src {
-            crate::config::Source::Raw(_) => {}
-            crate::config::Source::Connection {
-                table: Some(_),
-                query: None,
-                ..
-            } => {}
-            crate::config::Source::Connection { query: Some(_), .. } => {
-                bail!(
-                    "export '{}': `bind: {bind}` names a `query:`-shaped connection source — \
-                     that's ad hoc SQL nobody runs, the exact failure the binding model \
-                     replaces, not an existing object to point at. Bind to a `table:`-shaped \
-                     source instead (a real warehouse table or view), or materialize this \
-                     export with a transform.",
-                    export.name
-                );
-            }
-            crate::config::Source::Connection {
-                table: None,
-                query: None,
-                ..
-            } => {
-                // Unreachable in practice — `Source`'s own deserializer
-                // already requires exactly one of `table`/`query`. Kept for
-                // match exhaustiveness, not a real path.
-                bail!(
-                    "export '{}': `bind: {bind}` names a connection source with neither \
-                     `table:` nor `query:` set.",
-                    export.name
-                );
-            }
-            crate::config::Source::Cell { .. } => {
-                bail!(
-                    "export '{}': `bind: {bind}` names a `cell:` source — binding to another \
-                     cell's table isn't supported yet. Read it through a materializing \
-                     transform instead.",
-                    export.name
-                );
-            }
+        }
+        crate::config::Source::Connection {
+            table: None,
+            query: None,
+            ..
+        } => {
+            // Unreachable in practice — `Source`'s own deserializer
+            // already requires exactly one of `table`/`query`. Kept for
+            // match exhaustiveness, not a real path.
+            bail!(
+                "export '{export_name}': `bind: {bind}` names a connection source with neither \
+                 `table:` nor `query:` set.",
+            );
+        }
+        crate::config::Source::Cell { .. } => {
+            bail!(
+                "export '{export_name}': `bind: {bind}` names a `cell:` source — binding to \
+                 another cell's table isn't supported yet. Read it through a materializing \
+                 transform instead.",
+            );
         }
     }
     Ok(())
@@ -430,8 +436,10 @@ pub fn check(
     // static, contract-only facts.
     warn_no_grain_backstop(def);
     // ADR 0012 §3 ratchet: the promotion gesture is where meaning becomes
-    // mandatory — an experimental export needs nothing.
-    check_supported_have_descriptions(def)?;
+    // mandatory — an experimental export needs nothing. Issue #18:
+    // `warehouse_columns` lets a bound export satisfy this via meaning
+    // already documented at the source, not only a locally authored one.
+    check_supported_have_descriptions(def, warehouse_columns)?;
 
     let mut measurements = BTreeMap::new();
     for export in &def.interface {
@@ -540,30 +548,61 @@ pub fn check(
 }
 
 /// ADR 0012 §3 ratchet check 4: an export with `contract: supported` must
-/// carry a non-empty description — friction lands exactly on the deliberate
-/// promotion gesture, and nowhere else. Pure contract fact, checked on every
-/// run/verify; a supported export an agent cannot orient on is a promotion
-/// that didn't finish. ADR 0013 extends the message rather than adding a
-/// second check: a `docs:` page is additive prose, never a substitute — an
-/// agent reads `description` before it ever fetches a page, so `docs:`
-/// alone does not satisfy this lint. Setting both is correct, not an error.
-fn check_supported_have_descriptions(def: &CellDef) -> Result<()> {
+/// have its meaning available to an agent — friction lands exactly on the
+/// deliberate promotion gesture, and nowhere else. Pure contract fact,
+/// checked on every run/verify; a supported export an agent cannot orient
+/// on is a promotion that didn't finish. ADR 0013 extends the message
+/// rather than adding a second check: a `docs:` page is additive prose,
+/// never a substitute — an agent reads `description` before it ever
+/// fetches a page, so `docs:` alone does not satisfy this lint. Setting
+/// both is correct, not an error.
+///
+/// Issue #18: for a bound export, meaning satisfies this lint either way —
+/// authored locally (`description:`) or already available live at the
+/// source (`observed.source_descriptions`, i.e. the bound object has at
+/// least one warehouse-documented column). Deliberately NOT "restated
+/// locally" as the only path: `datamk interface import` exists precisely
+/// because copying warehouse prose into `cell.yaml` is the rot ADR 0012 §3
+/// already warns about, and forcing every `contract: supported` bound
+/// export to carry a local description would make that copy mandatory —
+/// the exact thing importing types-only is designed to avoid. An author
+/// still writes `description:` when they mean something *different* from
+/// the warehouse's own words; that's authorship, not a requirement this
+/// lint imposes.
+fn check_supported_have_descriptions(
+    def: &CellDef,
+    warehouse_columns: &HashMap<String, crate::engine::SourceWarehouseColumns>,
+) -> Result<()> {
     for export in &def.interface {
-        if export.contract == crate::config::Contract::Supported
-            && export
-                .description
-                .as_deref()
-                .is_none_or(|d| d.trim().is_empty())
-        {
-            bail!(
-                "export '{}': `contract: supported` requires a non-empty `description` — a \
-                 `docs:` page does not satisfy it. One or two sentences: what one row means \
-                 (ADR 0012 §3). Supported is the deliberate promotion gesture; a supported \
-                 export without meaning is a promotion that didn't finish. Agents read \
-                 `description` before they fetch a page.",
-                export.name
-            );
+        if export.contract != crate::config::Contract::Supported {
+            continue;
         }
+        let has_local_description = export
+            .description
+            .as_deref()
+            .is_some_and(|d| !d.trim().is_empty());
+        if has_local_description {
+            continue;
+        }
+        let meaning_available_at_source = export
+            .bind
+            .as_deref()
+            .and_then(|bind| warehouse_columns.get(bind))
+            .is_some_and(|wc| !wc.descriptions.is_empty());
+        if meaning_available_at_source {
+            continue;
+        }
+        bail!(
+            "export '{}': `contract: supported` requires a non-empty `description` — a \
+             `docs:` page does not satisfy it, and neither does a bound source with no \
+             warehouse-documented columns. One or two sentences: what one row means (ADR \
+             0012 §3) — or, for a bound export, let the meaning already documented at the \
+             source satisfy this (`datamk verify` populates `observed.source_descriptions`). \
+             Supported is the deliberate promotion gesture; a supported export without \
+             meaning anywhere is a promotion that didn't finish. Agents read `description` \
+             before they fetch a page.",
+            export.name
+        );
     }
     Ok(())
 }
@@ -771,7 +810,11 @@ fn warn_no_grain_backstop(def: &CellDef) {
     }
 }
 
-fn describe(conn: &Connection, source: &str) -> Result<Vec<(String, String)>> {
+/// `pub(crate)`: `datamk interface import` (issue #18) reuses this exact
+/// DESCRIBE, the same live-bound-session-view read `check` above uses — one
+/// implementation of "what does this source's schema actually look like
+/// right now," never a second copy that could drift.
+pub(crate) fn describe(conn: &Connection, source: &str) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(&format!("DESCRIBE SELECT * FROM {source}"))?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -841,6 +884,48 @@ fn type_compatible(declared: &str, actual: &str) -> bool {
         "timestamp" => a.starts_with("TIMESTAMP"),
         other => a.to_lowercase() == other,
     }
+}
+
+/// `datamk interface import`'s (issue #18) DuckDB-facing type authority —
+/// the inverse of `type_compatible` immediately above, which this never
+/// modifies (a sibling, not an edit). This is the authority for every
+/// column with no warehouse-native type to consult: a raw file, or a
+/// connector with no metadata job (Postgres, Snowflake — ADR 0010), same
+/// "not a lesser fallback, there is genuinely no other authority" framing
+/// `column_type_ok` already uses for the check direction. One canonical
+/// declared name per DuckDB type, chosen so `type_compatible(declared,
+/// actual)` is true by construction for every pair this can produce —
+/// pinned by a round-trip test, same discipline as BigQuery's
+/// `declared_type_for`. `None` for a DuckDB type with no clean declared
+/// name (`STRUCT(...)`, `LIST(...)`, `BLOB`, `TIME`, `UUID`, …) — the
+/// caller emits `type: unmapped` naming the real type, never a guess.
+pub(crate) fn duckdb_declared_type_for(actual: &str) -> Option<&'static str> {
+    let a = actual.to_uppercase();
+    if a.starts_with("VARCHAR") || a == "TEXT" {
+        return Some("string");
+    }
+    if a == "INTEGER" || a == "INT" || a == "INT32" {
+        return Some("integer");
+    }
+    if a == "BIGINT" || a == "INT64" {
+        return Some("bigint");
+    }
+    if a.starts_with("DECIMAL") || a.starts_with("NUMERIC") {
+        return Some("decimal");
+    }
+    if a == "DOUBLE" || a == "FLOAT" || a == "REAL" {
+        return Some("double");
+    }
+    if a == "BOOLEAN" {
+        return Some("boolean");
+    }
+    if a == "DATE" {
+        return Some("date");
+    }
+    if a.starts_with("TIMESTAMP") {
+        return Some("timestamp");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1236,7 +1321,7 @@ interface:
             "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    contract: supported\n",
         )
         .unwrap();
-        let err = check_supported_have_descriptions(&def)
+        let err = check_supported_have_descriptions(&def, &HashMap::new())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1249,7 +1334,7 @@ interface:
         )
         .unwrap();
         assert!(
-            check_supported_have_descriptions(&def).is_err(),
+            check_supported_have_descriptions(&def, &HashMap::new()).is_err(),
             "whitespace-only description must not satisfy the lint"
         );
     }
@@ -1263,7 +1348,7 @@ interface:
             "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    contract: supported\n    docs: docs/e.md\n",
         )
         .unwrap();
-        let err = check_supported_have_descriptions(&def)
+        let err = check_supported_have_descriptions(&def, &HashMap::new())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1276,7 +1361,8 @@ interface:
             "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    contract: supported\n    description: One row per thing.\n    docs: docs/e.md\n",
         )
         .unwrap();
-        check_supported_have_descriptions(&def).expect("description + docs together must pass");
+        check_supported_have_descriptions(&def, &HashMap::new())
+            .expect("description + docs together must pass");
     }
 
     #[test]
@@ -1285,7 +1371,84 @@ interface:
             "cell: c\ninterface:\n  - name: a\n    version: 1.0.0\n  - name: b\n    version: 1.0.0\n    contract: supported\n    description: One row per thing.\n",
         )
         .unwrap();
-        check_supported_have_descriptions(&def).expect("lint must pass");
+        check_supported_have_descriptions(&def, &HashMap::new()).expect("lint must pass");
+    }
+
+    /// Issue #18: a `contract: supported` bound export with no local
+    /// `description:` still passes when the bound source has at least one
+    /// warehouse-documented column in `observed.source_descriptions` — the
+    /// meaning is available, just not restated in `cell.yaml`. Forcing a
+    /// local copy here is exactly the rot `datamk interface import` exists
+    /// to avoid creating.
+    #[test]
+    fn supported_bound_export_passes_when_the_source_has_warehouse_descriptions() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: e\n\
+             \x20   version: 1.0.0\n\
+             \x20   bind: raw\n\
+             \x20   contract: supported\n",
+        )
+        .unwrap();
+        let mut warehouse = HashMap::new();
+        warehouse.insert(
+            "raw".to_string(),
+            crate::engine::SourceWarehouseColumns {
+                connector: "bigquery",
+                columns: indexmap::IndexMap::new(),
+                descriptions: indexmap::IndexMap::from([(
+                    "customer_id".to_string(),
+                    "The customer's unique identifier.".to_string(),
+                )]),
+            },
+        );
+        check_supported_have_descriptions(&def, &warehouse)
+            .expect("meaning documented at the source must satisfy the lint");
+    }
+
+    /// The other half: a `contract: supported` bound export whose source has
+    /// no warehouse descriptions at all (or isn't in the map — e.g. a
+    /// connector with no metadata job, ADR 0010) still fails the lint
+    /// exactly as before — "bound" alone is not an exemption, only
+    /// documented meaning is.
+    #[test]
+    fn supported_bound_export_with_no_warehouse_descriptions_still_fails_the_lint() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\n\
+             interface:\n\
+             \x20 - name: e\n\
+             \x20   version: 1.0.0\n\
+             \x20   bind: raw\n\
+             \x20   contract: supported\n",
+        )
+        .unwrap();
+        // No entry for "raw" at all (e.g. a Postgres/Snowflake connector, or
+        // a raw file — no metadata job, ADR 0010).
+        let err = check_supported_have_descriptions(&def, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires a non-empty `description`"),
+            "got: {err}"
+        );
+
+        // An entry that exists but carries no descriptions (a classified
+        // BigQuery source with genuinely no documented columns) must not
+        // satisfy the lint either.
+        let mut warehouse = HashMap::new();
+        warehouse.insert(
+            "raw".to_string(),
+            crate::engine::SourceWarehouseColumns {
+                connector: "bigquery",
+                columns: indexmap::IndexMap::new(),
+                descriptions: indexmap::IndexMap::new(),
+            },
+        );
+        assert!(
+            check_supported_have_descriptions(&def, &warehouse).is_err(),
+            "an empty-descriptions warehouse entry must not satisfy the lint"
+        );
     }
 
     // ADR 0012 §3 ratchet check 2 (orphan-kill, by construction): a
@@ -1502,6 +1665,61 @@ interface:
         assert!(type_compatible("uuid", "UUID"));
         assert!(type_compatible("uuid", "uuid"));
         assert!(!type_compatible("uuid", "VARCHAR"));
+    }
+
+    /// Issue #18: `duckdb_declared_type_for` (the inverse `datamk interface
+    /// import` uses for a raw file or a no-metadata-job connector) must
+    /// never emit a declared name its own forward sibling, `type_compatible`,
+    /// would then reject. Offline, no DuckDB connection needed.
+    #[test]
+    fn duckdb_declared_type_for_round_trips_through_type_compatible() {
+        let actuals = [
+            "VARCHAR",
+            "VARCHAR(255)",
+            "TEXT",
+            "INTEGER",
+            "INT",
+            "INT32",
+            "BIGINT",
+            "INT64",
+            "DECIMAL(18,2)",
+            "NUMERIC(10,0)",
+            "DOUBLE",
+            "FLOAT",
+            "REAL",
+            "BOOLEAN",
+            "DATE",
+            "TIMESTAMP",
+            "TIMESTAMP WITH TIME ZONE",
+        ];
+        for actual in actuals {
+            let declared = duckdb_declared_type_for(actual)
+                .unwrap_or_else(|| panic!("expected a declared name for actual type {actual}"));
+            assert!(
+                type_compatible(declared, actual),
+                "duckdb_declared_type_for({actual}) = {declared}, but type_compatible({declared}, \
+                 {actual}) is false — the two functions have drifted apart"
+            );
+        }
+    }
+
+    /// A DuckDB type with no clean declared name comes back `None`, never a
+    /// guess — the caller's contract is `type: unmapped`.
+    #[test]
+    fn duckdb_declared_type_for_returns_none_for_an_unmappable_type() {
+        for actual in [
+            "STRUCT(a INTEGER)",
+            "BLOB",
+            "TIME",
+            "UUID",
+            "MAP(VARCHAR, INTEGER)",
+        ] {
+            assert_eq!(
+                duckdb_declared_type_for(actual),
+                None,
+                "expected no declared name for {actual}"
+            );
+        }
     }
 
     // --- ADR 0008 Consequences: declarative grain inheritance --------------
