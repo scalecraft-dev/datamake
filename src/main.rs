@@ -4,6 +4,7 @@ mod context;
 mod deploy;
 mod engine;
 mod init;
+mod interface;
 mod logging;
 mod manifest;
 mod mesh;
@@ -124,6 +125,16 @@ async fn dispatch(command: Command) -> Result<()> {
                 e.store.as_deref(),
                 e.url_template.as_deref(),
                 e.out.as_deref(),
+            ),
+        },
+        Command::Interface(a) => match a.command {
+            cli::InterfaceCommand::Import(i) => interface::import(
+                &i.file,
+                &i.profile,
+                i.bind.as_deref(),
+                i.as_name.as_deref(),
+                i.write,
+                i.force,
             ),
         },
         Command::Rollback(a) => ops::rollback(&a.file, &a.profile, a.execution),

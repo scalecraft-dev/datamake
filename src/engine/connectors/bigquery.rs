@@ -260,6 +260,33 @@ pub(super) fn type_compatible(declared: &str, native: &str) -> bool {
     }
 }
 
+/// `datamk interface import`'s (issue #18) type authority for a bound
+/// export's `schema:` — the inverse of `type_compatible` immediately above,
+/// which this never modifies (a sibling, not an edit): picks ONE canonical
+/// declared name for a BigQuery-native type, chosen so that for every
+/// `(declared, native)` pair this can produce, `type_compatible(declared,
+/// native)` is true by construction — pinned by a round-trip test over
+/// every native type this function maps, so the two functions can never
+/// silently drift apart. `None` for a native type with no clean declared
+/// name (`STRUCT<...>`, `ARRAY<...>`, `GEOGRAPHY`, `JSON`, `BYTES`, `TIME`,
+/// `INTERVAL`, …) — the caller emits `type: unmapped` with the real native
+/// type named in a comment rather than guessing or dropping the column.
+pub(super) fn declared_type_for(native: &str) -> Option<&'static str> {
+    match native.to_uppercase().as_str() {
+        "STRING" => Some("string"),
+        // BigQuery has exactly one integer type — `bigint` names its real
+        // width honestly, even though `type_compatible` also accepts
+        // `int`/`integer`/`long` for it.
+        "INT64" => Some("bigint"),
+        "NUMERIC" | "BIGNUMERIC" => Some("decimal"),
+        "FLOAT64" => Some("double"),
+        "BOOL" => Some("boolean"),
+        "DATE" => Some("date"),
+        "TIMESTAMP" | "DATETIME" => Some("timestamp"),
+        _ => None,
+    }
+}
+
 /// Best-effort detection of "the metadata job itself was denied" (missing
 /// `bigquery.jobs.create`) vs. a genuine failure that must propagate. Matched
 /// on error text — `bigquery_query()` surfaces the upstream BigQuery API
@@ -1269,6 +1296,63 @@ mod tests {
         // BigQuery type like BYTES/JSON/GEOGRAPHY with no datamk alias).
         assert!(type_compatible("bytes", "BYTES"));
         assert!(!type_compatible("bytes", "STRING"));
+    }
+
+    /// Issue #18: `declared_type_for` (the inverse `datamk interface import`
+    /// uses to emit a `schema:` entry) must never emit a declared name that
+    /// its own forward sibling, `type_compatible`, would then reject —
+    /// offline, no BigQuery credentials needed, default CI. Every native
+    /// type this test doesn't list is `declared_type_for`'s `None` case,
+    /// covered separately below.
+    #[test]
+    fn declared_type_for_round_trips_through_type_compatible_for_every_mapped_native_type() {
+        let natives = [
+            "STRING",
+            "INT64",
+            "NUMERIC",
+            "BIGNUMERIC",
+            "FLOAT64",
+            "BOOL",
+            "DATE",
+            "TIMESTAMP",
+            "DATETIME",
+        ];
+        for native in natives {
+            let declared = declared_type_for(native)
+                .unwrap_or_else(|| panic!("expected a declared name for native type {native}"));
+            assert!(
+                type_compatible(declared, native),
+                "declared_type_for({native}) = {declared}, but type_compatible({declared}, \
+                 {native}) is false — the two functions have drifted apart"
+            );
+        }
+    }
+
+    /// The other half: a native type with no clean declared name must come
+    /// back `None`, never a guess — the caller's contract for this is
+    /// `type: unmapped`, never a silently-wrong declared type.
+    #[test]
+    fn declared_type_for_returns_none_for_an_unmappable_native_type() {
+        for native in [
+            "STRUCT<a INT64>",
+            "ARRAY<STRING>",
+            "GEOGRAPHY",
+            "JSON",
+            "BYTES",
+            "TIME",
+        ] {
+            assert_eq!(
+                declared_type_for(native),
+                None,
+                "expected no declared name for {native}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_type_for_is_case_insensitive_on_the_native_type() {
+        assert_eq!(declared_type_for("string"), Some("string"));
+        assert_eq!(declared_type_for("numeric"), Some("decimal"));
     }
 
     #[test]
