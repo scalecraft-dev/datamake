@@ -73,14 +73,22 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
     let profile_path = dir.join("profiles").join(format!("{profile}.yaml"));
     let raw = Bindings::load(&profile_path)?;
     let mut bindings = resolve(&def, &raw)?;
-    // Relative `gcs.credentials`/`gcs.extension` paths resolve against the
-    // cell directory, like transforms and a connection's `credentials`
-    // (engine::connectors).
+    // Relative `gcs.credentials`/`gcs.extension`/`principals` paths resolve
+    // against the cell directory, like transforms and a connection's
+    // `credentials` (engine::connectors). `principals` matters even more in
+    // project mode: unrebased, it resolves against the process cwd, so every
+    // mounted cell would silently share whichever cwd-relative file happens
+    // to exist there instead of its own.
     if let Some(g) = bindings.gcs.as_mut() {
         for p in [&mut g.credentials, &mut g.extension].into_iter().flatten() {
             if !Path::new(p.as_str()).is_absolute() {
                 *p = dir.join(p.as_str()).to_string_lossy().into_owned();
             }
+        }
+    }
+    if let Some(p) = bindings.principals.as_mut() {
+        if !Path::new(p.as_str()).is_absolute() {
+            *p = dir.join(p.as_str()).to_string_lossy().into_owned();
         }
     }
     // Relative snowflake `private_key_path`s resolve against the cell
@@ -224,5 +232,56 @@ mod tests {
         assert_eq!(loaded.transforms[0].key, vec!["flight_id".to_string()]);
         // The export declared no `grain:` — it must have inherited `key:`.
         assert_eq!(loaded.def.interface[0].grain, vec!["flight_id".to_string()]);
+    }
+
+    /// A scratch cell dir with a minimal `cell.yaml` and a `local` profile
+    /// whose body is caller-supplied — used by the `principals` rebase tests
+    /// below, where what matters is the profile's `principals:` line, not
+    /// the rest of the cell.
+    fn write_minimal_cell(profile_body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-config-load-principals-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("cell.yaml"), "cell: t\n").unwrap();
+        std::fs::write(dir.join("profiles/local.yaml"), profile_body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_rebases_a_relative_principals_path_against_the_cell_dir() {
+        let dir = write_minimal_cell(
+            "catalog: ./.cell/catalog.ducklake\n\
+             storage: ./.cell/data\n\
+             principals: secrets/principals.json\n",
+        );
+        let loaded = load(&dir.join("cell.yaml"), "local").unwrap();
+        assert_eq!(
+            loaded.bindings.principals.as_deref(),
+            Some(
+                dir.join("secrets/principals.json")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+        );
+    }
+
+    #[test]
+    fn load_leaves_an_absolute_principals_path_untouched() {
+        let dir = write_minimal_cell(
+            "catalog: ./.cell/catalog.ducklake\n\
+             storage: ./.cell/data\n\
+             principals: /etc/datamk/principals.json\n",
+        );
+        let loaded = load(&dir.join("cell.yaml"), "local").unwrap();
+        assert_eq!(
+            loaded.bindings.principals.as_deref(),
+            Some("/etc/datamk/principals.json")
+        );
     }
 }

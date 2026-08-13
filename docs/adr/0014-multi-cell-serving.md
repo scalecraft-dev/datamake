@@ -200,6 +200,12 @@ Multi-cell `serve` is the local, single-VM, and behind-your-own-proxy story.
   cross-tenant leak; `/context` and `/openapi.json` already said `private`.
 - Every poller line carries `cell`, without which N interleaved pollers on one
   stderr are unattributable.
+- Per-cell authorization required fixing a pre-existing bug: a relative
+  `principals:` path resolved against the process cwd, not the cell
+  directory. Single-cell serving hid it (operators run from inside the cell);
+  mounting N cells made every one of them load the same file while silently
+  ignoring their own. The design's per-cell auth boundary was never actually
+  reachable before this ADR — it only looked like it was.
 - `serve`'s `-f` and `-p` became optional, so "the user passed it" stays
   distinguishable from "clap filled it in".
 

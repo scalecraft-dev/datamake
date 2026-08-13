@@ -3703,5 +3703,120 @@ mod smoke {
                 assert!(headers.get("x-datamk-context-digest").is_some());
             });
         }
+
+        /// A role-gated cell whose profile names a **relative** `principals:`
+        /// path (`principals.json`, resolved against its own dir — the shape
+        /// every real cell uses) and a token->role map containing exactly
+        /// one, distinguishing token. Two of these mounted in one project is
+        /// the regression fixture: pre-fix, `config::load` left the relative
+        /// path unrebased, so every mounted cell's `cell.principals` was the
+        /// literal `"principals.json"`, read against the server process's
+        /// cwd instead of either cell's own directory.
+        fn scaffold_gated_cell(name: &str, token: &str) -> Scaffold {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-gated-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sql")).unwrap();
+            std::fs::create_dir_all(dir.join("profiles")).unwrap();
+            std::fs::write(
+                dir.join("cell.yaml"),
+                format!(
+                    "cell: {name}\n\
+                     transforms:\n\
+                     \x20 - sql/t.sql\n\
+                     interface:\n\
+                     \x20 - name: t\n\
+                     \x20   version: 1.0.0\n\
+                     \x20   grain: [id]\n\
+                     \x20   schema:\n\
+                     \x20     id: integer\n\
+                     \x20     val: string\n\
+                     access:\n\
+                     \x20 shareable: true\n\
+                     \x20 roles: [analyst]\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("sql/t.sql"),
+                "SELECT * FROM (VALUES (1, 'a')) AS t(id, val)",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("profiles/local.yaml"),
+                "catalog: ./.cell/catalog.ducklake\n\
+                 storage: ./.cell/data\n\
+                 principals: principals.json\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("principals.json"),
+                format!(r#"{{ "{token}": ["analyst"] }}"#),
+            )
+            .unwrap();
+            crate::engine::run(
+                &dir.join("cell.yaml"),
+                "local",
+                None,
+                crate::engine::RunOptions::default(),
+            )
+            .expect("build the gated scaffold cell");
+            Scaffold { dir }
+        }
+
+        /// The actual regression guard for the security bug fixed alongside
+        /// this test: two cells, mounted in one project, whose profiles both
+        /// point `principals:` at the same *relative* filename. Each cell's
+        /// own token must authorize only that cell — never the other's, and
+        /// never by falling back to whatever `principals.json` happens to be
+        /// readable from the server process's cwd. Fails without the
+        /// `config::load` rebase (either `build_state` errors because
+        /// `principals.json` doesn't exist relative to the test binary's cwd,
+        /// or — if it happened to exist there — both mounts would wrongly
+        /// share it).
+        #[test]
+        fn each_mount_authorizes_only_its_own_principals_file() {
+            let a = scaffold_gated_cell("gated_a", "token-a");
+            let b = scaffold_gated_cell("gated_b", "token-b");
+            let router = project_router(
+                vec![
+                    mounted(&a, "a", false, |_| {}),
+                    mounted(&b, "b", false, |_| {}),
+                ],
+                DEFAULT_MAX_CONCURRENCY,
+            );
+            rt().block_on(async {
+                let (status, body) = get(&router, "/a/t@1", Some("token-a")).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "a's own token must work on a: {body}"
+                );
+                let (status, body) = get(&router, "/b/t@1", Some("token-b")).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "b's own token must work on b: {body}"
+                );
+
+                let (status, _) = get(&router, "/a/t@1", Some("token-b")).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "b's token must not authorize a"
+                );
+                let (status, _) = get(&router, "/b/t@1", Some("token-a")).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "a's token must not authorize b"
+                );
+            });
+        }
     }
 }

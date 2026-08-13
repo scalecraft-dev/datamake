@@ -6,6 +6,33 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Fixed — SECURITY: a relative `principals:` path resolved against the process cwd
+
+A profile's `principals:` was the one path field expanded but never rebased
+against the cell directory — unlike `gcs.credentials`, `gcs.extension`, and
+Snowflake `private_key_path`, which `config::load` has always rebased. A
+relative path therefore resolved against wherever the process was started.
+
+**Impact.** `datamk serve -f sub/cell.yaml` run from a parent directory
+loaded the wrong token map, or none — and a cell that finds no principals
+file falls back to `shareable`-only, so a role-gated cell could authorize a
+caller its own file would have rejected. Serving a project made this
+systematic rather than occasional: every mounted cell loaded whichever
+cwd-relative file happened to exist, and each cell's own file was silently
+ignored. The server started healthy and returned 200s, so nothing surfaced
+the substitution.
+
+Unaffected: any profile with an absolute `principals:`, which includes every
+Kubernetes deployment (`/etc/datamk/principals.json`, checked by the deploy
+pre-flight).
+
+**Behavior change.** A relative `principals:` now resolves against the cell
+directory. If you were relying on cwd-relative resolution — most likely by
+running `datamk serve` from inside the cell directory, where the two agree —
+nothing changes. If your token map lived somewhere else and worked by
+accident, it will now fail to open at startup rather than authorize against
+the wrong file. Make the path absolute, or move the file into the cell.
+
 ### Added — serve several cells from one process (`datamk.yaml`, ADR 0014)
 
 A root `datamk.yaml` lists the cells one `datamk serve` process mounts behind

@@ -84,6 +84,13 @@ Every listed cell must open or the server does not start — a partially
 mounted server passes its own probe while serving 404s a caller cannot tell
 from a typo.
 
+### Per-cell authorization
+
+Each mounted cell authorizes against its **own** profile's `principals:`
+file and its own `access.roles` — a token minted for one cell is a 401 at
+another cell's mount. A relative `principals:` path resolves against that
+cell's directory, not the directory you started the server from.
+
 ### What co-tenancy costs you
 
 One process is one failure domain, one restart, one scaling unit, and one
