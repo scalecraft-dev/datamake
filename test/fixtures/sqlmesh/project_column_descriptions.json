@@ -1,0 +1,44 @@
+{
+ "sqlmesh_example.comment_forms": {
+  "column_descriptions": {
+   "doubled": "block after",
+   "item_id": "trailing: the item",
+   "lit": "string with dashes",
+   "num_orders": "leading: orders before the projection",
+   "quoted, alias": "quoted alias"
+  },
+  "declared": false,
+  "description": null
+ },
+ "sqlmesh_example.documented_model": {
+  "column_descriptions": {
+   "item_id": "The item identifier",
+   "num_orders": "Distinct orders for the item"
+  },
+  "declared": true,
+  "description": "Orders per item with explicit columns and descriptions"
+ },
+ "sqlmesh_example.full_model": {
+  "column_descriptions": {},
+  "declared": false,
+  "description": null
+ },
+ "sqlmesh_example.incremental_model": {
+  "column_descriptions": {},
+  "declared": false,
+  "description": null
+ },
+ "sqlmesh_example.inline_comment_model": {
+  "column_descriptions": {
+   "item_id": "the item id",
+   "num_orders": "number of orders"
+  },
+  "declared": false,
+  "description": "View with inline column comments only"
+ },
+ "sqlmesh_example.seed_model": {
+  "column_descriptions": {},
+  "declared": false,
+  "description": null
+ }
+}

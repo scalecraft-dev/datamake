@@ -41,7 +41,57 @@ fn published_store(file: &Path, profile: &str) -> Result<(config::LoadedCell, Ar
 }
 
 /// Print the published range, the `LATEST` pointer, and its age.
+/// `datamk status` for a discovered cell (ADR 0016 §2): the sidecar record
+/// is the whole story — no executions, no LATEST.
+fn discovered_status(file: &Path, profile: &str) -> Result<Option<String>> {
+    let loaded = config::load(file, profile)?;
+    let Some(d) = &loaded.def.discover else {
+        return Ok(None);
+    };
+    let head = format!(
+        "cell: {}   profile: {}\nsource: sqlmesh (environment {})",
+        loaded.def.cell, profile, d.environment
+    );
+    let body = match &loaded.discovery {
+        Some(config::Discovery::Fresh {
+            synced_at,
+            plan_id,
+            exports,
+        }) => format!(
+            "plan: {}…   synced: {synced_at}\nexports: {exports} discovered ({} supported)",
+            &plan_id[..plan_id.len().min(8)],
+            loaded
+                .def
+                .interface
+                .iter()
+                .filter(|e| e.contract == config::Contract::Supported)
+                .count()
+        ),
+        Some(config::Discovery::Stale(why)) => format!("interface: not available — {why}"),
+        None => unreachable!("a discover: cell always has a discovery outcome"),
+    };
+    Ok(Some(format!("{head}\n{body}")))
+}
+
+/// ADR 0016 §2: the verbs that assume a datamk-owned artifact lineage
+/// refuse a discovered cell up front, naming why.
+fn refuse_discovered(file: &Path, verb: &str, why: &str) -> Result<()> {
+    let def = crate::config::CellDef::load(file)?;
+    if def.discover.is_some() {
+        anyhow::bail!(
+            "cell '{}' discovers its interface (`discover:`), so `datamk {verb}` does not \
+             apply: {why}.",
+            def.cell
+        );
+    }
+    Ok(())
+}
+
 pub fn status(file: &Path, profile: &str) -> Result<()> {
+    if let Some(line) = discovered_status(file, profile)? {
+        println!("{line}");
+        return Ok(());
+    }
     let (loaded, store) = published_store(file, profile)?;
     let executions = store.list_executions()?;
     let latest = store.latest()?;
@@ -276,6 +326,12 @@ fn last_run_summary_lines(summary: &engine::run_summary::RunSummary) -> Vec<Stri
 /// that keeps a supported route from 500-ing on `AT (VERSION => <pin>)`
 /// against an artifact from before the pin (ADR 0004 §9).
 pub fn rollback(file: &Path, profile: &str, execution: Option<u64>) -> Result<()> {
+    refuse_discovered(
+        file,
+        "rollback",
+        "there is no datamk execution to roll back to; the \
+         warehouse objects are owned by the modeling tool and are unchanged by datamk",
+    )?;
     let (loaded, store) = published_store(file, profile)?;
     let executions = store.list_executions()?;
     let current = store
@@ -850,6 +906,13 @@ fn no_latest_to_attach_message(
 /// remote catalog file), which refuses by default and requires `--download`:
 /// an explicit, machine-local materialization under `<cell>/.cell/attach/`.
 pub fn attach(file: &Path, profile: &str, execution: Option<u64>, download: bool) -> Result<()> {
+    refuse_discovered(
+        file,
+        "attach",
+        "no datamk catalog holds its rows. Query the warehouse \
+         objects directly — `datamk context` names each export's object under \
+         `exports[].binding.object`",
+    )?;
     let loaded = config::load(file, profile)?;
     let alias = sanitize_ident(&loaded.def.cell);
     let storage = engine::resolve_storage(&loaded.bindings.storage, &loaded.dir)?;

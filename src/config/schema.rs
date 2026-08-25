@@ -35,6 +35,194 @@ pub struct CellDef {
     /// Authorization policy for the serving plane (default-deny).
     #[serde(default)]
     pub access: Access,
+    /// ADR 0016: discover the interface from a modeling tool's deployed
+    /// state instead of authoring it. Mutually exclusive with `sources:`,
+    /// `transforms:` and `interface:` (`validate_discover`) — a discovered
+    /// cell computes nothing and authors no export list; `datamk sync`
+    /// materializes `interface`/`sources` from the sidecar record at load.
+    #[serde(default)]
+    pub discover: Option<Discover>,
+    /// Set by `config::load` on a discovered cell from the sidecar record —
+    /// never authored, never serialized back into `cell.yaml`.
+    #[serde(skip)]
+    pub discovered_from: Option<DiscoveredFrom>,
+}
+
+/// Where a claim came from (ADR 0015 §2). A **closed set** — an origin an
+/// agent can't recognise is a bug, so this is an enum, never free text.
+/// Extended by exactly one token per modeling-tool adapter as its ADR lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Origin {
+    /// Authored in `cell.yaml`.
+    #[serde(rename = "cell.yaml")]
+    CellYaml,
+    /// Read from the warehouse's own metadata (a column comment observed by
+    /// `datamk verify`'s live bind pass, or by `datamk sync`).
+    #[serde(rename = "warehouse")]
+    Warehouse,
+    /// Declared in a SQLMesh model definition (ADR 0016) — including the
+    /// inline column comments SQLMesh itself treats as declarations.
+    #[serde(rename = "sqlmesh")]
+    Sqlmesh,
+}
+
+/// `{ <field>: <origin> }` on a record — names every field of that record
+/// that can originate in more than one place.
+pub type FromMap = IndexMap<String, Origin>;
+
+/// The `discover:` block (ADR 0016 §1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Discover {
+    pub from: DiscoverFrom,
+    /// The tool environment to read — the deployed one, never a dev env.
+    #[serde(default = "default_environment")]
+    pub environment: String,
+    /// `profiles/<p>.yaml` `connections.<name>`: the tool's state store.
+    pub state: String,
+    /// The schema the state tables live in (SQLMesh's default: `sqlmesh`).
+    #[serde(default = "default_state_schema")]
+    pub state_schema: String,
+    /// `profiles/<p>.yaml` `connections.<name>`: where the models' objects
+    /// live — types and registered comments are read from here.
+    pub warehouse: String,
+    /// REQUIRED to name at least one of `tags`/`schemas`/`models`: there is
+    /// no "everything" default (VISION.md's explicit export list).
+    #[serde(default)]
+    pub select: Select,
+    #[serde(default)]
+    pub exclude: Exclude,
+    #[serde(default)]
+    pub on_unresolvable: OnUnresolvable,
+    /// Refine a discovered model; never invent one.
+    #[serde(default)]
+    pub overrides: Vec<Override>,
+}
+
+fn default_environment() -> String {
+    "prod".to_string()
+}
+
+fn default_state_schema() -> String {
+    "sqlmesh".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoverFrom {
+    Sqlmesh,
+}
+
+/// OR within a key, AND across keys. `kinds` defaults to every kind except
+/// `EXTERNAL` (an `external_models.yaml` entry is an upstream, not a
+/// product) and `SEED`; both are selectable explicitly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Select {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// `schema` names (the middle part of `catalog.schema.table`).
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    /// `schema.table` names.
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+impl Select {
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.schemas.is_empty() && self.models.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exclude {
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// What `sync` does with a selected model whose columns cannot be resolved
+/// (undeclared, and no warehouse row).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnUnresolvable {
+    #[default]
+    Fail,
+    /// Drop it, and name it in the document's `notes[]`.
+    Exclude,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Override {
+    /// `schema.table`.
+    pub model: String,
+    /// The export name; default is the mangled `<schema>_<table>`.
+    #[serde(default, rename = "as")]
+    pub as_name: Option<String>,
+    /// Authored semver. Required to promote to `contract: supported`.
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub contract: Option<Contract>,
+    #[serde(default)]
+    pub grain: Option<Vec<String>>,
+    #[serde(default)]
+    pub visibility: Option<Visibility>,
+    /// Wins over the tool's description; the tool's text is dropped, not
+    /// carried alongside (one home per fact, ADR 0015 §2).
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// The tool-side facts of one discovered export (ADR 0016 §7): a measured
+/// block in the document (`deployed`), never in the digest. Set by
+/// `config::load` from the sidecar record; never authored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredExport {
+    /// Unquoted model name in the tool.
+    pub model: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervals: Option<crate::catalog::ir::Interval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_restatement: Option<bool>,
+    /// Route keys of selected parents.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// How many parents selection left out — a count, never their names.
+    pub depends_on_unselected: usize,
+    /// `synced_at` — the measurement's timestamp.
+    pub at: String,
+}
+
+/// The cell-level discovery stamp (ADR 0016 §7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredFrom {
+    pub tool: String,
+    pub environment: String,
+    pub plan_id: String,
+    pub finalized_at: String,
+    pub synced_at: String,
+    pub evidence: crate::catalog::ir::Evidence,
 }
 
 /// Cell-level authorization. The serving plane exposes data only when `shareable`
@@ -108,6 +296,14 @@ pub struct Export {
     pub visibility: Visibility,
     #[serde(default)]
     pub contract: Contract,
+    /// Origin of `description`/`grain` when not `cell.yaml` (ADR 0015 §2).
+    /// Empty ⇒ every present field is authored. Never read from or
+    /// written to `cell.yaml`; set by discovery (`config::load`).
+    #[serde(skip)]
+    pub from: FromMap,
+    /// ADR 0016: present iff this export was discovered from a tool.
+    #[serde(skip)]
+    pub discovered: Option<DiscoveredExport>,
 }
 
 impl Export {
@@ -153,6 +349,9 @@ pub struct ColumnSpec {
     /// Structured unit token (`USD`, `ms`, `rows`) — never prose.
     pub unit: Option<String>,
     pub description: Option<String>,
+    /// Origin of each present field when not `cell.yaml` (ADR 0015 §2).
+    /// Empty ⇒ authored. Never part of the YAML shape; set by discovery.
+    pub from: FromMap,
 }
 
 impl ColumnSpec {
@@ -163,6 +362,7 @@ impl ColumnSpec {
             ty: ty.to_string(),
             unit: None,
             description: None,
+            from: FromMap::new(),
         }
     }
 }
@@ -199,6 +399,7 @@ impl<'de> Deserialize<'de> for ColumnSpec {
                     ty: h.ty,
                     unit: h.unit,
                     description: h.description,
+                    from: FromMap::new(),
                 })
             }
             other => Err(D::Error::custom(format!(
@@ -578,7 +779,7 @@ fn rewrite_incremental_error(raw: &str) -> String {
 /// declarative transform's resolved table name. Resolve-time shape
 /// validation is defense in depth here, not the primary control — the
 /// double-quote at the SQL build site is (ADR 0005 §1, ADR 0008 §7).
-pub(crate) fn is_valid_identifier(s: &str) -> bool {
+pub fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -1058,12 +1259,26 @@ pub struct Bindings {
     /// real one in prod.
     #[serde(default)]
     pub connections: IndexMap<String, Connection>,
+    /// ADR 0016 §5: how old a `.cell/deployed_catalog.json` may be before
+    /// `serve` refuses it and `context` reports it stale. Environment — a
+    /// prod cell resynced hourly and a laptop resynced weekly differ here.
+    #[serde(default)]
+    pub discover: Option<DiscoverBinding>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoverBinding {
+    /// `48h` (default), `7d`, `30m`…
+    #[serde(default)]
+    pub max_age: Option<String>,
 }
 
 // Connector config shapes live in `config::connections` (one module per
 // connector, mirroring `engine::connectors`); re-exported here so `Connection`
 // stays the one place every connector's config shape is enumerated.
 pub use crate::config::connections::bigquery::BigQueryConnection;
+pub use crate::config::connections::duckdb::DuckdbConnection;
 pub use crate::config::connections::postgres::PostgresConnection;
 pub use crate::config::connections::snowflake::SnowflakeConnection;
 
@@ -1075,6 +1290,7 @@ pub enum Connection {
     Bigquery(BigQueryConnection),
     Postgres(PostgresConnection),
     Snowflake(SnowflakeConnection),
+    Duckdb(DuckdbConnection),
 }
 
 /// S3 connection settings. Each field is env-expandable. With no key/secret,
@@ -1150,6 +1366,8 @@ impl CellDef {
             .with_context(|| format!("parsing cell definition {}", path.display()))?;
         def.validate_prose()
             .with_context(|| format!("validating cell definition {}", path.display()))?;
+        def.validate_discover()
+            .with_context(|| format!("validating cell definition {}", path.display()))?;
         // ADR 0013: `docs:` paths are resolved (allowlist-by-construction:
         // relative, canonicalized, under the cell dir, never into
         // `profiles/` or `.cell/`) and cap-checked here, fail-loud — same
@@ -1160,6 +1378,66 @@ impl CellDef {
         super::docs::validate_all(&dir, &def)
             .with_context(|| format!("validating cell definition {}", path.display()))?;
         Ok(def)
+    }
+
+    /// ADR 0016 §1: a discovered cell computes nothing and authors no
+    /// export list, so `discover:` and any of `sources:`/`transforms:`/
+    /// `interface:` together is a parse error; a `select` naming nothing is
+    /// too (no "everything" default); an override must name a real semver.
+    pub fn validate_discover(&self) -> Result<()> {
+        let Some(d) = &self.discover else {
+            return Ok(());
+        };
+        for (what, present) in [
+            ("transforms:", !self.transforms.is_empty()),
+            ("sources:", !self.sources.is_empty()),
+            ("interface:", !self.interface.is_empty()),
+        ] {
+            if present {
+                bail!(
+                    "a cell with `discover:` cannot also declare `{what}` — its interface is \
+                     discovered from {}'s deployed state and datamk computes nothing for it. \
+                     Remove `{what}`, or remove `discover:` and author the interface by hand.",
+                    match d.from {
+                        DiscoverFrom::Sqlmesh => "sqlmesh",
+                    }
+                );
+            }
+        }
+        if d.select.is_empty() {
+            bail!(
+                "`discover.select` must name at least one of `tags`, `schemas`, or `models` — \
+                 there is no \"every model\" default: an interface is an explicit export list, \
+                 and a project's whole DAG is not one."
+            );
+        }
+        if d.state.trim().is_empty() || d.warehouse.trim().is_empty() {
+            bail!("`discover.state` and `discover.warehouse` must each name a profile connection");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for o in &d.overrides {
+            if !seen.insert(o.model.as_str()) {
+                bail!("`discover.overrides` names model '{}' twice", o.model);
+            }
+            if let Some(v) = &o.version {
+                semver::Version::parse(v).with_context(|| {
+                    format!(
+                        "`discover.overrides` for '{}': version '{v}' is not semver",
+                        o.model
+                    )
+                })?;
+            }
+            if let Some(name) = &o.as_name {
+                if !is_valid_identifier(name) {
+                    bail!(
+                        "`discover.overrides` for '{}': `as: {name}` is not a valid export name \
+                         (letters, digits, underscores; not starting with a digit)",
+                        o.model
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// ADR 0012 §3: prose is length-capped at parse time — the meaning
@@ -1252,6 +1530,8 @@ mod tests {
             freshness: None,
             visibility: Visibility::default(),
             contract: Contract::default(),
+            from: Default::default(),
+            discovered: None,
         }
     }
 
@@ -1311,6 +1591,7 @@ mod tests {
             ty: "decimal".to_string(),
             unit: Some("USD".to_string()),
             description: None,
+            from: FromMap::new(),
         };
         let yaml = serde_yaml::to_string(&rich).unwrap();
         let back: ColumnSpec = serde_yaml::from_str(&yaml).unwrap();

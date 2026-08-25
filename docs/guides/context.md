@@ -49,69 +49,76 @@ digest itself never moves for a prose-only change.
 
 ## What's inside
 
-The document has two regions that are never mixed, and that separation is the
-whole point:
+The document is **flat** — one level, no regions — and every fact says
+where it came from. Two rules cover the whole shape:
 
-- **`declared`** — author claims: exports, grain, schema with descriptions
-  and units, the query grammar. What the author *says* the data means.
-- **`observed`** — machine facts: build provenance (execution, snapshot,
-  verify outcome, when the data actually last moved), the execution/freshness
-  actually attached for each upstream `cell` source, and measurements probed
-  from the real rows. What the machine *measured*.
+- A fact is a **claim** iff its record carries `from`: a small map naming
+  the origin of each field that could have come from more than one place —
+  `cell.yaml` (the author), `warehouse` (the upstream object's own
+  metadata), or a modeling tool. A description with `from.description:
+  "warehouse"` is the warehouse's words; one with `"cell.yaml"` is the
+  author's, which always wins when both exist.
+- A fact is a **measurement** iff it sits in a block with a timestamp:
+  `build` (the published execution behind the document), `source_check`
+  (a live check), `freshness` (poll telemetry), and each export's own
+  `probe` (what the rows looked like at swap) and `check` (what the live
+  check measured). What the machine *measured*, and when.
 
 An agent can never mistake a claim for a measurement. Absent facts are
 omitted or `null` — never fabricated, never zeros.
 
 ```json
 {
-  "datamk_context": 2,
+  "datamk_context": 4,
   "cell": "orders",
   "status": "verified",
   "grain_verified": true,
-  "declared": {
-    "description": "Daily order revenue by region.",
-    "exports": [{
-      "name": "orders_daily",
-      "version": "2.1.0",
-      "route": "orders_daily@2",
-      "contract": "supported",
-      "description": "One row per (order_date, region) with the summed order revenue.",
-      "grain": ["order_date", "region"],
-      "schema": {
-        "order_date": { "type": "date" },
-        "region":     { "type": "string" },
-        "revenue":    { "type": "decimal", "unit": "USD",
-                        "description": "Gross order revenue, before refunds." }
-      },
-      "query": {
-        "filters": ["order_date", "region"],
-        "filter_semantics": "exact equality only — no ranges, no operators, no non-grain columns",
-        "limit_default": 100, "limit_max": 1000, "offset_max": 1000000,
-        "sample_request": "orders_daily@2?limit=10"
-      }
-    }],
-    "upstreams": [{ "ref": "flights", "version": null }]
-  },
-  "observed": {
-    "provenance": {
-      "execution": 47, "snapshot_id": 12, "verify_outcome": "passed",
-      "finished_at": "2026-08-06T10:00:05Z", "data_as_of": "2026-08-06 10:00:04+00"
+  "description": "Daily order revenue by region.",
+  "from": { "description": "cell.yaml" },
+  "exports": [{
+    "name": "orders_daily",
+    "version": "2.1.0",
+    "route": "orders_daily@2",
+    "contract": "supported",
+    "description": "One row per (order_date, region) with the summed order revenue.",
+    "grain": ["order_date", "region"],
+    "from": { "description": "cell.yaml", "grain": "cell.yaml" },
+    "schema": {
+      "order_date": { "type": "date",   "from": { "type": "cell.yaml" } },
+      "region":     { "type": "string", "from": { "type": "cell.yaml" } },
+      "revenue":    { "type": "decimal", "unit": "USD",
+                      "description": "Gross order revenue, before refunds.",
+                      "from": { "type": "cell.yaml", "unit": "cell.yaml",
+                                "description": "cell.yaml" } }
     },
-    "upstreams": [
-      { "ref": "flights", "execution": 41, "data_as_of": "2026-08-04 06:00:11+00" }
-    ],
-    "exports": {
-      "orders_daily@2": {
-        "rows": 4,
-        "coverage": { "order_date": { "min": "2026-06-01", "max": "2026-06-02" } },
-        "values":   { "region": { "values": ["eu-west", "us-east", "us-west"],
-                                  "complete": true } },
-        "example_request": "orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
-      }
+    "query": {
+      "filters": ["order_date", "region"],
+      "filter_semantics": "exact equality only — no ranges, no operators, no non-grain columns",
+      "limit_default": 100, "limit_max": 1000, "offset_max": 1000000,
+      "sample_request": "orders_daily@2?limit=10"
+    },
+    "probe": {
+      "at": "2026-08-06T10:00:05Z",
+      "rows": 4,
+      "coverage": { "order_date": { "min": "2026-06-01", "max": "2026-06-02" } },
+      "values":   { "region": { "values": ["eu-west", "us-east", "us-west"],
+                                "complete": true } },
+      "example_request": "orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
     }
+  }],
+  "upstreams": [
+    { "ref": "flights", "version": null,
+      "execution": 41, "data_as_of": "2026-08-04 06:00:11+00" }
+  ],
+  "docs": [],
+  "include_request": "context?include=docs",
+  "build": {
+    "execution": 47, "snapshot_id": 12, "verify_outcome": "passed",
+    "finished_at": "2026-08-06T10:00:05Z", "data_as_of": "2026-08-06 10:00:04+00"
   },
   "data": { "served_here": true, "channels": [] },
-  "notes": []
+  "notes": [],
+  "included": []
 }
 ```
 
@@ -142,18 +149,17 @@ A few parts earn special attention:
   been published, and never live-checked, serves `status: "draft"` with an
   engine note saying exactly that. Draft never wears the verified costume,
   and neither wears the other's.
-- **`declared.upstreams` vs. `observed.upstreams`** close a real gap for
-  composed cells: `declared` carries only the author's pin (`version`,
-  usually `null` — most cells float on whatever `catalog/LATEST` points at
-  when they build), while `observed` carries what the Builder actually
-  attached — the resolved `execution` and the upstream's `data_as_of` at
-  that moment. A cell can be `status: "verified"`, built minutes ago, while
-  reading an upstream artifact that's days stale because *that* cell's build
-  has been failing; `observed.upstreams` is what makes that visible instead
-  of silent. `execution` is `null` for a direct-attach upstream (no
-  publish-store execution number exists to report) — never fabricated.
-  `datamk status` narrates the same measurement under `upstreams (at
-  LATEST):`.
+- **`upstreams[]`** carries both halves of a composed cell's edge on one
+  record: the author's pin (`version`, usually `null` — most cells float on
+  whatever `catalog/LATEST` points at when they build) and what the Builder
+  actually attached — the resolved `execution` and the upstream's
+  `data_as_of` at that moment. A cell can be `status: "verified"`, built
+  minutes ago, while reading an upstream artifact that's days stale because
+  *that* cell's build has been failing; `execution`/`data_as_of` are what
+  make that visible instead of silent. They're absent for a direct-attach
+  upstream (no publish-store execution number exists to report) — never
+  fabricated. `datamk status` narrates the same measurement under
+  `upstreams (at LATEST):`.
 
 ## Author the meaning
 
@@ -248,36 +254,34 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 ```json
 {
-  "...": "... every field the default document has, plus:",
+  "...": "... every field the default document has, and now each docs entry carries content:",
   "included": ["docs"],
-  "docs": {
-    "cell": {
+  "docs": [
+    { "target": "cell", "source_path": "docs/overview.md",
       "media_type": "text/markdown; charset=utf-8",
-      "content": "# Orders\n\n..."
-    },
-    "orders_daily@2": {
+      "sha256": "…", "bytes": 4120,
+      "content": "# Orders\n\n..." },
+    { "target": "orders_daily@2", "source_path": "docs/orders_daily.md",
       "media_type": "text/markdown; charset=utf-8",
-      "content": "# Orders daily\n\n..."
-    }
-  }
+      "content": "# Orders daily\n\n..." }
+  ]
 }
 ```
 
-`included` holds section *names*, never the content itself: each name in it
-appears as a **top-level key of the same name**, keyed by
-`declared.docs[].target`. Iterating `included` expecting objects gets you
-strings.
+`included` holds section *names*, never the content itself: `"docs"` in it
+means each `docs[]` entry now carries `content`. Iterating `included`
+expecting objects gets you strings.
 
 The default `GET /context` (no `include`) never carries page content — only
-`declared.docs`, the identity of every declared page (`{target, source_path,
-media_type}`, no bytes) and `declared.include_request`, the affordance
-telling an agent how to ask for the rest. `source_path` is the author's
-path on disk, not a URL — it is deliberately not fetchable, and its name
-says so. `included` is always present
-(`[]` on the default document, `["docs"]` once inlined) so an agent can
-tell "this server predates docs pages" (the field is absent) from "this
-cell just has none" (present, `docs` is `{}`). `?include=docs` on a
-docs-less cell is a normal **200** with empty pages, not an error.
+each page's identity (`{target, source_path, media_type}`, no bytes), its
+release-time fingerprint (`sha256`, `bytes`) once a release has run, and
+`include_request`, the affordance telling an agent how to ask for the rest.
+`source_path` is the author's path on disk, not a URL — it is deliberately
+not fetchable, and its name says so. `included` is always present (`[]` on
+the default document, `["docs"]` once inlined) so an agent can tell "this
+server predates docs pages" (the field is absent) from "this cell just has
+none" (present, `docs` is `[]`). `?include=docs` on a docs-less cell is a
+normal **200** with empty pages, not an error.
 
 Docs content never moves `interface_digest` (the `ETag` on the default
 document, `/openapi.json`'s `info.version`, and the mesh manifest's
@@ -423,21 +427,28 @@ avoid the cost. Run it wherever you'd run any other CI check:
 datamk verify -f cell.yaml -p prod   # binds sources, live-checks, exits 0/1
 ```
 
-The same live check, where the connector has one, also surfaces the
-upstream's own column descriptions — a fact, not authored prose — under
-`observed.source_descriptions`, keyed by source name:
+The same live check, where the connector has one, also reads the upstream
+object's own column descriptions. A bound export's columns *are* its
+source's columns, so they land right on the export's schema — on every
+column the author left undescribed — with the origin saying who wrote them:
 
 ```json
-"observed": {
-  "source_descriptions": {
-    "pii": { "email": "Customer's primary contact address, from the CRM." }
-  }
+"schema": {
+  "id":    { "type": "bigint", "from": { "type": "cell.yaml" } },
+  "email": { "type": "string",
+             "description": "Customer's primary contact address, from the CRM.",
+             "from": { "type": "cell.yaml", "description": "warehouse" } }
 }
 ```
 
-This never appears in `declared` (author-reviewed prose only) and never
-feeds `docs:`'s release-time digest — an upstream comment edit in someone
-else's warehouse must never move datamk's own release gate.
+An authored `description:` always wins over the warehouse's words (write
+one only when you mean something different). Materialized exports get
+nothing from this — their columns are the output of transforms, and no
+source column is an authority on them. Warehouse prose never feeds `datamk
+release`'s meaning digest (that ratchet hashes `cell.yaml`'s own words
+only), so an upstream comment edit in someone else's warehouse never moves
+datamk's release gate — it does move the interface digest, because the
+interface an agent reads changed.
 
 A bound cell is deployable: `datamk deploy` no longer refuses an all-bound
 cell outright, only where the target genuinely has nothing to run (no
@@ -451,35 +462,36 @@ A passing live check is what earns `status: "verified_at_source"` —
 deliberately not `verified`. `verified` is a claim about immutable rows that
 still exist behind a published snapshot; a live check is a claim about rows
 as of the moment it ran, which may since have changed. An agent that reads
-`observed.source_check` knows exactly which guarantee it's trusting:
+`source_check` knows exactly which guarantee it's trusting:
 
 ```json
 {
   "status": "verified_at_source",
   "grain_verified": true,
-  "observed": {
-    "provenance": null,
-    "source_check": {
-      "outcome": "passed",
-      "checked_at": "2026-08-07T10:00:00Z",
-      "datamk_version": "0.0.14",
-      "exports": {
-        "customer_pii@1": {
-          "check": "grain_unique",
-          "grain": ["id"],
-          "rows": 722,
-          "distinct_grain": 722
-        }
-      }
+  "exports": [{
+    "route": "customer_pii@1",
+    "check": {
+      "at": "2026-08-07T10:00:00Z",
+      "check": "grain_unique",
+      "grain": ["id"],
+      "rows": 722,
+      "distinct_grain": 722
     }
+  }],
+  "source_check": {
+    "outcome": "passed",
+    "checked_at": "2026-08-07T10:00:00Z",
+    "datamk_version": "0.0.14"
   }
 }
 ```
 
-`exports` carries what each check actually measured, so a reader sees what
-passed and not merely that it did — `checked_at` timestamps all of them, one
-pass, one time. An export with no declared grain contributes no entry: no
-check ran on it, and an empty measurement is never invented to fill the gap.
+Each export's `check` carries what the check actually measured for it, so a
+reader sees what passed and not merely that it did — its `at` is the
+pass's `checked_at`, one pass, one time. An export with no declared grain
+carries no `check`: nothing ran on it, and an empty measurement is never
+invented to fill the gap. There is no `build` block on such a cell — no
+execution stands behind it, and its absence says so.
 
 `data_as_of` joins that block only when a connector can say, cheaply and
 truthfully, when the checked rows were last known-true — omitted otherwise,
@@ -489,7 +501,7 @@ never guessed and never defaulted to `checked_at`.
 the warehouse, then emit the document — so the passing check has to survive
 between processes. `verify` records it under `.cell/source_check.json`,
 stamped with a digest of the `cell.yaml` it ran against; `context` embeds
-`observed.source_check` only when that digest still matches. Edit the cell
+`source_check` only when that digest still matches. Edit the cell
 between the two steps and the record goes stale silently: `context` omits it
 entirely (falling back to `draft` if nothing else stands behind the
 document) rather than reporting a check that no longer describes the current
@@ -539,5 +551,5 @@ means a machine checked the claims live, as of the timestamp it carries,
 against rows that may since have changed — a real but weaker guarantee, on
 purpose given its own token so no consumer inherits it by assuming
 `verified`'s meaning. The prose is the one part no machine check covers; the
-ratchet bounds its drift, and the `declared`/`observed` split makes sure an
-agent always knows which kind of statement it is reading.
+ratchet bounds its drift, and the `from`-or-timestamp rule makes sure an
+agent always knows which kind of statement it is reading — and who made it.

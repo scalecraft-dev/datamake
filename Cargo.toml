@@ -36,6 +36,7 @@ thiserror = "1"
 semver = "1"
 duckdb = { version = "1", features = ["bundled"] }    # compiles DuckDB; heavy first build
 sha2 = "0.10"                                         # content hash of the deploy artifact bundle
+crc32fast = "1"
 # Native object-store client (ADR 0004 §3): plain GET/PUT/LIST + conditional PUT
 # for published catalog artifacts. DuckDB's httpfs is the *query* engine's S3
 # path; this is the publisher's. PutMode::Create works across S3/GCS/local.

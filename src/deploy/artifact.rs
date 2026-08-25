@@ -54,8 +54,12 @@ pub struct CellArtifact {
     /// (issue #6/#10) — sibling of `source_check` immediately above, same
     /// "travels with the content" reasoning, same fold into `content_hash`.
     pub source_descriptions: Option<ArtifactFile>,
+    /// `.cell/deployed_catalog.json` if a `datamk sync` record exists (ADR
+    /// 0016 §5) — the whole interface of a discovered cell; travels and
+    /// rolls exactly like `source_check`.
+    pub deployed_catalog: Option<ArtifactFile>,
     /// SHA-256 over (cell_yaml ++ sql ++ docs ++ published ++ source_check
-    /// ++ source_descriptions), each entry framed by its `rel_path`. A
+    /// ++ source_descriptions ++ deployed_catalog), each entry framed by its `rel_path`. A
     /// stable content identity: re-releasing (a new pin), a new live-verify
     /// record, or editing a docs page changes it, which a target uses to
     /// roll the workload (ADR 0002, ADR 0013 §9, issue #16, issue #10).
@@ -108,6 +112,11 @@ impl CellArtifact {
             None
         };
 
+        let deployed_catalog = if dir.join(".cell").join("deployed_catalog.json").exists() {
+            Some(read_artifact(dir, ".cell/deployed_catalog.json")?)
+        } else {
+            None
+        };
         let content_hash = content_hash(
             &cell_yaml,
             &sql,
@@ -115,6 +124,7 @@ impl CellArtifact {
             &published,
             &source_check,
             &source_descriptions,
+            &deployed_catalog,
         );
         Ok(CellArtifact {
             dir: dir.to_path_buf(),
@@ -124,6 +134,7 @@ impl CellArtifact {
             published,
             source_check,
             source_descriptions,
+            deployed_catalog,
             content_hash,
         })
     }
@@ -146,6 +157,7 @@ fn content_hash(
     published: &Option<ArtifactFile>,
     source_check: &Option<ArtifactFile>,
     source_descriptions: &Option<ArtifactFile>,
+    deployed_catalog: &Option<ArtifactFile>,
 ) -> String {
     let mut h = Sha256::new();
     feed(&mut h, cell_yaml);
@@ -162,6 +174,9 @@ fn content_hash(
         feed(&mut h, f);
     }
     if let Some(f) = source_descriptions {
+        feed(&mut h, f);
+    }
+    if let Some(f) = deployed_catalog {
         feed(&mut h, f);
     }
     let mut out = String::with_capacity(64);
@@ -208,12 +223,12 @@ mod tests {
             bytes: b"x".to_vec(),
         };
         assert_eq!(
-            content_hash(&a, &[], &[], &None, &None, &None),
-            content_hash(&a, &[], &[], &None, &None, &None)
+            content_hash(&a, &[], &[], &None, &None, &None, &None),
+            content_hash(&a, &[], &[], &None, &None, &None, &None)
         );
         assert_ne!(
-            content_hash(&a, &[], &[], &None, &None, &None),
-            content_hash(&b, &[], &[], &None, &None, &None)
+            content_hash(&a, &[], &[], &None, &None, &None, &None),
+            content_hash(&b, &[], &[], &None, &None, &None, &None)
         );
     }
 

@@ -1,0 +1,252 @@
+# Discovered cells: a SQLMesh project's deployed models as an interface
+
+A cell normally *authors* its interface: you write `interface:` and
+`datamk verify` proves it. A **discovered** cell reads its interface from a
+modeling tool's deployed state instead — today SQLMesh (ADR 0016) — so
+schema, grain and descriptions keep one home and are never hand-copied.
+Point the cell at the project once; `datamk sync` does the rest.
+
+What you get, per selected model: a bound export (typed columns, the
+model's own description and column descriptions, its grain), lineage inside
+the cell, and the tool's deployment facts (kind, cron, owner, tags, the
+deployed snapshot fingerprint, loaded intervals). What you don't get: rows
+over HTTP. A discovered cell serves `/context` and `/openapi.json`; the rows
+stay in the warehouse, and every export's `binding.object` says where.
+
+## Point at the project
+
+```bash
+datamk init gold --from sqlmesh
+```
+
+```yaml
+# cell.yaml
+cell: gold
+description: The invoicing marts.
+
+discover:
+  from: sqlmesh
+  environment: prod            # the deployed environment — never a dev env
+  state: sqlmesh_state         # profiles/<p>.yaml connections.sqlmesh_state
+  warehouse: warehouse         # profiles/<p>.yaml connections.warehouse
+  select:                      # REQUIRED: at least one of tags/schemas/models
+    schemas: [invoice]         #   OR within a key, AND across keys
+    tags: [invoicing_step]
+    # models: [margins.flight_margin]
+    # kinds: [FULL, VIEW]      # default: every kind except EXTERNAL and SEED
+  exclude:
+    models: [invoice.scratch_x]
+  overrides:                   # refine a discovered model; never invent one
+    - model: invoice.flight_spend
+      as: flight_spend
+      version: 1.2.0           # authored semver — required to promote
+      contract: supported
+      grain: [month, campaign_group_id, flight_id]
+
+access:
+  shareable: true
+```
+
+`discover:` and any of `sources:`/`transforms:`/`interface:` together is
+a parse error: a discovered cell computes nothing and authors no export
+list. `select` has no "everything" default — an interface is an explicit
+export list, and a 2,000-model DAG is not one. A project becomes several
+narrow cells (one per schema, tag, or team), composed in `datamk.yaml` like
+any others.
+
+The profile names two connections — the tool's **state store** and the
+**warehouse** where the deployed objects live — plus how old the sync
+record may get:
+
+```yaml
+# profiles/prod.yaml
+storage: gs://acme-cells/gold
+channels:
+  - "Rows live in BigQuery dw-main-silver; see each export's binding.object."
+connections:
+  sqlmesh_state:              # SQLMesh's state_connection
+    type: postgres
+    host: ${SQLMESH_STATE_HOST}
+    database: sqlmesh
+    user: ${SQLMESH_STATE_USER}
+    password: ${SQLMESH_STATE_PASSWORD}
+  warehouse:
+    type: bigquery
+    project: dw-main-silver
+discover:
+  max_age: 48h
+```
+
+A modeling project usually spans catalogs (`dw-main-bronze`/`silver`/
+`gold` as three BigQuery projects). One BigQuery `warehouse` connection
+reads every selected model from the model's *own* project, billing the
+metadata jobs to the connection's `billing_project` (else its `project`) —
+so that identity needs `bigquery.jobs.create` there and metadata read on
+each project the selection touches. A Postgres or DuckDB connection is one
+database; models in another catalog are reported as unreachable.
+
+On a laptop a SQLMesh project's state store *and* its objects are one
+DuckDB file, so both connections are `type: duckdb` pointing at it. A state
+store held in Postgres or a DuckDB file is supported; BigQuery/Snowflake
+state stores are not yet. The warehouse can be BigQuery, Postgres, or a
+DuckDB file (Snowflake: not yet).
+
+Cloud SQL IAM authentication is not built in: DuckDB's Postgres scanner
+speaks libpq, so an IAM token is a `${VAR}` password with an hour's life,
+or the Auth Proxy runs beside the job. `sync` runs and exits, so that is a
+job-wrapper concern.
+
+## Sync
+
+```bash
+datamk sync -f cell.yaml -p prod
+```
+
+```
+Discovered 1969 models from sqlmesh environment 'prod' (plan ea22e379…, finalized 2026-08-24T22:51:46Z); 41 selected
+  41 exports · 1928 excluded by discover.select · column descriptions: 118 from sqlmesh, 203 from the warehouse, 64 none
+Wrote .cell/deployed_catalog.json
+Next:
+  datamk verify  -p prod    # live-check types against the warehouse
+  datamk context -p prod    # the document agents read
+  datamk serve   -p prod    # /context + /openapi.json; rows stay in the warehouse
+```
+
+`sync` is the only step that needs credentials. It reads the state store
+(read-only `SELECT`s over `_versions`, `_environments`, `_snapshots`,
+`_intervals` — no Python, no SQLMesh install) and the warehouse's
+`INFORMATION_SCHEMA` (batched per schema), and writes one file. Everything
+downstream — `verify`, `context`, `serve`, `deploy` — reads that file with
+no credentials at all. It ships inside the deploy artifact like
+`published.json` does, so a deployed Server carries the interface it was
+synced with.
+
+Where each fact comes from, in order:
+
+| fact | first | then | then |
+|---|---|---|---|
+| column names, types | the model's `columns (...)` | the warehouse | — |
+| column description | the model's `column_descriptions` | the model's inline `--` comments (SQLMesh's own rule) | the warehouse's registered comment |
+| model description | the model's `description` | the warehouse's object comment | — |
+| grain | the model's `grains` | `overrides[].grain` | empty |
+
+The first two description sources are both *SQLMesh's* and land with
+`from.description: "sqlmesh"`; the warehouse copy (what `register_comments`
+wrote) is the fallback, `"warehouse"`. An override is `"cell.yaml"` and
+wins. One home per fact — the losers are not emitted.
+
+A model whose columns can't be resolved (undeclared, and no warehouse
+object — usually not yet planned, or a missing metadata grant) fails the
+sync with the three fixes named; `on_unresolvable: exclude` drops it and
+lists it in the document's `notes[]` instead.
+
+**Deployed reality only.** `sync` reads the environment row a plan
+promoted, joins snapshots on `(name, identifier)` — never on name alone —
+and refuses an environment that isn't finalized (an apply in flight; exit
+code 75 so a scheduler can retry). A dev environment's edits never appear.
+The state schema version is pinned (`100`); a store written by a newer
+SQLMesh fails loud rather than being misread.
+
+## What the other verbs do
+
+| verb | on a discovered cell |
+|---|---|
+| `run` | refuses — nothing to build; use `sync` |
+| `verify` | live-checks every export's declared types and grain against the warehouse, exactly like a hand-authored bound export; earns `status: verified_at_source` |
+| `context` | the document, with `discovered_from` and per-export `deployed`; a draft with a note if the record is missing or stale |
+| `serve` | serves `/context` + `/openapi.json`; **refuses to start** without a fresh record (an empty interface with a valid ETag would read as "no exports") |
+| `release` | pins `supported` exports; the meaning ratchet hashes authored prose only, so an upstream description edit moves the ETag, never the release gate |
+| `status` | the plan, sync time, and export count |
+| `attach`, `rollback` | refuse — datamk owns no rows or lineage here |
+
+## Versions and contracts
+
+SQLMesh has fingerprints, not semver. Discovered exports are `1.0.0`,
+`contract: experimental`, route `name@1` — unpinnable, and the document
+says so. To promote one, write an override with an authored `version` and
+`contract: supported`. From then on `sync` **refuses to overwrite** the
+record when that model's data definition changed upstream and the version
+did not — the upstream moved a contract datamk promised; bump the version
+(MAJOR if the meaning changed) or exclude the model.
+
+## The document
+
+```json
+{
+  "cell": "gold",
+  "status": "verified_at_source",
+  "discovered_from": { "tool": "sqlmesh", "environment": "prod",
+                       "plan_id": "ea22e379…", "finalized_at": "2026-08-24T22:51:46Z",
+                       "synced_at": "2026-08-25T04:02:11Z", "evidence": "environment_row" },
+  "exports": [{
+    "name": "flight_spend", "version": "1.2.0", "route": "flight_spend@1",
+    "contract": "supported",
+    "description": "Spend by flight_id and month for invoicing and UI reporting",
+    "grain": ["month", "campaign_group_id", "flight_id"],
+    "from": { "description": "sqlmesh", "grain": "cell.yaml" },
+    "schema": {
+      "month":          { "type": "DATE",    "from": { "type": "warehouse" } },
+      "invoice_amount": { "type": "NUMERIC", "description": "…",
+                          "from": { "type": "warehouse", "description": "sqlmesh" } }
+    },
+    "query": null,
+    "binding": { "source": "flight_spend", "object": "invoice.flight_spend", "connection": "warehouse" },
+    "depends_on": ["public_advertisers@1", "ui_ui_flights@1"],
+    "depends_on_unselected": 2,
+    "deployed": { "at": "2026-08-25T04:02:11Z", "model": "dw-main-silver.invoice.flight_spend",
+                  "kind": "INCREMENTAL_BY_TIME_RANGE", "cron": "@hourly", "owner": "ber",
+                  "tags": ["invoicing_step"], "fingerprint": "3237974788",
+                  "intervals": { "start": "2000-01-01T00:00:00Z", "end": "2026-08-24T18:00:00Z" } }
+  }]
+}
+```
+
+`deployed` and `discovered_from` are measurements (they carry `at`/
+`synced_at`) and sit outside the interface digest: an upstream tag or cron
+edit never moves the ETag. `description` and `schema` are the interface, so
+an upstream *meaning* change does — correctly. `depends_on` names selected
+parents by route key; unselected ones are a count, never names.
+
+## Staleness
+
+The record carries the profile's `max_age` (default 48h). Past it, `serve`
+refuses and `context` says so in `notes[]`. A `cell.yaml` edit or a profile
+switch invalidates it too. Between syncs, a warehouse object altered outside
+a SQLMesh plan is invisible — that window is the price of a serving path
+with no credentials; `verify` on a schedule closes it to the schedule's
+period.
+
+## Checking the inline-comment extractor against your project
+
+datamk reproduces SQLMesh's rule for inline column comments without running
+SQLMesh. To prove it on your own models, dump SQLMesh's answer next to the
+project and let datamk diff it — the SQL never leaves your machine:
+
+```python
+# in the SQLMesh project — parses the models only; the state store is never touched
+import json
+from sqlmesh import Context
+from sqlmesh.core.config import DuckDBConnectionConfig
+import config as cfgmod          # your config.py; a config.yaml project can use Context(paths=".")
+cfg = cfgmod.config
+for gw in cfg.gateways.values():
+    gw.state_connection = DuckDBConnectionConfig(database=":memory:")
+c = Context(paths=".", config=cfg)
+cases = {}
+for m in c.models.values():
+    q = getattr(m, "query", None)   # seeds have none
+    if m.kind.name == "EXTERNAL" or m.column_descriptions_ is not None or q is None:
+        continue
+    cases[m.name] = {"sql": json.loads(m.json())["query"]["sql"],   # the text the state store holds
+                     "dialect": m.dialect, "expected": m.column_descriptions}
+json.dump(cases, open("comments_check.json", "w"))
+```
+
+```bash
+datamk debug sqlmesh-comments comments_check.json   # exits non-zero on any mismatch
+```
+
+Run against a 1,969-model production project (977 non-external models
+without declared descriptions, 68 with inline ones) on 2026-08-25: 0
+mismatches, on both the stored model text and sqlglot's re-serialization
+of it.

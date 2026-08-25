@@ -9,7 +9,7 @@ pub mod deploy; // DeployConfig/Target; read only by the deploy command (Phase 3
 pub(crate) mod docs;
 mod schema;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::path::{Path, PathBuf};
 
 pub use bindings::{
@@ -20,12 +20,14 @@ pub use bindings::{
 // Part of `SnowflakeAuth`'s public shape; constructed outside `config` only
 // by connector tests, which is what the non-test build would otherwise warn
 // about.
+pub use bindings::resolve_named_connection;
 #[allow(unused_imports)]
 pub use bindings::Redacted;
 pub use deploy::{DeployConfig, Target};
 pub use schema::{
-    builds_no_snapshot, Bindings, CellDef, ColumnSpec, Contract, Export, MaterializeStrategy,
-    ResolvedTransform, Source, Visibility,
+    builds_no_snapshot, is_valid_identifier, Bindings, CellDef, ColumnSpec, Contract, Discover,
+    DiscoverFrom, DiscoveredExport, DiscoveredFrom, Export, FromMap, MaterializeStrategy,
+    OnUnresolvable, Origin, Override, ResolvedTransform, Source, Visibility,
 };
 // `pub(crate)`, not part of the flat `pub use` list above: every caller
 // (`verify.rs`, `deploy::preflight`, `config::mod::load` itself) is already
@@ -51,6 +53,23 @@ pub struct LoadedCell {
     /// collision- and identifier-checked. The engine's run loop and
     /// `verify_replay` dispatch on this, never on `def.transforms` directly.
     pub transforms: Vec<ResolvedTransform>,
+    /// ADR 0016: present iff the cell has a `discover:` block — whether the
+    /// sidecar record was fresh (and so `def.interface`/`def.sources` were
+    /// materialized from it) or why it was not. Consumers decide what a
+    /// stale record means for them: `serve` refuses to start, `context`
+    /// emits a draft with a note, `sync` ignores it.
+    pub discovery: Option<Discovery>,
+}
+
+/// The outcome of reading `.cell/deployed_catalog.json` at load.
+#[derive(Debug, Clone)]
+pub enum Discovery {
+    Fresh {
+        synced_at: String,
+        plan_id: String,
+        exports: usize,
+    },
+    Stale(crate::catalog::record::Staleness),
 }
 
 /// The cell directory a `-f`/`--file` path implies: its parent, or `.` when
@@ -70,9 +89,56 @@ pub fn cell_dir(file: &Path) -> PathBuf {
 pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
     let mut def = CellDef::load(file)?;
     let dir = cell_dir(file);
+    // ADR 0016 §5: a discovered cell's interface is whatever the fresh
+    // sidecar record says — materialized here, at the one seam every
+    // consumer of `def.interface`/`def.sources` shares, so `context`,
+    // `serve`, `verify`, `release` and `openapi` iterate the same `Vec` a
+    // hand-authored cell gives them and never learn a second path.
+    let discovery = match &def.discover {
+        None => None,
+        Some(d) => {
+            let digest = crate::context::cell_yaml_digest_of(file)?;
+            match crate::catalog::record::DeployedCatalogRecord::fresh_for(
+                &dir,
+                &digest,
+                profile,
+                crate::timeutil::unix_now(),
+            ) {
+                Ok(record) => {
+                    let d = d.clone();
+                    crate::catalog::select::materialize(&mut def, &d, &record.catalog)
+                        .with_context(|| {
+                            format!(
+                                "materializing the discovered interface from {}",
+                                crate::catalog::record::DeployedCatalogRecord::path(&dir).display()
+                            )
+                        })?;
+                    Some(Discovery::Fresh {
+                        synced_at: record.catalog.synced_at.clone(),
+                        plan_id: record.catalog.plan_id.clone(),
+                        exports: def.interface.len(),
+                    })
+                }
+                Err(why) => Some(Discovery::Stale(why)),
+            }
+        }
+    };
     let profile_path = dir.join("profiles").join(format!("{profile}.yaml"));
     let raw = Bindings::load(&profile_path)?;
     let mut bindings = resolve(&def, &raw)?;
+    // A relative `type: duckdb` connection path resolves against the cell
+    // directory, like every other profile path.
+    for src in bindings.sources.values_mut() {
+        if let bindings::ResolvedSource::Connection {
+            config: bindings::ResolvedConnection::Duckdb { path },
+            ..
+        } = src
+        {
+            if !Path::new(path.as_str()).is_absolute() {
+                *path = dir.join(path.as_str()).to_string_lossy().into_owned();
+            }
+        }
+    }
     // Relative `gcs.credentials`/`gcs.extension`/`principals` paths resolve
     // against the cell directory, like transforms and a connection's
     // `credentials` (engine::connectors). `principals` matters even more in
@@ -159,6 +225,7 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
         dir,
         bindings,
         transforms,
+        discovery,
     })
 }
 

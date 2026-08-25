@@ -6,6 +6,82 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added — discovered cells: a SQLMesh project's deployed models as an interface (ADR 0016)
+
+`discover:` in `cell.yaml` points a cell at a SQLMesh project; `datamk sync`
+reads the deployed environment from the tool's own state store (read-only
+`SELECT`s, no Python, no SQLMesh install) and the warehouse's
+`INFORMATION_SCHEMA`, and writes `.cell/deployed_catalog.json`. Every
+selected model becomes a bound export with the model's own schema, grain
+and descriptions (declared, inline-comment, or warehouse-registered — each
+marked with its origin), lineage inside the cell, and a per-export
+`deployed` block (kind, cron, owner, tags, fingerprint, loaded intervals).
+`verify`, `context`, `serve` and `deploy` then need no credentials.
+
+- `datamk sync [-f cell.yaml] [-p profile] [--dry-run]` — new verb. Exit
+  code 75 when the environment is mid-apply (retry).
+- `datamk init <name> --from sqlmesh` — scaffolds a discovered cell.
+- `select` is required (tags/schemas/models; `EXTERNAL` and `SEED` excluded
+  unless asked); `overrides` refine a model (`as`, `version`, `contract`,
+  `grain`, `description`, `visibility`); `on_unresolvable: fail | exclude`.
+- Discovered exports are `1.0.0`/`experimental`; promotion needs an authored
+  `version`, and `sync` refuses to overwrite a `supported` model whose data
+  definition moved upstream under an unchanged version.
+- `serve` refuses to start on a missing or stale record (profile
+  `discover.max_age`, default 48h); `run`, `attach`, `rollback` refuse a
+  discovered cell; `status` reports the plan and sync time.
+- Document: top-level `discovered_from`; per export `deployed`,
+  `depends_on`, `depends_on_unselected`; `from` gains the `sqlmesh` origin.
+- `datamk debug sqlmesh-comments <file>` (hidden) — the differential check
+  for the inline-comment extractor against SQLMesh's own output.
+- `.cell/deployed_catalog.json` ships in the deploy artifact and rolls the
+  workload like `published.json`.
+
+See `docs/guides/discover.md`.
+
+### Added — `type: duckdb` profile connections
+
+A DuckDB database file as a warehouse connection: attached read-only, every
+object read-through, with native types and registered comments supplied
+from `duckdb_columns()` — so `verify`'s type authority and warehouse
+descriptions work against a local file (a SQLMesh project's default engine
+and state store are exactly this). Usable by any `sources:` entry, not only
+discovered cells.
+
+### Changed — BREAKING: the context document is flat, with per-field provenance (`datamk_context: 4`)
+
+ADR 0015. The `declared`/`observed` regions are gone. Every field that lived
+under them is top-level or on the record it describes, and every fact says
+where it came from: a record that carries `from: { <field>: <origin> }` is a
+claim (`cell.yaml` | `warehouse`); a block with a timestamp is a
+measurement. One home per fact.
+
+Moved paths:
+
+| v3 | v4 |
+|---|---|
+| `declared.description` | `description` (+ `from.description`) |
+| `declared.exports[]` | `exports[]` (each with `from`; columns with `from`) |
+| `declared.upstreams[]` + `observed.upstreams[]` | one `upstreams[]` record: `{ref, version, execution, data_as_of}` |
+| `declared.docs[]` + `observed.docs.<target>` + top-level `docs` | one `docs[]` record: identity + `{sha256, bytes}` + `content` (under `?include=docs`) |
+| `declared.include_request` | `include_request` |
+| `observed.provenance` | `build` (absent, never `null`, when no execution stands behind the document) |
+| `observed.exports.<route>` (probe) | `exports[].probe` (+ `at`) |
+| `observed.source_check.exports.<route>` | `exports[].check` (+ `at`) |
+| `observed.source_check` | `source_check` (cell-level fields only) |
+| `observed.freshness` | `freshness` |
+| `observed.source_descriptions` | **removed** — warehouse column comments land on a *bound* export's own columns with `from.description: "warehouse"`; materialized exports no longer carry source-keyed descriptions |
+
+`interface_digest` (the `ETag`, `/openapi.json`'s `info.version`, the mesh
+`context_digest`) now hashes an explicit projection: it still ignores every
+measurement and docs content, still ignores `from`, and now **does** move
+when a warehouse column comment on a bound export changes — that is the
+interface an agent reads changing. `datamk release`'s meaning ratchet keeps
+hashing `cell.yaml`'s own words only.
+
+No deprecation window: v3 is not served side by side. `datamk mesh emit`
+reads both v1–3 and v4 documents.
+
 ### Fixed — SECURITY: a relative `principals:` path resolved against the process cwd
 
 A profile's `principals:` was the one path field expanded but never rebased

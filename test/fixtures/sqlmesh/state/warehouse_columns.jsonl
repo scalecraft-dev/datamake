@@ -1,0 +1,18 @@
+{"schema": "sqlmesh_example", "table": "comment_forms", "column": "item_id", "type": "INTEGER", "comment": "trailing: the item", "index": 1}
+{"schema": "sqlmesh_example", "table": "comment_forms", "column": "num_orders", "type": "BIGINT", "comment": "leading: orders before the projection", "index": 2}
+{"schema": "sqlmesh_example", "table": "comment_forms", "column": "doubled", "type": "BIGINT", "comment": "block after", "index": 3}
+{"schema": "sqlmesh_example", "table": "comment_forms", "column": "as_double", "type": "DOUBLE", "comment": null, "index": 4}
+{"schema": "sqlmesh_example", "table": "comment_forms", "column": "quoted, alias", "type": "VARCHAR", "comment": "quoted alias", "index": 5}
+{"schema": "sqlmesh_example", "table": "comment_forms", "column": "lit", "type": "VARCHAR", "comment": "string with dashes", "index": 6}
+{"schema": "sqlmesh_example", "table": "documented_model", "column": "item_id", "type": "INTEGER", "comment": "The item identifier", "index": 1}
+{"schema": "sqlmesh_example", "table": "documented_model", "column": "num_orders", "type": "BIGINT", "comment": "Distinct orders for the item", "index": 2}
+{"schema": "sqlmesh_example", "table": "full_model", "column": "item_id", "type": "INTEGER", "comment": null, "index": 1}
+{"schema": "sqlmesh_example", "table": "full_model", "column": "num_orders", "type": "BIGINT", "comment": null, "index": 2}
+{"schema": "sqlmesh_example", "table": "incremental_model", "column": "id", "type": "INTEGER", "comment": null, "index": 1}
+{"schema": "sqlmesh_example", "table": "incremental_model", "column": "item_id", "type": "INTEGER", "comment": null, "index": 2}
+{"schema": "sqlmesh_example", "table": "incremental_model", "column": "event_date", "type": "DATE", "comment": null, "index": 3}
+{"schema": "sqlmesh_example", "table": "inline_comment_model", "column": "item_id", "type": "INTEGER", "comment": "the item id", "index": 1}
+{"schema": "sqlmesh_example", "table": "inline_comment_model", "column": "num_orders", "type": "BIGINT", "comment": "number of orders", "index": 2}
+{"schema": "sqlmesh_example", "table": "seed_model", "column": "id", "type": "INTEGER", "comment": null, "index": 1}
+{"schema": "sqlmesh_example", "table": "seed_model", "column": "item_id", "type": "INTEGER", "comment": null, "index": 2}
+{"schema": "sqlmesh_example", "table": "seed_model", "column": "event_date", "type": "DATE", "comment": null, "index": 3}

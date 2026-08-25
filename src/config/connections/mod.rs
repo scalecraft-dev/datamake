@@ -7,5 +7,6 @@
 //! feature.
 
 pub mod bigquery;
+pub mod duckdb;
 pub mod postgres;
 pub mod snowflake;
