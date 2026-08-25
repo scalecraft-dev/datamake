@@ -291,9 +291,14 @@ fn artifact_files(art: &CellArtifact) -> Vec<&ArtifactFile> {
     // Issue #6/#10: `.cell/source_descriptions.json` travels the same way
     // `source_check` immediately above does — same sibling reasoning,
     // `serve`'s startup load needs it mounted to surface
-    // `observed.source_descriptions` on the hosted door.
+    // the bound exports' warehouse descriptions on the hosted door.
     if let Some(descriptions) = &art.source_descriptions {
         files.push(descriptions);
+    }
+    // ADR 0016 §5: the discovered interface itself — without it a deployed
+    // Server for a discovered cell refuses to start (`refuse_stale_discovery`).
+    if let Some(catalog) = &art.deployed_catalog {
+        files.push(catalog);
     }
     files
 }

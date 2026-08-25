@@ -82,10 +82,10 @@ fn context_path_item() -> Value {
                 "description": "Comma-separated optional sections to inline. Omit for the \
                                 default document; `docs` inlines every declared docs page. \
                                 Each section named in the response's `included` array is \
-                                inlined at a TOP-LEVEL key of the same name — `include=docs` \
-                                echoes `\"included\": [\"docs\"]` and puts the content in \
-                                `docs`, keyed by `declared.docs[].target`. `included` holds \
-                                section names, never the content itself.",
+                                inlined ON THE RECORDS it belongs to — `include=docs` echoes \
+                                `\"included\": [\"docs\"]` and sets `content` on each \
+                                `docs[]` entry. `included` holds section names, never the \
+                                content itself.",
                 "schema": { "type": "array", "items": { "type": "string", "enum": sections } }
             }],
             "responses": {
@@ -105,16 +105,21 @@ fn context_path_item() -> Value {
     })
 }
 
-/// The context document's response shape. Hand-written against
-/// `context::ContextDocument` and pinned to it by
-/// `context_schema_names_every_top_level_document_key` — the `/context` 200
-/// used to be a bare description string, so nothing in the spec said where
-/// `include=` content lands or that `binding` exists.
+/// The context document's response shape (ADR 0015: flat, per-field
+/// provenance). Hand-written against `context::ContextDocument` and pinned
+/// to it by `context_schema_names_every_top_level_document_key` — the
+/// `/context` 200 used to be a bare description string, so nothing in the
+/// spec said where `include=` content lands or that `binding` exists.
 fn context_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["datamk_context", "cell", "status", "grain_verified",
-                     "declared", "observed", "data", "notes", "included"],
+        "required": ["datamk_context", "cell", "status", "grain_verified", "exports",
+                     "upstreams", "docs", "include_request", "data", "notes", "included"],
+        "description": "One level, no regions. A fact is a CLAIM iff its record carries \
+                        `from` (who said it); a fact is a MEASUREMENT iff it sits in a \
+                        block with a timestamp (`build`, `source_check`, `freshness`, an \
+                        export's `probe`/`check`). Absent facts are omitted, never \
+                        fabricated.",
         "properties": {
             "datamk_context": {
                 "type": "integer",
@@ -129,86 +134,75 @@ fn context_schema() -> Value {
                                 verify-gated execution stands behind this document."
             },
             "grain_verified": { "type": "boolean" },
-            "declared": {
+            "description": { "type": "string" },
+            "from": from_schema("description"),
+            "discovered_from": {
                 "type": "object",
-                "description": "Author claims. Never flattened with `observed`.",
-                "required": ["exports", "upstreams", "docs", "include_request"],
+                "description": "Present iff the interface was discovered from a modeling \
+                                tool's deployed state (ADR 0016): which tool, environment, \
+                                plan, and how \"deployed\" is evidenced.",
                 "properties": {
-                    "description": { "type": "string" },
-                    "exports": { "type": "array", "items": declared_export_schema() },
-                    "upstreams": { "type": "array", "items": { "type": "object", "properties": {
-                        "ref": { "type": "string" },
-                        "version": { "type": "integer" }
-                    }}},
-                    "docs": { "type": "array", "items": { "type": "object",
-                        "required": ["target", "source_path", "media_type"],
-                        "properties": {
-                            "target": { "type": "string",
-                                        "description": "`cell`, or an export's route key." },
-                            "source_path": { "type": "string",
-                                "description": "The author's cell.yaml-relative file path. \
-                                                NOT a URL and not fetchable — there is no \
-                                                /docs route; use ?include=docs for content." },
-                            "media_type": { "type": "string" }
-                        }}},
-                    "include_request": { "type": "string" }
+                    "tool": { "type": "string" },
+                    "environment": { "type": "string" },
+                    "plan_id": { "type": "string" },
+                    "finalized_at": { "type": "string", "format": "date-time" },
+                    "synced_at": { "type": "string", "format": "date-time" },
+                    "evidence": { "type": "string", "enum": ["environment_row", "artifact_only"] }
                 }
             },
-            "observed": {
-                "type": ["object", "null"],
-                "description": "Machine facts, or null when nothing has been built or \
-                                verified. Absent facts are omitted, never fabricated.",
+            "exports": { "type": "array", "items": export_schema() },
+            "upstreams": { "type": "array", "items": { "type": "object",
+                "required": ["ref"],
                 "properties": {
-                    "provenance": { "type": ["object", "null"] },
-                    "source_check": {
-                        "type": "object",
-                        "description": "A live check of the bound exports against their \
-                                        declared sources.",
-                        "properties": {
-                            "outcome": { "type": "string" },
-                            "checked_at": { "type": "string", "format": "date-time" },
-                            "data_as_of": { "type": "string", "format": "date-time" },
-                            "datamk_version": { "type": "string" },
-                            "exports": {
-                                "type": "object",
-                                "description": "Route key -> what the check measured. \
-                                                Timestamped by `checked_at`.",
-                                "additionalProperties": { "type": "object",
-                                    "required": ["check", "grain", "rows", "distinct_grain"],
-                                    "properties": {
-                                        "check": { "type": "string", "enum": ["grain_unique"] },
-                                        "grain": { "type": "array",
-                                                   "items": { "type": "string" } },
-                                        "rows": { "type": "integer" },
-                                        "distinct_grain": { "type": "integer" }
-                                    }}
-                            }
-                        }
-                    },
-                    "freshness": { "type": "object" },
-                    "upstreams": { "type": "array", "items": { "type": "object" } },
-                    "exports": {
-                        "type": "object",
-                        "description": "Route key -> swap-time probe (rows, coverage, values, \
-                                        example_request).",
-                        "additionalProperties": { "type": "object" }
-                    },
-                    "docs": { "type": "object", "additionalProperties": { "type": "object",
-                        "properties": {
-                            "sha256": { "type": "string" },
-                            "bytes": { "type": "integer" }
-                        }}},
-                    "source_descriptions": {
-                        "type": "object",
-                        "description": "Source name (as declared under `sources:`) -> column \
-                                        -> upstream description. Keyed by source, NOT by \
-                                        export; observed, so it may disagree with the \
-                                        declared schema.",
-                        "additionalProperties": { "type": "object",
-                            "additionalProperties": { "type": "string" } }
-                    }
+                    "ref": { "type": "string" },
+                    "version": { "type": "integer", "description": "The author's pin." },
+                    "execution": { "type": "integer",
+                        "description": "What the Builder actually attached — a measurement." },
+                    "data_as_of": { "type": "string", "format": "date-time" }
+                }}},
+            "docs": { "type": "array", "items": { "type": "object",
+                "required": ["target", "source_path", "media_type"],
+                "properties": {
+                    "target": { "type": "string",
+                                "description": "`cell`, or an export's route key." },
+                    "source_path": { "type": "string",
+                        "description": "The author's cell.yaml-relative file path. \
+                                        NOT a URL and not fetchable — there is no \
+                                        /docs route; use ?include=docs for content." },
+                    "media_type": { "type": "string" },
+                    "sha256": { "type": "string",
+                                "description": "Release-time fingerprint; absent until released." },
+                    "bytes": { "type": "integer" },
+                    "content": { "type": "string",
+                        "description": "Present only when `included` contains `docs`." }
+                }}},
+            "include_request": { "type": "string" },
+            "build": {
+                "type": "object",
+                "description": "Provenance of the published execution behind this document. \
+                                Absent when none stands behind it.",
+                "properties": {
+                    "execution": { "type": "integer" },
+                    "snapshot_id": { "type": ["integer", "null"] },
+                    "verify_outcome": { "type": "string" },
+                    "started_at": { "type": "string", "format": "date-time" },
+                    "finished_at": { "type": "string", "format": "date-time" },
+                    "datamk_version": { "type": "string" },
+                    "data_as_of": { "type": "string" }
                 }
             },
+            "source_check": {
+                "type": "object",
+                "description": "A live check of the bound exports against their declared \
+                                sources. Per-export measurements ride `exports[].check`.",
+                "properties": {
+                    "outcome": { "type": "string" },
+                    "checked_at": { "type": "string", "format": "date-time" },
+                    "data_as_of": { "type": "string", "format": "date-time" },
+                    "datamk_version": { "type": "string" }
+                }
+            },
+            "freshness": { "type": "object" },
             "data": {
                 "type": "object",
                 "required": ["served_here", "channels"],
@@ -218,8 +212,7 @@ fn context_schema() -> Value {
                                         export's `binding` for where they are." },
                     "channels": { "type": "array", "items": { "type": "string" },
                         "description": "Operator hints from the profile. Free-form prose; \
-                                        `declared.exports[].binding` is the machine-readable \
-                                        target." }
+                                        `exports[].binding` is the machine-readable target." }
                 }
             },
             "notes": { "type": "array", "items": { "type": "string" } },
@@ -229,24 +222,23 @@ fn context_schema() -> Value {
                                                         .map(|s| json!(s))
                                                         .collect::<Vec<Value>>() },
                 "description": "Section NAMES inlined by this response, never their content. \
-                                Each name appears as a top-level key of the same name."
-            },
-            "docs": {
-                "type": "object",
-                "description": "Present only when `included` contains `docs`. Keyed by \
-                                `declared.docs[].target`.",
-                "additionalProperties": { "type": "object",
-                    "required": ["media_type", "content"],
-                    "properties": {
-                        "media_type": { "type": "string" },
-                        "content": { "type": "string" }
-                    }}
+                                `docs` means each `docs[]` entry carries `content`."
             }
         }
     })
 }
 
-fn declared_export_schema() -> Value {
+/// The `from` map (ADR 0015 §2): field name -> origin, for every field of
+/// the record that can originate in more than one place.
+fn from_schema(fields: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": format!("Origin of each claim on this record ({fields}). Closed set."),
+        "additionalProperties": { "type": "string", "enum": ["cell.yaml", "warehouse", "sqlmesh"] }
+    })
+}
+
+fn export_schema() -> Value {
     json!({
         "type": "object",
         "required": ["name", "version", "route", "contract", "grain", "schema"],
@@ -261,11 +253,13 @@ fn declared_export_schema() -> Value {
             "description": { "type": "string" },
             "freshness": { "type": "string" },
             "grain": { "type": "array", "items": { "type": "string" } },
+            "from": from_schema("description, grain"),
             "schema": { "type": "object", "additionalProperties": { "type": "object",
                 "properties": {
                     "type": { "type": "string" },
                     "unit": { "type": "string" },
-                    "description": { "type": "string" }
+                    "description": { "type": "string" },
+                    "from": from_schema("type, unit, description")
                 }}},
             "query": {
                 "type": ["object", "null"],
@@ -285,6 +279,38 @@ fn declared_export_schema() -> Value {
                     "connection": { "type": "string",
                                     "description": "Connection alias; what it resolves to is \
                                                     profile, not contract." }
+                }
+            },
+            "depends_on": { "type": "array", "items": { "type": "string" },
+                "description": "Route keys of this export's selected parents within the cell \
+                                (discovered cells)." },
+            "depends_on_unselected": { "type": "integer",
+                "description": "Parents left out by selection — a count, never names." },
+            "deployed": {
+                "type": "object",
+                "description": "What the modeling tool says about this model's deployment \
+                                (kind, cron, owner, tags, fingerprint, loaded intervals). \
+                                Measured at `at`; outside the digest.",
+                "required": ["at", "model", "kind", "fingerprint"],
+                "properties": { "at": { "type": "string", "format": "date-time" } }
+            },
+            "probe": {
+                "type": "object",
+                "description": "Swap-time measurement against the rows this route serves \
+                                (rows, coverage, values, example_request). Absent until measured.",
+                "required": ["at"],
+                "properties": { "at": { "type": "string", "format": "date-time" } }
+            },
+            "check": {
+                "type": "object",
+                "description": "What `datamk verify`'s live check measured for this export.",
+                "required": ["at", "check", "grain", "rows", "distinct_grain"],
+                "properties": {
+                    "at": { "type": "string", "format": "date-time" },
+                    "check": { "type": "string", "enum": ["grain_unique"] },
+                    "grain": { "type": "array", "items": { "type": "string" } },
+                    "rows": { "type": "integer" },
+                    "distinct_grain": { "type": "integer" }
                 }
             }
         }
@@ -412,6 +438,8 @@ mod tests {
             freshness: None,
             visibility,
             contract: Contract::Experimental,
+            from: Default::default(),
+            discovered: None,
         }
     }
 
@@ -450,6 +478,8 @@ mod tests {
                 export_with("internal", "1.0.0", Visibility::Private),
             ],
             access: Default::default(),
+            discover: None,
+            discovered_from: None,
         };
         // The same shared route list `serve` and `/context` read (ADR 0012 §4).
         let routes = crate::context::discoverable_routes(&def).unwrap();
@@ -515,12 +545,19 @@ mod tests {
             "cell",
             "status",
             "grain_verified",
-            "declared",
-            "observed",
+            "description",
+            "from",
+            "discovered_from",
+            "exports",
+            "upstreams",
+            "docs",
+            "include_request",
+            "build",
+            "source_check",
+            "freshness",
             "data",
             "notes",
             "included",
-            "docs",
         ] {
             assert!(props.contains_key(key), "undocumented top-level key {key}");
         }
@@ -529,9 +566,18 @@ mod tests {
             json!(crate::context::DATAMK_CONTEXT_VERSION)
         );
         // The two fields the reported round-trips were lost on.
-        let export = &props["declared"]["properties"]["exports"]["items"]["properties"];
+        let export = &props["exports"]["items"]["properties"];
         assert!(export.get("binding").is_some());
-        let docs_entry = &props["declared"]["properties"]["docs"]["items"]["properties"];
+        assert!(export.get("probe").is_some() && export.get("check").is_some());
+        assert!(
+            export.get("from").is_some(),
+            "per-field provenance is documented"
+        );
+        let docs_entry = &props["docs"]["items"]["properties"];
+        assert!(
+            docs_entry.get("content").is_some(),
+            "the include=docs landing spot"
+        );
         assert!(docs_entry.get("source_path").is_some());
         assert!(
             docs_entry.get("path").is_none(),
@@ -541,7 +587,7 @@ mod tests {
         let include_desc = doc["paths"]["/context"]["get"]["parameters"][0]["description"]
             .as_str()
             .unwrap();
-        assert!(include_desc.contains("TOP-LEVEL key"), "{include_desc}");
+        assert!(include_desc.contains("ON THE RECORDS"), "{include_desc}");
     }
 
     /// Version and contract used to exist only as prose inside `summary`.
@@ -559,6 +605,8 @@ mod tests {
                 Visibility::Discoverable,
             )],
             access: Default::default(),
+            discover: None,
+            discovered_from: None,
         };
         let routes = crate::context::discoverable_routes(&def).unwrap();
         let doc = generate(&def.cell, None, &routes, "digest123", "");

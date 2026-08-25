@@ -1,0 +1,6 @@
+{"schema": "sqlmesh_example", "table": "comment_forms", "comment": null}
+{"schema": "sqlmesh_example", "table": "documented_model", "comment": "Orders per item with explicit columns and descriptions"}
+{"schema": "sqlmesh_example", "table": "full_model", "comment": null}
+{"schema": "sqlmesh_example", "table": "incremental_model", "comment": null}
+{"schema": "sqlmesh_example", "table": "inline_comment_model", "comment": "View with inline column comments only"}
+{"schema": "sqlmesh_example", "table": "seed_model", "comment": null}

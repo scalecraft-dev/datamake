@@ -25,8 +25,8 @@ pub struct Published {
     #[serde(default)]
     pub descriptions: BTreeMap<String, String>,
     /// target (`"cell"` or route key) -> docs page fingerprint (ADR 0013 §5):
-    /// computed at release time from the same pages `declared.docs` names,
-    /// carried into `observed.docs` by both `serve` and `datamk context`.
+    /// computed at release time from the same pages the document's `docs[]`
+    /// names, carried onto `docs[].{sha256, bytes}` by both `serve` and `datamk context`.
     /// Defaults keep pre-ADR-0013 manifests parsing.
     #[serde(default)]
     pub docs: BTreeMap<String, crate::context::DocsFingerprint>,
@@ -56,7 +56,7 @@ impl Published {
 /// `datamk verify` writes this (`.cell/source_check.json`, sibling of
 /// `published.json`) after successfully checking every bound export against
 /// its declared source; `datamk context` reads it back to
-/// populate `observed.source_check` and derive the `verified_at_source`
+/// populate the document's `source_check` and derive the `verified_at_source`
 /// status.
 ///
 /// `verify` and `context` run as separate processes, often in different CI
@@ -141,7 +141,7 @@ impl SourceCheckRecord {
         if r.cell_yaml_digest != cell_yaml_digest {
             tracing::info!(
                 "found .cell/source_check.json but its digest no longer matches cell.yaml — \
-                 the config changed since the last `datamk verify`; omitting observed.source_check \
+                 the config changed since the last `datamk verify`; omitting source_check \
                  (re-run `datamk verify` for a current one)"
             );
             return None;
@@ -152,7 +152,7 @@ impl SourceCheckRecord {
                 record_profile = %r.profile,
                 "found .cell/source_check.json but it was written under a different profile — \
                  a live check under one profile does not attest another; omitting \
-                 observed.source_check (re-run `datamk verify -p {profile}` for a current one)"
+                 source_check (re-run `datamk verify -p {profile}` for a current one)"
             );
             return None;
         }
@@ -224,7 +224,7 @@ impl SourceDescriptionsRecord {
             tracing::info!(
                 "found .cell/source_descriptions.json but its digest no longer matches \
                  cell.yaml — the config changed since the last `datamk verify`; omitting \
-                 observed.source_descriptions (re-run `datamk verify` for a current one)"
+                 the warehouse column descriptions (re-run `datamk verify` for a current one)"
             );
             return None;
         }
@@ -234,7 +234,7 @@ impl SourceDescriptionsRecord {
                 record_profile = %r.profile,
                 "found .cell/source_descriptions.json but it was written under a different \
                  profile — a live check under one profile does not attest another; omitting \
-                 observed.source_descriptions (re-run `datamk verify -p {profile}` for a \
+                 the warehouse column descriptions (re-run `datamk verify -p {profile}` for a \
                  current one)"
             );
             return None;
@@ -258,7 +258,7 @@ impl SourceDescriptionsRecord {
     /// `def`-scoped filter, this record would publish that private source's
     /// full documented column set, including columns the interface never
     /// declares, from a source ADR 0012 §4 says appears nowhere on the
-    /// wire — not even as a name. `observed.source_descriptions` exists to
+    /// wire — not even as a name. This record exists to
     /// describe bound exports, nothing else.
     ///
     /// No-ops (writes nothing, returns `Ok`) when no bound source has any

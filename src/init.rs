@@ -11,6 +11,9 @@ pub fn run(args: InitArgs) -> Result<()> {
     if dir.exists() {
         bail!("{} already exists", dir.display());
     }
+    if let Some(tool) = args.from.as_deref() {
+        return init_discovered(&dir, &args.name, tool);
+    }
     std::fs::create_dir_all(dir.join("sql"))?;
     std::fs::create_dir_all(dir.join("profiles"))?;
     std::fs::create_dir_all(dir.join("deploy"))?;
@@ -34,6 +37,104 @@ pub fn run(args: InitArgs) -> Result<()> {
     println!("  datamk deploy -f {d}/cell.yaml -p prod --dry-run");
     Ok(())
 }
+
+/// `datamk init <name> --from sqlmesh` (ADR 0016 §2): a discovered cell —
+/// no `sql/`, no `interface:`; a `discover:` block to point at the project
+/// and profiles naming the state store and warehouse. `channels:` is
+/// scaffolded non-empty on purpose: it is the only field that tells a
+/// caller where the rows actually are, since a discovered cell serves none.
+fn init_discovered(dir: &Path, name: &str, tool: &str) -> Result<()> {
+    if tool != "sqlmesh" {
+        bail!("`--from {tool}` is not supported; the tools datamk can discover an interface from: sqlmesh");
+    }
+    std::fs::create_dir_all(dir.join("profiles"))?;
+    write(&dir.join("cell.yaml"), &discovered_cell_yaml(name))?;
+    write(&dir.join("profiles/local.yaml"), DISCOVERED_PROFILE_LOCAL)?;
+    write(&dir.join("profiles/prod.yaml"), DISCOVERED_PROFILE_PROD)?;
+    write(&dir.join(".gitignore"), GITIGNORE)?;
+    let d = dir.display();
+    println!("Created discovered cell '{name}' in {d}");
+    println!("Next (edit discover.select and the profile's connections first):");
+    println!("  datamk sync    -f {d}/cell.yaml   # read the deployed models, write .cell/deployed_catalog.json");
+    println!("  datamk verify  -f {d}/cell.yaml   # live-check types against the warehouse");
+    println!("  datamk context -f {d}/cell.yaml   # the document agents read");
+    println!("  datamk serve   -f {d}/cell.yaml   # /context + /openapi.json; rows stay in the warehouse");
+    Ok(())
+}
+
+fn discovered_cell_yaml(name: &str) -> String {
+    format!(
+        r#"cell: {name}
+description: One line — what this set of deployed models is for.
+
+# A DISCOVERED cell (ADR 0016): the interface is read from the SQLMesh
+# project's deployed state by `datamk sync`, never authored here. There is no
+# `sources:`, `transforms:` or `interface:` — datamk computes nothing for it,
+# and serves no rows: every export is bound to the warehouse object SQLMesh
+# deployed. Descriptions, types and grain keep one home (the model, or the
+# warehouse's registered comments); `overrides:` refines, never invents.
+discover:
+  from: sqlmesh
+  environment: prod            # the deployed environment — never a dev env
+  state: sqlmesh_state         # -> profiles/<p>.yaml connections.sqlmesh_state
+  warehouse: warehouse         # -> profiles/<p>.yaml connections.warehouse
+  select:                      # REQUIRED: at least one of tags/schemas/models.
+    schemas: [marts]           #   OR within a key, AND across keys.
+    # tags: [published]
+    # models: [marts.orders_daily]
+    # kinds: [FULL, VIEW]      # default: every kind except EXTERNAL and SEED
+  exclude:
+    models: []
+  # on_unresolvable: fail      # fail (default) | exclude — a model whose columns
+                               # can't be resolved (undeclared, no warehouse object)
+  overrides:                   # refine a discovered model; never create one
+    # - model: marts.orders_daily
+    #   as: orders_daily        # export name (default: <schema>_<table>)
+    #   version: 1.0.0          # authored semver — required to promote to supported
+    #   contract: supported
+    #   grain: [order_date, region]
+
+access:
+  shareable: true
+"#
+    )
+}
+
+const DISCOVERED_PROFILE_LOCAL: &str = r#"# Binding profile: local. A SQLMesh project on your laptop uses a duckdb file
+# for both its engine and its state store — one file, two connections.
+catalog: ./.cell/catalog.ducklake
+storage: ./.cell/data
+channels:
+  - "Rows live in the SQLMesh duckdb file; attach it read-only with your own engine."
+connections:
+  sqlmesh_state:
+    type: duckdb
+    path: ../my-sqlmesh-project/db.db   # the project's state store (config.yaml `database:`)
+  warehouse:
+    type: duckdb
+    path: ../my-sqlmesh-project/db.db   # where the deployed models' objects live
+# discover:
+#   max_age: 48h                 # how old .cell/deployed_catalog.json may be before
+#                                # `serve` refuses it (default 48h)
+"#;
+
+const DISCOVERED_PROFILE_PROD: &str = r#"# Binding profile: prod. Environment-specific; values may reference ${VARS}.
+storage: gs://your-bucket/cells/this-cell   # published-artifact mode: no `catalog:`
+channels:
+  - "Rows live in the warehouse; see each export's binding.object. Request access: <your link>"
+connections:
+  sqlmesh_state:                  # SQLMesh's state store (config.py state_connection)
+    type: postgres
+    host: ${SQLMESH_STATE_HOST}
+    database: sqlmesh
+    user: ${SQLMESH_STATE_USER}
+    password: ${SQLMESH_STATE_PASSWORD}
+  warehouse:                      # the deployed models' objects
+    type: bigquery
+    project: ${GCP_PROJECT}
+discover:
+  max_age: 48h
+"#;
 
 fn write(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))

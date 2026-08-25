@@ -853,13 +853,16 @@ fn context_emits_a_draft_document_for_a_local_cell() {
     let doc: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("context emits valid JSON on stdout");
 
-    assert_eq!(doc["datamk_context"], 3);
+    assert_eq!(doc["datamk_context"], 4);
     assert_eq!(doc["cell"], "ctxcell");
     assert_eq!(doc["status"], "draft", "pinless => draft, by definition");
     assert_eq!(doc["grain_verified"], false);
-    assert!(doc["observed"].is_null(), "no fabricated provenance: {doc}");
+    assert!(
+        doc.get("build").is_none(),
+        "no fabricated provenance: {doc}"
+    );
     assert_eq!(doc["data"]["served_here"], false, "a file serves no rows");
-    let export = &doc["declared"]["exports"][0];
+    let export = &doc["exports"][0];
     assert_eq!(export["route"], "orders_daily@2");
     assert_eq!(export["grain"], serde_json::json!(["order_date", "region"]));
     assert_eq!(export["query"]["sample_request"], "orders_daily@2?limit=10");
@@ -1136,4 +1139,207 @@ fn interface_import_requires_bind_when_the_cell_has_multiple_sources() {
     assert!(err.contains("--bind"), "got: {err}");
     assert!(err.contains('a') && err.contains('b'), "got: {err}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- ADR 0016: discovered cells over a SQLMesh state store ----------------
+
+/// A SQLMesh state store + the deployed virtual-layer objects, as a real
+/// DuckDB file, built from the checked-in fixtures (`test/fixtures/sqlmesh/
+/// state/*.jsonl` — exported from a `sqlmesh init` project with prod + a
+/// dev environment). Mirrors `catalog::sqlmesh::state::fixture::build_file`
+/// (the binary's own tests); duplicated here because an integration test
+/// only sees the binary.
+fn sqlmesh_state_file(path: &Path) {
+    let conn = duckdb::Connection::open(path).unwrap();
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/sqlmesh/state");
+    conn.execute_batch("CREATE SCHEMA sqlmesh; CREATE SCHEMA sqlmesh_example;")
+        .unwrap();
+    let typed = [
+        ("_versions", "{schema_version: 'BIGINT', sqlglot_version: 'VARCHAR', sqlmesh_version: 'VARCHAR'}"),
+        ("_environments", "{name: 'VARCHAR', snapshots: 'VARCHAR', start_at: 'VARCHAR', end_at: 'VARCHAR', plan_id: 'VARCHAR', previous_plan_id: 'VARCHAR', expiration_ts: 'BIGINT', finalized_ts: 'BIGINT', promoted_snapshot_ids: 'VARCHAR', suffix_target: 'VARCHAR', catalog_name_override: 'VARCHAR', previous_finalized_snapshots: 'VARCHAR', normalize_name: 'BOOLEAN', requirements: 'VARCHAR', gateway_managed: 'BOOLEAN'}"),
+        ("_snapshots", "{name: 'VARCHAR', identifier: 'VARCHAR', version: 'VARCHAR', snapshot: 'VARCHAR', kind_name: 'VARCHAR', updated_ts: 'BIGINT', unpaused_ts: 'BIGINT', ttl_ms: 'BIGINT', unrestorable: 'BOOLEAN', forward_only: 'BOOLEAN', dev_version: 'VARCHAR', fingerprint: 'VARCHAR'}"),
+        ("_intervals", "{id: 'VARCHAR', created_ts: 'BIGINT', name: 'VARCHAR', identifier: 'VARCHAR', version: 'VARCHAR', dev_version: 'VARCHAR', start_ts: 'BIGINT', end_ts: 'BIGINT', is_dev: 'BOOLEAN', is_removed: 'BOOLEAN', is_compacted: 'BOOLEAN', is_pending_restatement: 'BOOLEAN', last_altered_ts: 'BIGINT'}"),
+    ];
+    for (table, columns) in typed {
+        conn.execute_batch(&format!(
+            "CREATE TABLE sqlmesh.{table} AS SELECT * FROM read_json('{}', format = 'newline_delimited', columns = {columns});",
+            base.join(format!("{table}.jsonl")).display()
+        ))
+        .unwrap();
+    }
+    let cols: Vec<serde_json::Value> =
+        std::fs::read_to_string(base.join("warehouse_columns.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    let objects: Vec<serde_json::Value> =
+        std::fs::read_to_string(base.join("warehouse_objects.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    for o in &objects {
+        let table = o["table"].as_str().unwrap();
+        let defs: Vec<String> = cols
+            .iter()
+            .filter(|c| c["table"] == table)
+            .map(|c| {
+                format!(
+                    "{} {}",
+                    q(c["column"].as_str().unwrap()),
+                    c["type"].as_str().unwrap()
+                )
+            })
+            .collect();
+        conn.execute_batch(&format!(
+            "CREATE TABLE sqlmesh_example.{} ({});",
+            q(table),
+            defs.join(", ")
+        ))
+        .unwrap();
+        for c in cols.iter().filter(|c| c["table"] == table) {
+            if let Some(comment) = c["comment"].as_str() {
+                conn.execute_batch(&format!(
+                    "COMMENT ON COLUMN sqlmesh_example.{}.{} IS '{}';",
+                    q(table),
+                    q(c["column"].as_str().unwrap()),
+                    comment.replace('\'', "''")
+                ))
+                .unwrap();
+            }
+        }
+    }
+}
+
+/// `init --from sqlmesh` → `sync` → `status` → `context` → `serve` refusal
+/// once the record is gone: the discovered-cell surface, end to end, through
+/// the binary. Reads the state store and warehouse from one duckdb file;
+/// nothing else is configured, which is the credential-light claim.
+#[test]
+fn discovered_cell_syncs_describes_and_refuses_to_serve_without_a_record() {
+    let parent = scratch_dir("discover");
+    let dir = parent.join("gold");
+    run_ok(
+        &parent,
+        &[
+            "init",
+            "gold",
+            "--from",
+            "sqlmesh",
+            "-p",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert!(dir.join("cell.yaml").is_file());
+    assert!(
+        !dir.join("sql").exists(),
+        "a discovered cell scaffolds no transforms"
+    );
+    sqlmesh_state_file(&dir.join("state.db"));
+    std::fs::write(
+        dir.join("cell.yaml"),
+        "cell: gold\n\
+         description: The fixture project's models.\n\
+         discover:\n\
+         \x20 from: sqlmesh\n\
+         \x20 state: sqlmesh_state\n\
+         \x20 warehouse: warehouse\n\
+         \x20 select:\n\
+         \x20   tags: [gold]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("profiles/local.yaml"),
+        "catalog: ./.cell/catalog.ducklake\n\
+         storage: ./.cell/data\n\
+         connections:\n\
+         \x20 sqlmesh_state: { type: duckdb, path: ./state.db }\n\
+         \x20 warehouse: { type: duckdb, path: ./state.db }\n",
+    )
+    .unwrap();
+
+    // Dry run writes nothing and still reports.
+    let out = run_ok(&dir, &["sync", "--dry-run"]);
+    let text = combined(&out);
+    assert!(
+        text.contains("[dry run]") && text.contains("2 selected"),
+        "{text}"
+    );
+    assert!(!dir.join(".cell/deployed_catalog.json").exists());
+
+    let out = run_ok(&dir, &["sync"]);
+    let text = combined(&out);
+    assert!(
+        text.contains("Discovered 6 models from sqlmesh environment 'prod'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Wrote") && text.contains("deployed_catalog.json"),
+        "{text}"
+    );
+    assert!(dir.join(".cell/deployed_catalog.json").is_file());
+
+    let out = run_ok(&dir, &["status"]);
+    let text = combined(&out);
+    assert!(
+        text.contains("source: sqlmesh (environment prod)"),
+        "{text}"
+    );
+    assert!(text.contains("exports: 2 discovered"), "{text}");
+
+    let out = run_ok(&dir, &["context"]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["discovered_from"]["tool"], "sqlmesh");
+    let names: Vec<&str> = doc["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "sqlmesh_example_documented_model",
+            "sqlmesh_example_inline_comment_model"
+        ]
+    );
+    assert_eq!(
+        doc["exports"][1]["schema"]["num_orders"]["from"]["description"],
+        "sqlmesh"
+    );
+    assert!(
+        doc["exports"][0]["query"].is_null(),
+        "bound exports have no data route"
+    );
+
+    // `run` refuses with the sync hint.
+    let out = run(&dir, &["run"]);
+    assert!(!out.status.success());
+    assert!(combined(&out).contains("datamk sync"), "{}", combined(&out));
+
+    // Without the record, `serve` refuses to start rather than serving an
+    // empty interface; `context` still emits, as a draft with a note.
+    std::fs::remove_file(dir.join(".cell/deployed_catalog.json")).unwrap();
+    let out = run(&dir, &["serve", "--port", "0"]);
+    assert!(!out.status.success(), "serve must refuse without a record");
+    let text = combined(&out);
+    assert!(
+        text.contains("refuses to start") && text.contains("datamk sync"),
+        "{text}"
+    );
+    let out = run_ok(&dir, &["context"]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["exports"], serde_json::json!([]));
+    assert!(
+        doc["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("datamk sync")),
+        "{doc}"
+    );
+
+    let _ = std::fs::remove_dir_all(&parent);
 }

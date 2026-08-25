@@ -32,7 +32,7 @@ pub struct DocsPage {
     /// `"cell"` or the route key (`name@major`).
     pub target: String,
     /// The declared relative path, verbatim. Not read by any caller today —
-    /// `declared.docs`' identity is built independently, directly from
+    /// the document's `docs[]` identity is built independently, directly from
     /// `def.docs`/`export.docs` (`context::docs_entries`), so a page never
     /// needs to be loaded just to report its own declared path — kept on
     /// the struct for diagnostics and API cohesion (identity + content
@@ -386,6 +386,8 @@ mod tests {
                 freshness: None,
                 visibility: crate::config::Visibility::default(),
                 contract: crate::config::Contract::default(),
+                from: Default::default(),
+                discovered: None,
             });
         }
         let err = validate_all(&dir, &def).unwrap_err().to_string();

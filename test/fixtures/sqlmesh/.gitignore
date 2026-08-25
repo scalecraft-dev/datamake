@@ -1,0 +1,4 @@
+project/db.db
+project/logs/
+project/.cache/
+project/__pycache__/

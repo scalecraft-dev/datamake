@@ -1,14 +1,17 @@
-//! The cell context document (ADR 0012): the cell's interface made
-//! machine-readable — what `/openapi.json` is to an API, this is to a data
-//! product. One artifact, two doors: `GET /context` on the serving plane and
-//! `datamk context` on stdout. The document is a *projection* of the cell,
-//! never a separate product: write the cell and the context exists; build the
-//! cell and it becomes trustworthy.
+//! The cell context document (ADR 0012, reshaped by ADR 0015): the cell's
+//! interface made machine-readable — what `/openapi.json` is to an API, this
+//! is to a data product. One artifact, two doors: `GET /context` on the
+//! serving plane and `datamk context` on stdout. The document is a
+//! *projection* of the cell, never a separate product: write the cell and the
+//! context exists; build the cell and it becomes trustworthy.
 //!
-//! The single most important shape constraint (ADR 0012 §2): `declared` holds
-//! author claims, `observed` holds machine facts, and the two are never
-//! flattened — an agent must never be able to mistake a claim for a
-//! measurement. Absent facts are omitted or `null`, never fabricated.
+//! The shape rule (ADR 0015 §3): the document is **flat** — one level, no
+//! `declared`/`observed` regions — and every fact says where it came from.
+//! A fact is a *claim* iff it carries `from` (a per-field origin map on the
+//! record: `cell.yaml`, `warehouse`, a modeling tool); a fact is a
+//! *measurement* iff it sits in a block with a timestamp (`build`,
+//! `source_check`, `freshness`, an export's `probe`/`check`). Nothing is
+//! both, nothing is neither. Absent facts are omitted, never fabricated.
 
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -16,20 +19,27 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{CellDef, ColumnSpec, Contract, Export, Source, Visibility};
+pub use crate::config::{FromMap, Origin};
 use crate::engine::run_summary::RunSummary;
 
 /// The document-schema version (`datamk_context`). An integer, distinct from
 /// cell semver and `datamk_version`: additive changes don't bump; any removal,
-/// rename, or re-meaning bumps, with the prior version served through a
-/// deprecation window (ADR 0012 §2).
+/// rename, or re-meaning bumps (ADR 0012 §2).
 ///
 /// **2**: `declared.docs[].path` renamed to `source_path`.
-/// **3**: every emitted request affordance (`declared.include_request`,
-/// `declared.exports[].query.sample_request`, `observed.exports[]
-/// .example_request`) is **relative to the document's own URL** —
-/// `orders_daily@2?limit=10`, not `/orders_daily@2?limit=10`. A re-meaning,
-/// so it bumps. See `INCLUDE_DOCS_REQUEST` for why.
-pub const DATAMK_CONTEXT_VERSION: u32 = 3;
+/// **3**: every emitted request affordance (`include_request`,
+/// `exports[].query.sample_request`, `exports[].probe.example_request`) is
+/// **relative to the document's own URL** — `orders_daily@2?limit=10`, not
+/// `/orders_daily@2?limit=10`. A re-meaning, so it bumps. See
+/// `INCLUDE_DOCS_REQUEST` for why.
+/// **4**: flat (ADR 0015). The `declared`/`observed` regions are gone;
+/// every field that lived under them is top-level or on the record it
+/// describes (`exports[].probe`, `exports[].check`, `upstreams[].execution`,
+/// `docs[].sha256`), claims carry a `from` origin map, and measurements
+/// carry a timestamp. `observed.provenance` is `build`;
+/// `observed.source_descriptions` is gone — warehouse prose lands on a
+/// bound export's own columns with `from.description: "warehouse"`.
+pub const DATAMK_CONTEXT_VERSION: u32 = 4;
 
 /// The `limit` in every emitted `sample_request` — the smallest useful legal
 /// call, a pure function of the route key and the limit grammar.
@@ -54,38 +64,67 @@ pub struct ContextDocument {
     /// no pin and no run summary, so it is draft even after a local build; the
     /// engine-emitted note says why. `verified_at_source` sits strictly
     /// between the two: no execution, but a `datamk verify` live-checked
-    /// every bound export against its declared source
-    /// (`observed.source_check`) — a claim about rows as of that check, not
-    /// about immutable rows that still exist. Distinct from `verified` on
-    /// purpose (issue #6 Q3): an agent that branches on `status` must opt in
-    /// to trusting a weaker guarantee, never inherit it silently.
+    /// every bound export against its declared source (`source_check`) — a
+    /// claim about rows as of that check, not about immutable rows that
+    /// still exist. Distinct from `verified` on purpose (issue #6 Q3): an
+    /// agent that branches on `status` must opt in to trusting a weaker
+    /// guarantee, never inherit it silently.
     pub status: Status,
     /// `false` unless a verified build or a live source check stands behind
     /// the document — never `null`, never `true` by assumption (ADR 0012 §2).
     pub grain_verified: bool,
-    /// Author claims: the interface exactly as `cell.yaml` declares it.
-    pub declared: Declared,
-    /// Machine facts. `null` (never `{}`) when nothing has been built or
-    /// verified behind this document.
-    pub observed: Option<Observed>,
+    /// The cell's one-line description (ADR 0012 §3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Origin of each cell-level claim above (ADR 0015 §2).
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub from: FromMap,
+    /// ADR 0016 §7: present iff the interface was discovered from a modeling
+    /// tool — which tool, which environment, which plan, and how the
+    /// "deployed" claim is evidenced. `synced_at` makes it a measurement;
+    /// it is outside the digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovered_from: Option<crate::config::DiscoveredFrom>,
+    /// The visibility-filtered exports (a `private` export appears nowhere,
+    /// in any form, not even as a name — ADR 0012 §4), each carrying its own
+    /// claims (`from`) and its own measurements (`probe`, `check`).
+    pub exports: Vec<ExportDoc>,
+    /// One-hop upstream edges: the author's `{ref, version}` pin plus, when a
+    /// build has been observed, what was actually attached (issue #7). Never
+    /// the upstream `table` (the upstream owner's to disclose — ADR 0012 §5).
+    pub upstreams: Vec<UpstreamDoc>,
+    /// Docs pages (ADR 0013): identity always; fingerprint once released;
+    /// `content` only when `included` names `docs`.
+    pub docs: Vec<DocsDoc>,
+    /// The affordance to fetch docs content — a constant, always present.
+    pub include_request: String,
+    /// Build provenance from the published run summary (ADR 0012 §5).
+    /// Absent when no published execution stands behind the document — a
+    /// direct-attach cell writes no summary; that absence is served as-is,
+    /// never as zeros (ADR 0012 §2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<Provenance>,
+    /// From `datamk verify`'s live-verify pass (issue #6): present iff a
+    /// fresh (digest-matched) `.cell/source_check.json` record exists. Absent
+    /// when no live check has run, or its record is stale (a `cell.yaml` edit
+    /// since the check — silently omitted, never emitted stale). The
+    /// per-export measurements ride each export's `check`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_check: Option<SourceCheck>,
+    /// Hosted `/context` only, published mode only: the poll telemetry that
+    /// makes bounded staleness visible (ADR 0004 §6). Never in the portable
+    /// artifact — poll telemetry is a lie the instant the file is written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<FreshnessBlock>,
     pub data: DataBlock,
-    /// Engine-emitted only — no author-supplied string ever lands here
-    /// (author prose lives in `declared`, labeled as a claim).
+    /// Engine-emitted only — no author-supplied string ever lands here.
     pub notes: Vec<String>,
     /// Which optional sections this response inlines (ADR 0013) —
     /// engine-emitted, always present: `[]` on the default variant, `["docs"]`
     /// under `?include=docs` (served) or the default portable emission. Lets
     /// an agent distinguish "server predates this field" (absent — an old
-    /// binary) from "this cell has no docs" (present, and `docs` below is
-    /// `Some({})`), the same assert-absence discipline as `observed`.
+    /// binary) from "this cell has no docs" (present, and `docs` is `[]`).
     pub included: Vec<String>,
-    /// Docs page content (ADR 0013), present ONLY when `included` contains
-    /// `"docs"`. Top-level (not nested under `declared`) so a prose-only edit
-    /// never moves `interface_digest` — that digest is also `/openapi.json`'s
-    /// `info.version` and the mesh manifest's `context_digest`, and a prose
-    /// typo must not tell generic tooling the callable surface changed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub docs: Option<IndexMap<String, DocsContentEntry>>,
     /// Portable artifact only (`datamk context`): when the document was
     /// emitted. A hosted `/context` omits it — the response is always now.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,84 +147,58 @@ pub enum Status {
     Verified,
 }
 
-/// The declared interface: visibility-filtered exports (a `private` export
-/// appears nowhere, in any form, not even as a name — ADR 0012 §4) plus
-/// nominal one-hop upstream edges.
-#[derive(Debug, Clone, Serialize)]
-pub struct Declared {
-    /// The cell's one-line description (ADR 0012 §3) — an author claim,
-    /// which is why it lives here and not at the top level.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub exports: Vec<DeclaredExport>,
-    /// `{ref, version}` from `cell` sources — never the upstream `table`
-    /// (the upstream owner's to disclose, on its own document, under its own
-    /// auth — ADR 0012 §5).
-    pub upstreams: Vec<UpstreamRef>,
-    /// Docs page **identity only** (ADR 0013) — `{target, path, media_type}`
-    /// per declared page, always present (`[]` when none). No
-    /// content-derived value here (no sha256, no bytes): this struct is what
-    /// `interface_digest` serializes whole, and a prose typo must not tell
-    /// generic OpenAPI tooling the callable surface changed. Identity
-    /// (adding/removing/renaming a page) legitimately does move the digest —
-    /// see `digest_tracks_docs_identity_but_ignores_content_and_fingerprint`.
-    pub docs: Vec<DeclaredDocsEntry>,
-    /// The affordance to fetch the pages above — a constant, always present,
-    /// the same precedent as `DeclaredExport::query` (an affordance field
-    /// inside `declared`).
-    pub include_request: String,
-}
-
 /// `context?include=docs` — the one and only door to docs content (ADR
 /// 0012 §4: one document, one route; there is no `/docs/:name`).
 ///
 /// **Relative, not root-absolute** (ADR 0014, `datamk_context: 3`). This
-/// string lives inside `Declared`, which `interface_digest` serializes
-/// whole, so a root-absolute affordance has no safe form once a cell can be
-/// mounted at a base path: `/context` 404s in a multi-cell server, and
-/// prefixing it with the mount makes the same `cell.yaml` yield a different
-/// digest depending on where it's served — environment leaking into the
-/// contract. A relative reference resolves per RFC 3986 §5 against the
-/// document's own URL and is correct unmounted or mounted with one string;
-/// the digest never sees the base path.
+/// string is part of the interface digest, so a root-absolute affordance has
+/// no safe form once a cell can be mounted at a base path: `/context` 404s
+/// in a multi-cell server, and prefixing it with the mount makes the same
+/// `cell.yaml` yield a different digest depending on where it's served —
+/// environment leaking into the contract. A relative reference resolves per
+/// RFC 3986 §5 against the document's own URL and is correct unmounted or
+/// mounted with one string; the digest never sees the base path.
 const INCLUDE_DOCS_REQUEST: &str = "context?include=docs";
 
-/// One declared docs page's identity — never its content or a
-/// content-derived fingerprint (those live at the top-level `docs` field and
-/// under `observed.docs` respectively).
+/// One docs page (ADR 0013): identity (`target`, `source_path`,
+/// `media_type`) is interface and always present; `sha256`/`bytes` are a
+/// release-time fingerprint carried through `published.json`, never
+/// computed at load time (which would populate it on every unbuilt cell
+/// that merely declares `docs:`); `content` is inlined only when `included`
+/// names `docs`. Only identity is in the interface digest — a prose edit
+/// must not tell generic tooling the callable surface changed.
 #[derive(Debug, Clone, Serialize)]
-pub struct DeclaredDocsEntry {
+pub struct DocsDoc {
     /// `"cell"` or the route key (`name@major`) — route keys always carry
     /// `@major`, so an export can never collide with the literal `"cell"`.
     pub target: String,
     /// The author's cell.yaml-relative filesystem path. Named `source_path`,
     /// not `path`, because it is not fetchable — there is no `/docs/:target`
-    /// route (ADR 0012 §4); content arrives via `?include=docs`. Same
-    /// false-affordance fix already made for `DeclaredExport::route`.
+    /// route (ADR 0012 §4); content arrives via `?include=docs`.
     pub source_path: String,
     pub media_type: String,
-}
-
-/// One docs page's content, as served under `?include=docs` (ADR 0013).
-/// Never under `observed` — author bytes are a claim, not a measurement.
-#[derive(Debug, Clone, Serialize)]
-pub struct DocsContentEntry {
-    pub media_type: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 /// One docs page's content fingerprint (ADR 0013) — a machine fact computed
-/// at release time and carried through `published.json`, never author bytes.
-/// Present in both the default and docs variant (it is cheap identity data,
-/// not gated behind `include=docs`) and never in `interface_digest`.
+/// at release time and carried through `published.json`, never author
+/// bytes. Lands on `docs[].{sha256, bytes}`.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct DocsFingerprint {
     pub sha256: String,
     pub bytes: usize,
 }
 
+/// One export as the document emits it: interface fields first (in the
+/// digest), then the per-export measurements (`probe`, `check` — timestamped,
+/// never in the digest).
 #[derive(Debug, Clone, Serialize)]
-pub struct DeclaredExport {
+pub struct ExportDoc {
     pub name: String,
     pub version: String,
     /// The route key (`name@major`) — this export's stable identity, and
@@ -196,10 +209,7 @@ pub struct DeclaredExport {
     /// is `null` for exactly the same exports, by construction
     /// (`(!e.is_bound()).then(...)`), so `query` is the machine-checkable
     /// signal for "does `GET /{route}` exist," never `route`'s mere
-    /// presence. Issue #6/#12: this field used to be documented as
-    /// unconditionally "the serving route key," which is what a caller
-    /// building a URL straight from it (without checking `query`) would hit
-    /// a 404 on for a bound export.
+    /// presence.
     pub route: String,
     pub contract: Contract,
     /// What one row means (ADR 0012 §3) — required once `contract:
@@ -209,24 +219,94 @@ pub struct DeclaredExport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
     pub grain: Vec<String>,
-    /// Declared column -> spec, in declared order. Always the object shape
-    /// here — the string-or-mapping union is authoring ergonomics for
-    /// `cell.yaml`; an emitted document has no reason to make a consumer
-    /// handle two shapes.
+    /// Origin of `description` and `grain` (ADR 0015 §2), present for each
+    /// that is present.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub from: FromMap,
+    /// Column -> spec, in declared order. Always the object shape here — the
+    /// string-or-mapping union is authoring ergonomics for `cell.yaml`; an
+    /// emitted document has no reason to make a consumer handle two shapes.
     pub schema: IndexMap<String, ColumnDoc>,
-    /// The served HTTP affordances, exactly (ADR 0012 §2). Omitted where the
-    /// data routes are not mounted (`--no-data`) — it describes affordances
-    /// that do not exist there.
+    /// The served HTTP affordances, exactly (ADR 0012 §2). `null` for a
+    /// bound export: the affordance it would describe (a mounted HTTP route)
+    /// does not exist for that export, ever, regardless of any serving flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<QueryBlock>,
     /// Where the rows are, for a bound export — present iff `query` is null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<BindingBlock>,
+    /// ADR 0016 §7: lineage inside this cell — route keys of the selected
+    /// parents. Not `upstreams[]`, which means a *cell* dependency.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// How many parents selection left out — a count, never their names
+    /// (the unselected models are not this cell's to disclose, ADR 0012 §5).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub depends_on_unselected: usize,
+    /// ADR 0016 §7: what the modeling tool says about this model's
+    /// deployment — kind, cron, owner, tags, fingerprint, loaded intervals.
+    /// A measured block (`at` = the sync time), outside the digest, so an
+    /// upstream tag or cron edit never moves the ETag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployed: Option<DeployedBlock>,
+    /// Swap-time probe (ADR 0012 §5) — measured against the rows the route
+    /// actually serves (pinned snapshot for supported routes), never on the
+    /// request path, omitted on failure. Turns the worst agent failure — an
+    /// empty result read as a legitimate zero — into a diagnosable miss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ExportProbe>,
+    /// What `datamk verify`'s live check measured for this export — the
+    /// numbers behind `source_check.outcome`, so a reader sees what passed
+    /// and not only that it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<ExportCheck>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// The tool-side facts of a discovered export (ADR 0016 §7), on the wire.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeployedBlock {
+    pub at: String,
+    pub model: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    pub fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intervals: Option<crate::catalog::ir::Interval>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_restatement: Option<bool>,
+}
+
+impl From<&crate::config::DiscoveredExport> for DeployedBlock {
+    fn from(d: &crate::config::DiscoveredExport) -> Self {
+        DeployedBlock {
+            at: d.at.clone(),
+            model: d.model.clone(),
+            kind: d.kind.clone(),
+            cron: d.cron.clone(),
+            owner: d.owner.clone(),
+            tags: d.tags.clone(),
+            fingerprint: d.fingerprint.clone(),
+            version: d.version.clone(),
+            intervals: d.intervals.clone(),
+            pending_restatement: d.pending_restatement,
+        }
+    }
 }
 
 /// A bound export's target, exactly as `cell.yaml` writes it — never
-/// profile-resolved: `table` is env-expandable and `declared` is hashed into
-/// `interface_digest`, so a resolved value would churn the digest per
+/// profile-resolved: `table` is env-expandable and this block is in the
+/// interface digest, so a resolved value would churn the digest per
 /// environment. A templated table ships as `${DATASET}.fct_x`.
 #[derive(Debug, Clone, Serialize)]
 pub struct BindingBlock {
@@ -240,7 +320,9 @@ pub struct BindingBlock {
     pub connection: Option<String>,
 }
 
-/// One declared column as the document emits it.
+/// One column as the document emits it. `from` names the origin of every
+/// field present (`type` always; `unit`/`description` when set) — ADR 0015
+/// §2.
 #[derive(Debug, Clone, Serialize)]
 pub struct ColumnDoc {
     #[serde(rename = "type")]
@@ -250,14 +332,28 @@ pub struct ColumnDoc {
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub from: FromMap,
 }
 
 impl From<&ColumnSpec> for ColumnDoc {
+    /// Every present field carries its origin: `cell.yaml` unless the spec
+    /// says otherwise (a discovered column, ADR 0016).
     fn from(spec: &ColumnSpec) -> Self {
+        let origin = |field: &str| spec.from.get(field).copied().unwrap_or(Origin::CellYaml);
+        let mut from = FromMap::new();
+        from.insert("type".to_string(), origin("type"));
+        if spec.unit.is_some() {
+            from.insert("unit".to_string(), origin("unit"));
+        }
+        if spec.description.is_some() {
+            from.insert("description".to_string(), origin("description"));
+        }
         ColumnDoc {
             ty: spec.ty.clone(),
             unit: spec.unit.clone(),
             description: spec.description.clone(),
+            from,
         }
     }
 }
@@ -280,71 +376,27 @@ pub struct QueryBlock {
     pub sample_request: String,
 }
 
-/// Machine facts about what actually stands behind the document.
+/// One upstream edge: the author's pin (`ref`, `version` — interface, in the
+/// digest) and, once a build has been observed, what the Builder actually
+/// attached (`execution`, `data_as_of` — measurements, never in the digest:
+/// an execution number there would churn agent caches on every refresh
+/// without the interface moving). `execution` is absent for a direct-attach
+/// cell source (no execution number exists — ADR 0004 §12) or when nothing
+/// has been observed; never fabricated.
 #[derive(Debug, Clone, Serialize)]
-pub struct Observed {
-    /// From the published run summary. `null` when none exists — a
-    /// direct-attach cell writes no summary; that absence is served as-is,
-    /// never as zeros (ADR 0012 §2).
-    pub provenance: Option<Provenance>,
-    /// From `datamk verify`'s live-verify pass (issue #6): present iff a
-    /// fresh (digest-matched) `.cell/source_check.json` record exists.
-    /// `null` when no live check has run, or its record is stale (a
-    /// `cell.yaml` edit since the check — silently omitted, never emitted
-    /// stale). Independent of `provenance`: a cell can carry both (a mixed
-    /// cell with a published execution AND a separately live-checked
-    /// never-backed export), though `status` only reads `provenance` once
-    /// it's present (ADR 0012 §2 cell-level rule, issue #6).
+pub struct UpstreamDoc {
+    #[serde(rename = "ref")]
+    pub reference: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_check: Option<SourceCheck>,
-    /// Hosted `/context` only, published mode only: the poll telemetry that
-    /// makes bounded staleness visible (ADR 0004 §6). Never in the portable
-    /// artifact — poll telemetry is a lie the instant the file is written.
+    pub version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub freshness: Option<FreshnessBlock>,
-    /// The execution/freshness actually attached for each `cell` source
-    /// (issue #7) — the gap `declared.upstreams`' author-pinned `version`
-    /// leaves open when a source floats: what got read, not what was
-    /// asked for. Deliberately *not* on `UpstreamRef`/`Declared` (ADR 0012
-    /// §2): that struct is hashed into `interface_digest`, and an
-    /// execution number there would churn agent caches on every refresh
-    /// without the interface moving. Empty for cells with no cell sources,
-    /// or when nothing has been observed yet.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub upstreams: Vec<ObservedUpstream>,
-    /// Swap-time probe results, per route (ADR 0012 §5) — measured against
-    /// the rows the route actually serves (pinned snapshot for supported
-    /// routes), never computed on the request path, omitted on failure.
-    /// These turn the worst agent failure — an empty result read as a
-    /// legitimate zero — into a diagnosable miss.
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    pub exports: IndexMap<String, ExportProbe>,
-    /// Docs page fingerprints (ADR 0013), `{target: {sha256, bytes}}` —
-    /// computed at release time and carried through `published.json`, never
-    /// at config-load time (which would force this non-empty on every
-    /// unbuilt cell that merely declares `docs:`, breaking the "`observed`
-    /// stays null on an unbuilt cell" invariant below). Author bytes never
-    /// sit here — only their fingerprint.
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    pub docs: IndexMap<String, DocsFingerprint>,
-    /// Upstream column descriptions observed by `datamk verify`'s live-bind
-    /// pass (issue #6/#10), source name -> column name -> description.
-    /// Keyed the same way as `cell.yaml`'s `sources:` map. A machine fact —
-    /// never authored, never hand-edited, never fed into `description_digest`
-    /// (unlike `docs:`, which is file-backed and allowlist-validated) —
-    /// because an upstream comment edit must never move datamk's own release
-    /// gate. Only BigQuery populates anything here today (ADR 0010);
-    /// Postgres/Snowflake sources are absent, not present with an empty map.
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    pub source_descriptions: IndexMap<String, IndexMap<String, String>>,
+    pub execution: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_as_of: Option<String>,
 }
 
-/// What was actually attached for one `cell` source (issue #7): the
-/// resolved execution and its snapshot time, never the upstream `table`
-/// (same disclosure boundary as `UpstreamRef` — ADR 0012 §5). `execution`
-/// is `None` for a direct-attach cell source (no execution number exists to
-/// report — ADR 0004 §12) or when nothing has been observed; never
-/// fabricated.
+/// What was actually attached for one `cell` source (issue #7), as read off
+/// a run summary — merged onto the matching `UpstreamDoc` by `assemble`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ObservedUpstream {
     #[serde(rename = "ref")]
@@ -355,9 +407,11 @@ pub struct ObservedUpstream {
     pub data_as_of: Option<String>,
 }
 
-/// What the swap-time probe measured for one export.
-#[derive(Debug, Clone, Default, Serialize)]
+/// What the swap-time probe measured for one export. `at` is when — the
+/// timestamp that makes this a measurement (ADR 0015 §3).
+#[derive(Debug, Clone, Serialize)]
 pub struct ExportProbe {
+    pub at: String,
     /// Total row count behind the route.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<i64>,
@@ -382,6 +436,19 @@ pub struct ExportProbe {
     pub example_request: Option<String>,
 }
 
+impl ExportProbe {
+    /// An empty probe taken at `at` — every measurement still to be filled.
+    pub fn at(at: String) -> Self {
+        ExportProbe {
+            at,
+            rows: None,
+            coverage: IndexMap::new(),
+            values: IndexMap::new(),
+            example_request: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ColumnCoverage {
     pub min: String,
@@ -395,10 +462,11 @@ pub struct ColumnValues {
     pub complete: bool,
 }
 
-/// The provenance fields admitted to the wire (ADR 0012 §5). Everything else
-/// in `RunSummary` — sources, connections, staged rows, transform filenames —
-/// is the private/public seam and never crosses it, which is why this struct
-/// is built field-by-field from the summary rather than embedding it.
+/// The provenance fields admitted to the wire (ADR 0012 §5), as the `build`
+/// block. Everything else in `RunSummary` — sources, connections, staged
+/// rows, transform filenames — is the private/public seam and never crosses
+/// it, which is why this struct is built field-by-field from the summary
+/// rather than embedding it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Provenance {
     pub execution: u64,
@@ -417,14 +485,16 @@ pub struct Provenance {
     pub data_as_of: Option<String>,
 }
 
-/// A live check of a bound export against its declared source (issue #6,
-/// live-verify core) — the fact behind `status: verified_at_source`.
+/// A live check of the bound exports against their declared sources (issue
+/// #6, live-verify core) — the fact behind `status: verified_at_source`.
 /// Deliberately not `Provenance`: there is no execution, no snapshot, no
 /// immutable rows behind this — just a machine check that passed as of
 /// `checked_at`. Built from `crate::manifest::SourceCheckRecord` (the
 /// `.cell/source_check.json` file `datamk verify` writes); the wire shape
 /// mirrors the record's admitted fields exactly, field-by-field the same
-/// discipline `Provenance` uses for `RunSummary`.
+/// discipline `Provenance` uses for `RunSummary`. The per-export
+/// measurements are carried here for `assemble` to place on each export's
+/// `check` — they are not serialized as part of this block.
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceCheck {
     /// `"passed"` by construction — see `SourceCheckRecord`'s doc comment.
@@ -435,15 +505,16 @@ pub struct SourceCheck {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_as_of: Option<String>,
     pub datamk_version: String,
-    /// What each check actually measured, per route — the numbers behind
-    /// `outcome`, so a reader sees what passed and not only that it did.
-    /// Timestamped by `checked_at` above: one pass, one time.
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    /// Route -> measurement; placed on `exports[].check` by `assemble`.
+    #[serde(skip_serializing)]
     pub exports: IndexMap<String, ExportCheck>,
 }
 
+/// What one live check measured for one export. `at` is the check's
+/// `checked_at` — one pass, one time.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportCheck {
+    pub at: String,
     pub check: String,
     pub grain: Vec<String>,
     pub rows: i64,
@@ -465,6 +536,7 @@ impl SourceCheck {
                     (
                         route.clone(),
                         ExportCheck {
+                            at: r.checked_at.clone(),
                             check: m.check.clone(),
                             grain: m.grain.clone(),
                             rows: m.rows,
@@ -502,12 +574,22 @@ pub struct DataBlock {
     pub channels: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct UpstreamRef {
-    #[serde(rename = "ref")]
-    pub reference: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<u64>,
+/// The interface as a whole — every claim, no measurements: what the digest
+/// covers, and what `serve` precomputes once at startup (the interface never
+/// changes for the lifetime of the process). `assemble` lays measurements
+/// onto a clone of this to produce a document.
+#[derive(Debug, Clone)]
+pub struct Interface {
+    pub description: Option<String>,
+    pub from: FromMap,
+    pub discovered_from: Option<crate::config::DiscoveredFrom>,
+    /// Any `probe`/`check` present here is ignored by the digest.
+    pub exports: Vec<ExportDoc>,
+    /// Any `execution`/`data_as_of` present here is ignored by the digest.
+    pub upstreams: Vec<UpstreamDoc>,
+    /// Any `sha256`/`bytes`/`content` present here is ignored by the digest.
+    pub docs: Vec<DocsDoc>,
+    pub include_request: String,
 }
 
 /// The one visibility-filtered route list every consumer reads (ADR 0012 §4):
@@ -557,41 +639,95 @@ pub fn served_here(data_mounted: bool, mounted: &[(String, Export)]) -> bool {
     data_mounted && !mounted.is_empty()
 }
 
-/// The declared region, built from the shared route list. `query` is
-/// unconditional interface grammar (ADR 0012 §2, amended) — present for
-/// every export that isn't bound. A bound export's `query` block is null:
-/// the affordance it would describe (a mounted HTTP route) does not exist
-/// for that export, ever, regardless of any serving flag — a genuine
-/// interface fact (issue #6), not a serving-mode one, which is why it's the
-/// only thing that still gates this field.
-pub fn declared(def: &CellDef, routes: &[(String, Export)]) -> Declared {
+/// The interface, built from the shared route list. `query` is unconditional
+/// interface grammar (ADR 0012 §2, amended) — present for every export that
+/// isn't bound. A bound export's `query` block is null: the affordance it
+/// would describe (a mounted HTTP route) does not exist for that export,
+/// ever, regardless of any serving flag — a genuine interface fact (issue
+/// #6), not a serving-mode one, which is why it's the only thing that still
+/// gates this field.
+///
+/// `source_descriptions` (issue #6/#10, `.cell/source_descriptions.json`:
+/// source name -> column -> the warehouse's own column comment) lands on a
+/// **bound** export's columns that carry no authored description, with
+/// `from.description: "warehouse"` (ADR 0015 §4) — a bound export's columns
+/// *are* its source's columns. A materialized export's columns are the
+/// output of transforms, so no source column is an authority on them and
+/// nothing is merged there. Precedence is `cell.yaml` > `warehouse`: an
+/// author who writes a description means something different from the
+/// upstream's words (`interface import`'s rule, `src/interface.rs`).
+pub fn interface(
+    def: &CellDef,
+    routes: &[(String, Export)],
+    source_descriptions: &IndexMap<String, IndexMap<String, String>>,
+) -> Interface {
     let exports = routes
         .iter()
-        .map(|(route, e)| DeclaredExport {
-            name: e.name.clone(),
-            version: e.version.clone(),
-            route: route.clone(),
-            contract: e.contract,
-            description: e.description.clone(),
-            freshness: e.freshness.clone(),
-            grain: e.grain.clone(),
-            schema: e
+        .map(|(route, e)| {
+            let mut schema: IndexMap<String, ColumnDoc> = e
                 .schema
                 .iter()
                 .map(|(col, spec)| (col.clone(), ColumnDoc::from(spec)))
-                .collect(),
-            query: (!e.is_bound()).then(|| query_block(route, e)),
-            binding: e.bind.as_deref().map(|b| binding_block(def, b)),
+                .collect();
+            if let Some(bind) = e.bind.as_deref() {
+                if let Some(cols) = source_descriptions.get(bind) {
+                    for (col, doc) in schema.iter_mut() {
+                        if doc.description.is_none() {
+                            if let Some(text) = cols.get(col).filter(|t| !t.trim().is_empty()) {
+                                doc.description = Some(text.clone());
+                                doc.from
+                                    .insert("description".to_string(), Origin::Warehouse);
+                            }
+                        }
+                    }
+                }
+            }
+            let origin = |field: &str| e.from.get(field).copied().unwrap_or(Origin::CellYaml);
+            let mut from = FromMap::new();
+            if e.description.is_some() {
+                from.insert("description".to_string(), origin("description"));
+            }
+            if !e.grain.is_empty() {
+                from.insert("grain".to_string(), origin("grain"));
+            }
+            ExportDoc {
+                name: e.name.clone(),
+                version: e.version.clone(),
+                route: route.clone(),
+                contract: e.contract,
+                description: e.description.clone(),
+                freshness: e.freshness.clone(),
+                grain: e.grain.clone(),
+                from,
+                schema,
+                query: (!e.is_bound()).then(|| query_block(route, e)),
+                binding: e.bind.as_deref().map(|b| binding_block(def, b)),
+                depends_on: e
+                    .discovered
+                    .as_ref()
+                    .map(|d| d.depends_on.clone())
+                    .unwrap_or_default(),
+                depends_on_unselected: e
+                    .discovered
+                    .as_ref()
+                    .map(|d| d.depends_on_unselected)
+                    .unwrap_or(0),
+                deployed: e.discovered.as_ref().map(DeployedBlock::from),
+                probe: None,
+                check: None,
+            }
         })
         .collect();
 
-    let mut upstreams: Vec<UpstreamRef> = def
+    let mut upstreams: Vec<UpstreamDoc> = def
         .sources
         .values()
         .filter_map(|s| match s {
-            Source::Cell { cell, version, .. } => Some(UpstreamRef {
+            Source::Cell { cell, version, .. } => Some(UpstreamDoc {
                 reference: cell.clone(),
                 version: *version,
+                execution: None,
+                data_as_of: None,
             }),
             _ => None,
         })
@@ -599,8 +735,15 @@ pub fn declared(def: &CellDef, routes: &[(String, Export)]) -> Declared {
     upstreams.sort_by(|a, b| (&a.reference, a.version).cmp(&(&b.reference, b.version)));
     upstreams.dedup_by(|a, b| a.reference == b.reference && a.version == b.version);
 
-    Declared {
+    let mut from = FromMap::new();
+    if def.description.is_some() {
+        from.insert("description".to_string(), Origin::CellYaml);
+    }
+
+    Interface {
         description: def.description.clone(),
+        from,
+        discovered_from: def.discovered_from.clone(),
         exports,
         upstreams,
         docs: docs_entries(def, routes),
@@ -632,22 +775,22 @@ fn binding_block(def: &CellDef, bind: &str) -> BindingBlock {
 /// access, since identity needs only the declared path and its extension. A
 /// private export's docs entry never appears here, matching the same
 /// visibility filter `routes` was already built with (ADR 0012 §4).
-fn docs_entries(def: &CellDef, routes: &[(String, Export)]) -> Vec<DeclaredDocsEntry> {
+fn docs_entries(def: &CellDef, routes: &[(String, Export)]) -> Vec<DocsDoc> {
+    let entry = |target: String, path: &str| DocsDoc {
+        target,
+        source_path: path.to_string(),
+        media_type: crate::config::docs::guess_media_type(path).to_string(),
+        sha256: None,
+        bytes: None,
+        content: None,
+    };
     let mut entries = Vec::new();
     if let Some(path) = &def.docs {
-        entries.push(DeclaredDocsEntry {
-            target: "cell".to_string(),
-            source_path: path.clone(),
-            media_type: crate::config::docs::guess_media_type(path).to_string(),
-        });
+        entries.push(entry("cell".to_string(), path));
     }
     for (route, e) in routes {
         if let Some(path) = &e.docs {
-            entries.push(DeclaredDocsEntry {
-                target: route.clone(),
-                source_path: path.clone(),
-                media_type: crate::config::docs::guess_media_type(path).to_string(),
-            });
+            entries.push(entry(route.clone(), path));
         }
     }
     entries
@@ -747,26 +890,16 @@ pub const NOTE_VIRTUAL_CELL: &str =
      contract against the bound source(s), which raises this document to \
      `verified_at_source`.";
 
-/// Every fact `assemble` needs, gathered up front. A named-field struct
-/// instead of `assemble`'s former 11 positional parameters (three bare
-/// `bool`s among them) — the exact shape that let the original `served_here`
-/// bug ship as `/* served_here */ s.data_mounted` at a call site: a comment
-/// doing the job a type should. Both doors (`build`, below, and `serve`'s
-/// `context_doc` handler) construct this with named fields; there is no
-/// positional call to `assemble` left anywhere.
 #[derive(Debug)]
 pub struct Facts {
     pub cell: String,
-    pub declared: Declared,
+    pub interface: Interface,
     pub provenance: Option<Provenance>,
     pub source_check: Option<SourceCheck>,
     pub freshness: Option<FreshnessBlock>,
     pub upstreams: Vec<ObservedUpstream>,
     pub probes: IndexMap<String, ExportProbe>,
     pub docs_fingerprints: IndexMap<String, DocsFingerprint>,
-    /// Issue #6/#10: `.cell/source_descriptions.json`'s `sources` map, when
-    /// fresh — see `Observed::source_descriptions`.
-    pub source_descriptions: IndexMap<String, IndexMap<String, String>>,
     pub served_here: bool,
     pub channels: Vec<String>,
     pub direct_attach: bool,
@@ -783,24 +916,30 @@ pub struct Facts {
 }
 
 /// Assemble a document from prebuilt facts (how the serve handler works —
-/// its declared region and digest are precomputed at startup). Status is a
+/// its interface and digest are precomputed at startup). Status is a
 /// ladder, weakest to strongest (issue #6 Q3): `provenance` present ⇒
-/// `verified` (its wire meaning — ADR 0012 §5) — unchanged, and checked
-/// first, so a mixed cell's published execution (which already verified its
-/// never-backed exports live at build time, see `engine::run`) reads as the
-/// strongest claim it earns; else `source_check` present ⇒
-/// `verified_at_source`; else `draft`, with the matching engine note.
+/// `verified` (its wire meaning — ADR 0012 §5) — checked first, so a mixed
+/// cell's published execution (which already verified its bound exports live
+/// at build time, see `engine::run`) reads as the strongest claim it earns;
+/// else `source_check` present ⇒ `verified_at_source`; else `draft`, with
+/// the matching engine note.
+///
+/// Measurements are laid onto the records they measure (ADR 0015 §1):
+/// `probes` and `source_check.exports` onto `exports[].probe`/`.check` by
+/// route; `upstreams` onto `upstreams[]` by ref; `docs_fingerprints` onto
+/// `docs[]` by target. A measurement for a route/ref/target the interface
+/// doesn't carry is dropped — the interface is visibility-filtered, and a
+/// private export's measurement never reaches the wire (ADR 0012 §4).
 pub fn assemble(facts: Facts) -> ContextDocument {
     let Facts {
         cell,
-        declared,
+        interface,
         provenance,
-        source_check,
+        mut source_check,
         freshness,
-        upstreams,
-        probes,
-        docs_fingerprints,
-        source_descriptions,
+        upstreams: observed_upstreams,
+        mut probes,
+        mut docs_fingerprints,
         served_here,
         channels,
         direct_attach,
@@ -819,12 +958,10 @@ pub fn assemble(facts: Facts) -> ContextDocument {
     // for a check that never ran on it. Narrowed to also require every
     // discoverable export to declare a grain; only ever moves `true` to
     // `false` relative to the old formula, and only where the old value was
-    // lying. Computed from `declared.exports` (not a separate parameter) so
-    // it can't drift from what `declared` itself says — and it never touches
-    // `interface_digest`, which hashes `declared` wholesale regardless of
-    // this field's value.
+    // lying. Computed from the interface's exports so it can't drift from
+    // what they say — and it never touches `interface_digest`.
     let grain_verified =
-        status != Status::Draft && declared.exports.iter().all(|e| !e.grain.is_empty());
+        status != Status::Draft && interface.exports.iter().all(|e| !e.grain.is_empty());
     let mut notes = Vec::new();
     if status == Status::Draft {
         notes.push(
@@ -847,44 +984,112 @@ pub fn assemble(facts: Facts) -> ContextDocument {
             .to_string(),
         );
     }
+
+    let mut checks = source_check
+        .as_mut()
+        .map(|c| std::mem::take(&mut c.exports))
+        .unwrap_or_default();
+    let exports = interface
+        .exports
+        .into_iter()
+        .map(|mut e| {
+            e.probe = probes.shift_remove(&e.route);
+            e.check = checks.shift_remove(&e.route);
+            e
+        })
+        .collect();
+
+    let upstreams = interface
+        .upstreams
+        .into_iter()
+        .map(|mut u| {
+            if let Some(o) = observed_upstreams
+                .iter()
+                .find(|o| o.reference == u.reference)
+            {
+                u.execution = o.execution;
+                u.data_as_of = o.data_as_of.clone();
+            }
+            u
+        })
+        .collect();
+
+    let docs = interface
+        .docs
+        .into_iter()
+        .map(|mut d| {
+            if let Some(f) = docs_fingerprints.shift_remove(&d.target) {
+                d.sha256 = Some(f.sha256);
+                d.bytes = Some(f.bytes);
+            }
+            d
+        })
+        .collect();
+
     ContextDocument {
         datamk_context: DATAMK_CONTEXT_VERSION,
         cell,
         status,
         grain_verified,
-        declared,
-        observed: if provenance.is_some()
-            || source_check.is_some()
-            || freshness.is_some()
-            || !upstreams.is_empty()
-            || !probes.is_empty()
-            || !docs_fingerprints.is_empty()
-            || !source_descriptions.is_empty()
-        {
-            Some(Observed {
-                provenance,
-                source_check,
-                freshness,
-                upstreams,
-                exports: probes,
-                docs: docs_fingerprints,
-                source_descriptions,
-            })
-        } else {
-            None
-        },
+        description: interface.description,
+        from: interface.from,
+        discovered_from: interface.discovered_from,
+        exports,
+        upstreams,
+        docs,
+        include_request: interface.include_request,
+        build: provenance,
+        source_check,
+        freshness,
         data: DataBlock {
             served_here,
             channels,
         },
         notes,
         // Request-specific (`?include=docs`) / flag-specific (`--no-docs`):
-        // set by the caller after `assemble`/`build` returns, the same
-        // post-build mutation pattern `emit` already uses for `emitted_at`.
+        // set by the caller after `assemble`/`build` returns via
+        // `inline_docs`, the same post-build mutation pattern `emit` already
+        // uses for `emitted_at`.
         included: Vec::new(),
-        docs: None,
         emitted_at: None,
         cell_yaml_digest: None,
+    }
+}
+
+impl ContextDocument {
+    /// The interface this document carries — the same records, measurements
+    /// and all; `interface_digest`'s projection ignores those by
+    /// construction, so digesting this equals digesting the interface the
+    /// document was assembled from. Lets a consumer holding only a document
+    /// recompute its digest.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn to_interface(&self) -> Interface {
+        Interface {
+            description: self.description.clone(),
+            from: self.from.clone(),
+            discovered_from: self.discovered_from.clone(),
+            exports: self.exports.clone(),
+            upstreams: self.upstreams.clone(),
+            docs: self.docs.clone(),
+            include_request: self.include_request.clone(),
+        }
+    }
+
+    /// Inline docs content (ADR 0013): marks `included: ["docs"]` and sets
+    /// `content` on each `docs[]` entry whose `target` a loaded page names.
+    /// `included` is set even when there are no pages — a truthful
+    /// (possibly empty) answer, distinct from "server predates this field".
+    pub fn inline_docs<'a>(
+        &mut self,
+        pages: impl IntoIterator<Item = &'a crate::config::docs::DocsPage>,
+    ) {
+        self.included = vec!["docs".to_string()];
+        for p in pages {
+            if let Some(d) = self.docs.iter_mut().find(|d| d.target == p.target) {
+                d.media_type = p.media_type.clone();
+                d.content = Some(p.content.to_string());
+            }
+        }
     }
 }
 
@@ -914,14 +1119,13 @@ pub fn build(
 ) -> ContextDocument {
     assemble(Facts {
         cell: def.cell.clone(),
-        declared: declared(def, routes),
+        interface: interface(def, routes, &source_descriptions),
         provenance,
         source_check,
         freshness,
         upstreams,
         probes: IndexMap::new(),
         docs_fingerprints,
-        source_descriptions,
         served_here,
         channels: Vec::new(),
         direct_attach,
@@ -989,26 +1193,116 @@ pub fn observed_upstreams_from(
 }
 
 /// The interface digest: the document's `ETag` and `/openapi.json`'s
-/// `info.version` (ADR 0012 §2). Covers the interface regions — shape,
-/// `declared` (including the query grammar), `data` — and never `observed`
-/// telemetry or notes: the digest must change when the *interface* changes,
-/// not when data refreshes under it (an execution number would churn agent
-/// caches on every refresh without the interface moving).
-pub fn interface_digest(cell: &str, declared: &Declared, data: &DataBlock) -> String {
+/// `info.version` (ADR 0012 §2, ADR 0015 §5). Hashes an **explicit
+/// projection** of the interface — never the document, never a region:
+/// shape, `cell`, `description`, each export's interface fields (name,
+/// version, route, contract, description, freshness, grain, schema
+/// `{type, unit, description}`, query grammar, binding), each upstream's
+/// `{ref, version}`, each docs page's identity, and `data`. Nothing else: not
+/// `from` (a description whose text is unchanged but whose origin changed is
+/// not an interface change), not any timestamped block (`build`, probes,
+/// checks, freshness, upstream executions, docs fingerprints), not notes, not
+/// docs content. The digest must change when the *interface* changes, not
+/// when data refreshes under it.
+pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> String {
     #[derive(Serialize)]
-    struct InterfaceRegions<'a> {
+    struct Projection<'a> {
         datamk_context: u32,
         cell: &'a str,
-        declared: &'a Declared,
+        description: &'a Option<String>,
+        exports: Vec<ExportProjection<'a>>,
+        upstreams: Vec<UpstreamProjection<'a>>,
+        docs: Vec<DocsProjection<'a>>,
+        include_request: &'a str,
         data: &'a DataBlock,
     }
-    let bytes = serde_json::to_vec(&InterfaceRegions {
+    #[derive(Serialize)]
+    struct ExportProjection<'a> {
+        name: &'a str,
+        version: &'a str,
+        route: &'a str,
+        contract: Contract,
+        description: &'a Option<String>,
+        freshness: &'a Option<String>,
+        grain: &'a [String],
+        schema: IndexMap<&'a str, ColumnProjection<'a>>,
+        query: &'a Option<QueryBlock>,
+        binding: &'a Option<BindingBlock>,
+        depends_on: &'a [String],
+    }
+    #[derive(Serialize)]
+    struct ColumnProjection<'a> {
+        #[serde(rename = "type")]
+        ty: &'a str,
+        unit: &'a Option<String>,
+        description: &'a Option<String>,
+    }
+    #[derive(Serialize)]
+    struct UpstreamProjection<'a> {
+        reference: &'a str,
+        version: Option<u64>,
+    }
+    #[derive(Serialize)]
+    struct DocsProjection<'a> {
+        target: &'a str,
+        source_path: &'a str,
+        media_type: &'a str,
+    }
+    let projection = Projection {
         datamk_context: DATAMK_CONTEXT_VERSION,
         cell,
-        declared,
+        description: &interface.description,
+        exports: interface
+            .exports
+            .iter()
+            .map(|e| ExportProjection {
+                name: &e.name,
+                version: &e.version,
+                route: &e.route,
+                contract: e.contract,
+                description: &e.description,
+                freshness: &e.freshness,
+                grain: &e.grain,
+                schema: e
+                    .schema
+                    .iter()
+                    .map(|(col, c)| {
+                        (
+                            col.as_str(),
+                            ColumnProjection {
+                                ty: &c.ty,
+                                unit: &c.unit,
+                                description: &c.description,
+                            },
+                        )
+                    })
+                    .collect(),
+                query: &e.query,
+                binding: &e.binding,
+                depends_on: &e.depends_on,
+            })
+            .collect(),
+        upstreams: interface
+            .upstreams
+            .iter()
+            .map(|u| UpstreamProjection {
+                reference: &u.reference,
+                version: u.version,
+            })
+            .collect(),
+        docs: interface
+            .docs
+            .iter()
+            .map(|d| DocsProjection {
+                target: &d.target,
+                source_path: &d.source_path,
+                media_type: &d.media_type,
+            })
+            .collect(),
+        include_request: &interface.include_request,
         data,
-    })
-    .expect("context document serializes");
+    };
+    let bytes = serde_json::to_vec(&projection).expect("context projection serializes");
     hex(&Sha256::digest(&bytes))
 }
 
@@ -1142,26 +1436,20 @@ pub fn build_document(
         is_all_never,
     );
     doc.data.channels = loaded.bindings.channels.clone();
+    // ADR 0016 §5: a discovered cell with no fresh record has no interface
+    // to describe — say so, rather than emit an empty export list that reads
+    // as "this cell has no exports".
+    if let Some(crate::config::Discovery::Stale(why)) = &loaded.discovery {
+        doc.notes.push(format!(
+            "This cell discovers its interface, but {why}. No exports are listed until it is."
+        ));
+    }
 
     // ADR 0013 §7: inline by default — a portable artifact with null content
     // pointing at a path the reader doesn't have is a dangling pointer.
     if !no_docs {
         let pages = crate::config::docs::load_declared(&loaded.dir, &loaded.def, &routes)?;
-        doc.included = vec!["docs".to_string()];
-        doc.docs = Some(
-            pages
-                .into_iter()
-                .map(|p| {
-                    (
-                        p.target,
-                        DocsContentEntry {
-                            media_type: p.media_type,
-                            content: p.content.to_string(),
-                        },
-                    )
-                })
-                .collect(),
-        );
+        doc.inline_docs(&pages);
     }
 
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
@@ -1271,83 +1559,7 @@ interface:
     #[test]
     fn context_document_serializes_to_the_documented_shape() {
         let json = serde_json::to_string_pretty(&sample_verified()).unwrap();
-        let expected = r#"{
-  "datamk_context": 3,
-  "cell": "orders",
-  "status": "verified",
-  "grain_verified": true,
-  "declared": {
-    "description": "Daily order revenue by region.",
-    "exports": [
-      {
-        "name": "orders_daily",
-        "version": "2.1.0",
-        "route": "orders_daily@2",
-        "contract": "supported",
-        "description": "One row per (order_date, region) with the summed order revenue.",
-        "freshness": "daily",
-        "grain": [
-          "order_date",
-          "region"
-        ],
-        "schema": {
-          "order_date": {
-            "type": "date"
-          },
-          "region": {
-            "type": "string"
-          },
-          "revenue": {
-            "type": "decimal",
-            "unit": "USD",
-            "description": "Gross order revenue, before refunds."
-          }
-        },
-        "query": {
-          "filters": [
-            "order_date",
-            "region"
-          ],
-          "filter_semantics": "exact equality only — no ranges, no operators, no non-grain columns",
-          "limit_default": 100,
-          "limit_max": 1000,
-          "offset_max": 1000000,
-          "sample_request": "orders_daily@2?limit=10"
-        }
-      }
-    ],
-    "upstreams": [
-      {
-        "ref": "flights",
-        "version": 7
-      }
-    ],
-    "docs": [],
-    "include_request": "context?include=docs"
-  },
-  "observed": {
-    "provenance": {
-      "execution": 47,
-      "snapshot_id": 12,
-      "verify_outcome": "passed",
-      "started_at": "2026-07-13T10:00:00Z",
-      "finished_at": "2026-07-13T10:00:05Z",
-      "datamk_version": "0.0.12",
-      "data_as_of": "2026-07-13 10:00:04+00"
-    },
-    "freshness": {
-      "serving_execution": 47,
-      "latest_seen": 47,
-      "last_successful_poll_age_seconds": 3
-    }
-  },
-  "data": {
-    "served_here": true,
-    "channels": []
-  },
-  "notes": [],
-  "included": []
-}"#;
+        let expected = include_str!("../test/fixtures/context_v4_golden.json").trim_end();
         assert_eq!(json, expected);
     }
 
@@ -1374,14 +1586,23 @@ interface:
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "draft");
         assert_eq!(v["grain_verified"], false);
-        assert!(v["observed"].is_null(), "observed must be null, got {v}");
+        assert!(v.get("build").is_none(), "build must be absent, got {v}");
+        assert!(
+            v.get("source_check").is_none(),
+            "source_check must be absent, got {v}"
+        );
+        assert!(
+            v["exports"][0].get("probe").is_none(),
+            "no probe on an unbuilt cell: {v}"
+        );
         assert_eq!(v["notes"][0], NOTE_NOTHING_BUILT);
         // ADR 0013: `included` is always present, `[]` when nothing was
         // requested/inlined — never absent, the old-binary/no-docs signal.
         assert_eq!(v["included"], serde_json::json!([]));
-        assert!(
-            v["docs"].is_null(),
-            "docs must be absent when not requested"
+        assert_eq!(
+            v["docs"],
+            serde_json::json!([]),
+            "docs identity is always present"
         );
     }
 
@@ -1551,11 +1772,22 @@ interface:
         );
     }
 
-    /// The digest covers the interface regions and never observed telemetry
-    /// (ADR 0012 §2): a data refresh must not churn agent caches; an
+    /// The digest covers the interface projection and never a measurement
+    /// (ADR 0015 §5): a data refresh must not churn agent caches; an
     /// interface change must.
     fn digest_of(doc: &ContextDocument) -> String {
-        interface_digest(&doc.cell, &doc.declared, &doc.data)
+        interface_digest(&doc.cell, &doc.to_interface(), &doc.data)
+    }
+
+    fn page(target: &str, content: &str) -> crate::config::docs::DocsPage {
+        crate::config::docs::DocsPage {
+            target: target.to_string(),
+            path: "docs/x.md".to_string(),
+            media_type: "text/markdown; charset=utf-8".to_string(),
+            content: std::sync::Arc::from(content),
+            sha256: "abc".to_string(),
+            bytes: content.len(),
+        }
     }
 
     #[test]
@@ -1659,14 +1891,7 @@ interface:
         // Injecting top-level content (as `?include=docs` would) must not
         // move the digest — content lives outside `declared`.
         let mut with_content = base.clone();
-        with_content.included = vec!["docs".to_string()];
-        with_content.docs = Some(IndexMap::from([(
-            "cell".to_string(),
-            DocsContentEntry {
-                media_type: "text/markdown; charset=utf-8".to_string(),
-                content: "Some prose an agent will read.".to_string(),
-            },
-        )]));
+        with_content.inline_docs(&[page("cell", "Some prose an agent will read.")]);
         assert_eq!(
             digest_of(&base),
             digest_of(&with_content),
@@ -1772,11 +1997,11 @@ interface:
         doc.cell_yaml_digest = Some("abc123".to_string());
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["data"]["served_here"], false);
-        assert!(v["declared"]["exports"][0]["query"].is_object());
+        assert!(v["exports"][0]["query"].is_object());
         assert_eq!(v["emitted_at"], "2026-08-06T00:00:00Z");
         assert_eq!(v["cell_yaml_digest"], "abc123");
         // Poll telemetry never rides the portable artifact.
-        assert!(v["observed"].is_null());
+        assert!(v.get("freshness").is_none());
     }
 
     #[test]
@@ -1976,14 +2201,7 @@ interface:
             false,
         );
         // Inline docs content too, as `?include=docs` would.
-        loaded.included = vec!["docs".to_string()];
-        loaded.docs = Some(IndexMap::from([(
-            "cell".to_string(),
-            DocsContentEntry {
-                media_type: "text/markdown; charset=utf-8".to_string(),
-                content: "Some prose an agent will read.".to_string(),
-            },
-        )]));
+        loaded.inline_docs(&[page("cell", "Some prose an agent will read.")]);
 
         assert_eq!(
             digest_of(&draft),
@@ -1993,10 +2211,10 @@ interface:
         );
     }
 
-    /// `observed` is present (not `null`) when `upstreams` is the only
-    /// populated piece — mirrors the existing rule for `freshness`/`probes`.
+    /// An observed attachment lands on the declared upstream edge it
+    /// belongs to (ADR 0015 §1) — one record, pin and measurement together.
     #[test]
-    fn observed_is_present_when_only_upstreams_is_populated() {
+    fn observed_execution_lands_on_the_declared_upstream_edge() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
         let doc = build(
@@ -2018,20 +2236,43 @@ interface:
         );
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "draft", "no provenance ⇒ still draft");
-        assert_eq!(v["observed"]["upstreams"][0]["ref"], "flights");
-        assert_eq!(v["observed"]["upstreams"][0]["execution"], 41);
+        assert_eq!(v["upstreams"][0]["ref"], "flights");
+        assert_eq!(v["upstreams"][0]["version"], 7);
+        assert_eq!(v["upstreams"][0]["execution"], 41);
+        assert!(
+            v["upstreams"][0].get("data_as_of").is_none(),
+            "never fabricated: {v}"
+        );
     }
 
-    /// A cell with no `cell` sources must serialize byte-identically to
-    /// before this field existed — `upstreams` skipped, not `[]`.
+    /// `upstreams` is always present — `[]` when the cell declares no `cell`
+    /// sources — and an unobserved edge carries the pin alone.
     #[test]
-    fn upstreams_field_is_omitted_not_empty_array_when_there_are_no_cell_sources() {
-        let json = serde_json::to_string(&sample_verified()).unwrap();
-        // sample_verified() calls `build` with `Vec::new()` for upstreams.
-        assert!(
-            !json.contains(r#""upstreams":[]"#),
-            "observed.upstreams must be skipped when empty, not emitted as []: {json}"
+    fn upstreams_is_present_and_carries_only_the_pin_when_unobserved() {
+        let v = serde_json::to_value(sample_verified()).unwrap();
+        assert_eq!(
+            v["upstreams"],
+            serde_json::json!([{"ref": "flights", "version": 7}])
         );
+
+        let mut def = sample_def();
+        def.sources.shift_remove("upstream_flights");
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+        );
+        let v = serde_json::to_value(doc).unwrap();
+        assert_eq!(v["upstreams"], serde_json::json!([]));
     }
 
     // --- ADR 0013: long-form docs pages -------------------------------
@@ -2046,7 +2287,7 @@ interface:
         def.interface[0].docs = Some("docs/orders_daily.md".to_string());
         def.interface[1].docs = Some("docs/internal.md".to_string()); // private export
         let routes = discoverable_routes(&def).unwrap();
-        let d = declared(&def, &routes);
+        let d = interface(&def, &routes, &IndexMap::new());
 
         assert_eq!(d.include_request, "context?include=docs");
         assert_eq!(d.docs.len(), 2, "{:?}", d.docs);
@@ -2057,18 +2298,16 @@ interface:
         assert_eq!(d.docs[1].source_path, "docs/orders_daily.md");
 
         // Private export's docs page never appears, in any form.
-        let json = serde_json::to_string(&d).unwrap();
-        assert!(!json.contains("internal.md"), "{json}");
+        assert!(d.docs.iter().all(|p| p.source_path != "docs/internal.md"));
     }
 
     #[test]
     fn declared_docs_is_empty_but_present_when_nothing_is_declared() {
         let def = sample_def();
         let routes = discoverable_routes(&def).unwrap();
-        let d = declared(&def, &routes);
-        let v = serde_json::to_value(&d).unwrap();
-        assert_eq!(v["docs"], serde_json::json!([]));
-        assert_eq!(v["include_request"], "context?include=docs");
+        let d = interface(&def, &routes, &IndexMap::new());
+        assert!(d.docs.is_empty());
+        assert_eq!(d.include_request, "context?include=docs");
     }
 
     /// ADR 0013 §7: `datamk context` inlines docs by default — a request can
@@ -2117,8 +2356,9 @@ interface:
         let default_doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&default_out).unwrap()).unwrap();
         assert_eq!(default_doc["included"], serde_json::json!(["docs"]));
+        assert_eq!(default_doc["docs"][0]["target"], "cell");
         assert!(
-            default_doc["docs"]["cell"]["content"]
+            default_doc["docs"][0]["content"]
                 .as_str()
                 .unwrap()
                 .contains("What this cell is for"),
@@ -2130,13 +2370,13 @@ interface:
         let no_docs_doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&no_docs_out).unwrap()).unwrap();
         assert_eq!(no_docs_doc["included"], serde_json::json!([]));
-        assert!(no_docs_doc["docs"].is_null(), "{no_docs_doc}");
+        assert!(
+            no_docs_doc["docs"][0].get("content").is_none(),
+            "{no_docs_doc}"
+        );
         // Identity still ships either way — `--no-docs` withholds content,
         // not the fact that a page exists.
-        assert_eq!(
-            no_docs_doc["declared"]["docs"][0]["source_path"],
-            "docs/overview.md"
-        );
+        assert_eq!(no_docs_doc["docs"][0]["source_path"], "docs/overview.md");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2198,22 +2438,28 @@ interface:
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(v["status"], "verified_at_source");
         assert_eq!(v["grain_verified"], true);
-        assert_eq!(v["observed"]["provenance"], serde_json::Value::Null);
-        assert_eq!(v["observed"]["source_check"]["outcome"], "passed");
         assert!(
-            v["observed"]["source_check"]["checked_at"].is_string(),
+            v.get("build").is_none(),
+            "no execution ⇒ no build block: {v}"
+        );
+        assert_eq!(v["source_check"]["outcome"], "passed");
+        assert!(
+            v["source_check"]["checked_at"].is_string(),
             "checked_at must be a real timestamp: {v}"
         );
         assert!(
-            v["observed"]["source_check"]["datamk_version"].is_string(),
+            v["source_check"]["datamk_version"].is_string(),
             "datamk_version must be present: {v}"
         );
         // ADR 0012 §2: never fabricated, never defaulted to checked_at — no
         // connector in this slice supplies one, so it must be absent.
         assert!(
-            v["observed"]["source_check"].get("data_as_of").is_none(),
+            v["source_check"].get("data_as_of").is_none(),
             "data_as_of must be omitted, not fabricated: {v}"
         );
+        // The per-export measurement rides the export (ADR 0015 §1), not
+        // the cell-level block.
+        assert!(v["source_check"].get("exports").is_none(), "{v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2247,7 +2493,7 @@ interface:
         )
         .unwrap();
         let routes = discoverable_routes(&def).unwrap();
-        let d = declared(&def, &routes);
+        let d = interface(&def, &routes, &IndexMap::new());
         let by_name = |n: &str| d.exports.iter().find(|e| e.name == n).unwrap();
 
         let bound = by_name("qfai_customer");
@@ -2284,7 +2530,12 @@ interface:
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
 
-        let m = &v["observed"]["source_check"]["exports"]["virtual_pii@1"];
+        assert_eq!(v["exports"][0]["route"], "virtual_pii@1");
+        let m = &v["exports"][0]["check"];
+        assert_eq!(
+            m["at"], v["source_check"]["checked_at"],
+            "one pass, one time"
+        );
         assert_eq!(m["check"], "grain_unique");
         assert_eq!(m["grain"], serde_json::json!(["id"]));
         // data.csv holds two rows with distinct ids.
@@ -2321,10 +2572,222 @@ interface:
             "a stale source-check record must not promote status: {v}"
         );
         assert!(
-            v["observed"].is_null(),
+            v.get("source_check").is_none() && v["exports"][0].get("check").is_none(),
             "a stale source-check record must be omitted entirely, not emitted stale: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- ADR 0015: per-field provenance --------------------------------
+
+    fn bound_def() -> CellDef {
+        serde_yaml::from_str(
+            r#"
+cell: qfai
+sources:
+  gold_customer:
+    connection: dw-main
+    table: gold.fct_qfai_customer
+interface:
+  - name: qfai_customer
+    version: 1.0.0
+    description: One row per customer.
+    grain: [customer_id]
+    bind: gold_customer
+    schema:
+      customer_id: bigint
+      revenue:
+        type: decimal
+        unit: USD
+        description: Authored, and therefore wins.
+      churned: boolean
+  - name: derived
+    version: 1.0.0
+    grain: [customer_id]
+    schema:
+      customer_id: bigint
+      churned: boolean
+"#,
+        )
+        .unwrap()
+    }
+
+    fn warehouse_descriptions() -> IndexMap<String, IndexMap<String, String>> {
+        let mut cols = IndexMap::new();
+        cols.insert("customer_id".to_string(), "The customer key.".to_string());
+        cols.insert("revenue".to_string(), "Warehouse says gross.".to_string());
+        cols.insert("churned".to_string(), "TRUE once cancelled.".to_string());
+        let mut m = IndexMap::new();
+        m.insert("gold_customer".to_string(), cols);
+        m
+    }
+
+    /// Every authored claim names `cell.yaml` as its origin, on the record
+    /// that carries it (ADR 0015 §2) — and only for fields that are present.
+    #[test]
+    fn authored_claims_carry_cell_yaml_provenance_per_field() {
+        let v = serde_json::to_value(sample_verified()).unwrap();
+        assert_eq!(v["from"], serde_json::json!({"description": "cell.yaml"}));
+        let e = &v["exports"][0];
+        assert_eq!(
+            e["from"],
+            serde_json::json!({"description": "cell.yaml", "grain": "cell.yaml"})
+        );
+        assert_eq!(
+            e["schema"]["order_date"]["from"],
+            serde_json::json!({"type": "cell.yaml"})
+        );
+        assert_eq!(
+            e["schema"]["revenue"]["from"],
+            serde_json::json!({"type": "cell.yaml", "unit": "cell.yaml", "description": "cell.yaml"})
+        );
+    }
+
+    /// Warehouse column comments land on a bound export's columns with
+    /// `from.description: "warehouse"`, lose to an authored description, and
+    /// never touch a materialized export (ADR 0015 §4).
+    #[test]
+    fn warehouse_descriptions_land_on_bound_columns_only_and_lose_to_authored_ones() {
+        let def = bound_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let i = interface(&def, &routes, &warehouse_descriptions());
+        let bound = i
+            .exports
+            .iter()
+            .find(|e| e.name == "qfai_customer")
+            .unwrap();
+        let id = &bound.schema["customer_id"];
+        assert_eq!(id.description.as_deref(), Some("The customer key."));
+        assert_eq!(id.from["description"], Origin::Warehouse);
+        assert_eq!(id.from["type"], Origin::CellYaml);
+        let revenue = &bound.schema["revenue"];
+        assert_eq!(
+            revenue.description.as_deref(),
+            Some("Authored, and therefore wins.")
+        );
+        assert_eq!(revenue.from["description"], Origin::CellYaml);
+
+        let derived = i.exports.iter().find(|e| e.name == "derived").unwrap();
+        assert!(derived.schema["churned"].description.is_none());
+        assert!(!derived.schema["churned"].from.contains_key("description"));
+    }
+
+    /// A warehouse comment edit on a bound column IS an interface change to
+    /// the agent reading it, so it moves the digest (ADR 0015 §5) — while a
+    /// change of origin with identical text does not (`from` is excluded).
+    #[test]
+    fn digest_tracks_description_text_but_not_its_origin() {
+        let def = bound_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let data = DataBlock {
+            served_here: false,
+            channels: Vec::new(),
+        };
+        let bare = interface(&def, &routes, &IndexMap::new());
+        let with_wh = interface(&def, &routes, &warehouse_descriptions());
+        assert_ne!(
+            interface_digest("qfai", &bare, &data),
+            interface_digest("qfai", &with_wh, &data),
+            "a warehouse description an agent reads is part of the interface"
+        );
+
+        let mut edited = warehouse_descriptions();
+        edited["gold_customer"].insert("customer_id".to_string(), "Renamed meaning.".to_string());
+        let with_edit = interface(&def, &routes, &edited);
+        assert_ne!(
+            interface_digest("qfai", &with_wh, &data),
+            interface_digest("qfai", &with_edit, &data)
+        );
+
+        // Same text, different origin: write the warehouse's words into
+        // cell.yaml — the digest must not move.
+        let mut def2 = def.clone();
+        let bound_schema = &mut def2.interface[0].schema;
+        bound_schema.get_mut("customer_id").unwrap().description =
+            Some("The customer key.".to_string());
+        bound_schema.get_mut("churned").unwrap().description =
+            Some("TRUE once cancelled.".to_string());
+        let routes2 = discoverable_routes(&def2).unwrap();
+        let authored = interface(&def2, &routes2, &IndexMap::new());
+        let authored_bound = authored
+            .exports
+            .iter()
+            .find(|e| e.name == "qfai_customer")
+            .unwrap();
+        assert_eq!(
+            authored_bound.schema["customer_id"].from["description"],
+            Origin::CellYaml
+        );
+        assert_eq!(
+            interface_digest("qfai", &with_wh, &data),
+            interface_digest("qfai", &authored, &data),
+            "origin alone must not move the digest"
+        );
+    }
+
+    /// The v4 shape rule (ADR 0015 §3): every top-level measured block
+    /// carries a timestamp; every export-level one too.
+    #[test]
+    fn measurements_carry_timestamps_and_land_on_their_records() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+        let mut probes = IndexMap::new();
+        let mut probe = ExportProbe::at("2026-08-07T10:00:00Z".to_string());
+        probe.rows = Some(4);
+        probes.insert("orders_daily@2".to_string(), probe);
+        let mut checks = IndexMap::new();
+        checks.insert(
+            "orders_daily@2".to_string(),
+            ExportCheck {
+                at: "2026-08-07T09:00:00Z".to_string(),
+                check: "grain_unique".to_string(),
+                grain: vec!["order_date".to_string(), "region".to_string()],
+                rows: 4,
+                distinct_grain: 4,
+            },
+        );
+        let doc = assemble(Facts {
+            cell: def.cell.clone(),
+            interface: interface(&def, &routes, &IndexMap::new()),
+            provenance: None,
+            source_check: Some(SourceCheck {
+                outcome: "passed".to_string(),
+                checked_at: "2026-08-07T09:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: "0.0.13".to_string(),
+                exports: checks,
+            }),
+            freshness: None,
+            upstreams: Vec::new(),
+            probes,
+            docs_fingerprints: IndexMap::new(),
+            served_here: true,
+            channels: Vec::new(),
+            direct_attach: false,
+            is_all_never: false,
+        });
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["status"], "verified_at_source");
+        assert_eq!(v["exports"][0]["probe"]["at"], "2026-08-07T10:00:00Z");
+        assert_eq!(v["exports"][0]["probe"]["rows"], 4);
+        assert_eq!(v["exports"][0]["check"]["at"], "2026-08-07T09:00:00Z");
+        assert_eq!(v["exports"][0]["check"]["distinct_grain"], 4);
+        assert_eq!(v["source_check"]["checked_at"], "2026-08-07T09:00:00Z");
+        // Neither measurement moves the digest.
+        let bare = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+        );
+        assert_eq!(digest_of(&bare), digest_of(&doc));
     }
 }

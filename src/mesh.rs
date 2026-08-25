@@ -34,7 +34,7 @@ pub struct MeshManifest {
 pub struct MeshCell {
     pub name: String,
     pub url: String,
-    /// Copied from the cell's context document (`declared.description`).
+    /// Copied from the cell's context document (its top-level `description`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Copied from the cell's context document — what lets an agent *route*
@@ -238,19 +238,19 @@ fn summarize(entry: CellEntry, fetched: Option<(serde_json::Value, Option<String
     let Some((doc, etag)) = fetched else {
         return cell;
     };
-    // 1, 2, and 3 all parse here: neither the v2 rename
-    // (`docs[].path` -> `source_path`) nor v3's relative request
-    // affordances touch anything the emitter copies. Unknown versions
-    // still bail.
-    if !matches!(
-        doc.get("datamk_context").and_then(|v| v.as_u64()),
-        Some(1) | Some(2) | Some(3)
-    ) {
-        tracing::warn!(cell = %cell.name, "unrecognized datamk_context version; emitting name+url only");
-        return cell;
-    }
-    cell.description = doc["declared"]["description"].as_str().map(str::to_string);
-    if let Some(exports) = doc["declared"]["exports"].as_array() {
+    // 1, 2, and 3 keep the `declared` region; 4 (ADR 0015) is flat —
+    // `description` and `exports` sit at the top level. Nothing else the
+    // emitter copies moved. Unknown versions still bail.
+    let region = match doc.get("datamk_context").and_then(|v| v.as_u64()) {
+        Some(1) | Some(2) | Some(3) => &doc["declared"],
+        Some(4) => &doc,
+        _ => {
+            tracing::warn!(cell = %cell.name, "unrecognized datamk_context version; emitting name+url only");
+            return cell;
+        }
+    };
+    cell.description = region["description"].as_str().map(str::to_string);
+    if let Some(exports) = region["exports"].as_array() {
         cell.exports = exports
             .iter()
             .filter_map(|e| {
@@ -333,6 +333,33 @@ mod tests {
         assert_eq!(cell.exports.len(), 2);
         assert!(!cell.exports[0].bound);
         assert!(cell.exports[1].bound);
+    }
+
+    /// ADR 0015: a v4 document is flat — the same fields, read from the top
+    /// level.
+    #[test]
+    fn summarize_reads_a_flat_v4_document() {
+        let doc = serde_json::json!({
+            "datamk_context": 4,
+            "cell": "orders",
+            "description": "Daily order revenue by region.",
+            "from": { "description": "cell.yaml" },
+            "exports": [
+                { "name": "served", "version": "1.0.0", "contract": "supported",
+                  "query": { "filters": [] } },
+                { "name": "bound", "version": "1.0.0", "contract": "experimental",
+                  "binding": { "source": "gold", "object": "ds.fct_x" } },
+            ]
+        });
+        let cell = summarize(entry("orders"), Some((doc, Some("d4".to_string()))));
+        assert_eq!(
+            cell.description.as_deref(),
+            Some("Daily order revenue by region.")
+        );
+        assert_eq!(cell.exports.len(), 2);
+        assert!(!cell.exports[0].bound);
+        assert!(cell.exports[1].bound);
+        assert_eq!(cell.context_digest.as_deref(), Some("d4"));
     }
 
     #[test]

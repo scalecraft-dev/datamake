@@ -16,10 +16,10 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     let snapshot = current_snapshot(&cell.conn)?;
 
     // ADR 0013 §5: docs fingerprints are a release-time fact, computed here
-    // (not at config-load time — that would populate `observed.docs` on
+    // (not at config-load time — that would populate `docs[].sha256` on
     // every never-built cell) for the cell plus every discoverable export
     // that declares `docs:`, regardless of contract — the same route list
-    // `declared.docs`/`context::declared` derive from, so identity and
+    // `context::interface`'s docs entries derive from, so identity and
     // fingerprint never disagree on what a "target" is.
     let doc_routes = crate::context::discoverable_routes(&cell.def)?;
     let docs_pages = crate::config::docs::load_declared(&cell.dir, &cell.def, &doc_routes)?;
@@ -120,15 +120,30 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
 /// version bump" warning at the next release — setting both `description`
 /// and `docs:` is correct, not an error, and both are meaning.
 fn description_digest(export: &crate::config::Export, docs_content: Option<&str>) -> String {
+    use crate::config::Origin;
+    // ADR 0015 §6: the ratchet asks "did the AUTHOR change the meaning?" —
+    // it hashes `cell.yaml`'s own words only. A description whose origin is
+    // the warehouse or a modeling tool is visible to consumers through the
+    // interface digest (the ETag) instead; an upstream edit must never move
+    // datamk's own release gate (issue #10).
+    let authored = |from: &crate::config::FromMap, field: &str| {
+        from.get(field).is_none_or(|o| *o == Origin::CellYaml)
+    };
     let mut input = String::new();
-    input.push_str(export.description.as_deref().unwrap_or(""));
+    if authored(&export.from, "description") {
+        input.push_str(export.description.as_deref().unwrap_or(""));
+    }
     for (col, spec) in &export.schema {
         input.push('\u{1f}');
         input.push_str(col);
         input.push('\u{1f}');
-        input.push_str(spec.unit.as_deref().unwrap_or(""));
+        if authored(&spec.from, "unit") {
+            input.push_str(spec.unit.as_deref().unwrap_or(""));
+        }
         input.push('\u{1f}');
-        input.push_str(spec.description.as_deref().unwrap_or(""));
+        if authored(&spec.from, "description") {
+            input.push_str(spec.description.as_deref().unwrap_or(""));
+        }
     }
     input.push('\u{1f}');
     input.push_str(docs_content.unwrap_or(""));

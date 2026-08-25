@@ -1,3 +1,4 @@
+mod catalog;
 mod cli;
 mod config;
 mod context;
@@ -59,6 +60,12 @@ async fn main() -> Result<()> {
             if let Some(path) = &log_path {
                 eprintln!("See the full run log: {}", path.display());
             }
+            // ADR 0016 §3: "the tool's environment is mid-apply, try again"
+            // gets its own exit code so a scheduler can retry without
+            // parsing text.
+            if e.downcast_ref::<catalog::RetryLater>().is_some() {
+                std::process::exit(catalog::EXIT_RETRY);
+            }
             std::process::exit(1);
         }
     }
@@ -85,6 +92,7 @@ async fn dispatch(command: Command) -> Result<()> {
             };
             engine::run(&a.file, &a.profile, retention_secs, opts)
         }
+        Command::Sync(a) => catalog::sync(&a.file, &a.profile, a.dry_run),
         Command::Verify(a) => verify::run(&a.file, &a.profile),
         Command::Release(a) => release::run(&a.file, &a.profile),
         Command::Deploy(a) => deploy::run(&a).await,
@@ -138,6 +146,9 @@ async fn dispatch(command: Command) -> Result<()> {
             ),
         },
         Command::Rollback(a) => ops::rollback(&a.file, &a.profile, a.execution),
+        Command::Debug(a) => match a.command {
+            cli::DebugCommand::SqlmeshComments { file } => catalog::debug_sqlmesh_comments(&file),
+        },
         Command::Publish(a) => {
             eprintln!("publish has been renamed to `release` (it pins the supported snapshot).");
             eprintln!("Run `datamk release` instead.");

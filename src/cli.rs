@@ -54,6 +54,11 @@ pub enum Command {
     Init(InitArgs),
     /// Execute the transform pipeline, commit a snapshot, auto-verify (the Builder workload)
     Run(RunArgs),
+    /// Discover the interface from a modeling tool's deployed state and
+    /// record it (`discover:` cells, ADR 0016). Reads the tool's state store
+    /// and the warehouse — read-only — and writes .cell/deployed_catalog.json,
+    /// which `verify`, `context` and `serve` then read with no credentials.
+    Sync(SyncArgs),
     /// Machine-verify actual output against the declared interface
     Verify(FileArgs),
     /// Pin the current snapshot as the supported contract
@@ -86,6 +91,44 @@ pub enum Command {
     /// Deprecated alias for `release`; kept for one release.
     #[command(hide = true)]
     Publish(FileArgs),
+
+    /// Developer tooling — not part of the surface.
+    #[command(hide = true)]
+    Debug(DebugArgs),
+}
+
+#[derive(Args)]
+pub struct DebugArgs {
+    #[command(subcommand)]
+    pub command: DebugCommand,
+}
+
+#[derive(Subcommand)]
+pub enum DebugCommand {
+    /// The differential check for the inline-comment extractor (ADR 0016
+    /// §4): reads a JSON file `{ "<model>": { "sql": "...", "dialect":
+    /// "bigquery", "expected": { "<column>": "<description>" } } }` (SQLMesh's
+    /// own `column_descriptions` per model, produced next to the project),
+    /// runs the extractor on each `sql`, and prints every mismatch. Exits
+    /// non-zero if any. Nothing leaves the machine.
+    SqlmeshComments {
+        /// The JSON file described above.
+        file: PathBuf,
+    },
+}
+
+#[derive(Args)]
+pub struct SyncArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml) — names the
+    /// state-store and warehouse connections.
+    #[arg(short, long, default_value = "local")]
+    pub profile: String,
+    /// Read and report, but write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]
@@ -158,8 +201,8 @@ pub enum InterfaceCommand {
     /// own types — never its prose. Types are safe to copy because `verify`
     /// checks them against the warehouse every run, so a stale copy is
     /// caught; descriptions have no such check, so a copy would silently
-    /// rot. The warehouse's own prose already rides `observed.
-    /// source_descriptions`, live — write `description:` only when you mean
+    /// rot. The warehouse's own prose already rides the bound export's
+    /// columns (`from.description: "warehouse"`), live — write `description:` only when you mean
     /// something different from it.
     Import(InterfaceImportArgs),
 }
@@ -297,6 +340,12 @@ pub struct InitArgs {
     /// Directory to create (defaults to ./<name>)
     #[arg(short, long)]
     pub path: Option<PathBuf>,
+    /// Scaffold a DISCOVERED cell instead (ADR 0016): `sqlmesh` — the
+    /// interface is read from the tool's deployed state by `datamk sync`,
+    /// never authored. Writes a `discover:` cell.yaml and profiles naming
+    /// the state-store and warehouse connections.
+    #[arg(long, value_name = "TOOL")]
+    pub from: Option<String>,
 }
 
 #[derive(Args)]

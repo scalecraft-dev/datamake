@@ -7,7 +7,8 @@
 //! safe to copy because `verify` checks them against the warehouse every
 //! run — a stale copy is caught. Descriptions have no such check, so a copy
 //! silently goes stale the moment the warehouse's own comment changes. The
-//! warehouse's prose already rides `observed.source_descriptions` (issue
+//! warehouse's prose already rides the bound export's own columns, marked
+//! `from.description: "warehouse"` (ADR 0015 §4; issue
 //! #10), live and unrottable, every time `datamk verify` runs. An author
 //! writes a local `description:` only when they mean something *different*
 //! from the warehouse's own words — authorship, not transcription.

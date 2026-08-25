@@ -39,6 +39,9 @@ pub struct Cell {
     /// Operator hints for where rows live when not served over HTTP
     /// (ADR 0012 §4) — surfaced in the context document's `data.channels`.
     pub channels: Vec<String>,
+    /// ADR 0016: the sidecar record's freshness for a discovered cell —
+    /// `None` for a hand-authored one. See `config::LoadedCell::discovery`.
+    pub discovery: Option<crate::config::Discovery>,
     /// The profile's `s3:` block; drives both DuckDB's secret and the native
     /// object-store client (ADR 0004 §3 credential parity).
     pub s3: Option<ResolvedS3>,
@@ -209,6 +212,7 @@ pub fn open_with(file: &Path, profile: &str, read_only: bool, budget: &Budget) -
         dir: loaded.dir,
         sources: loaded.bindings.sources.clone(),
         transforms: loaded.transforms,
+        discovery: loaded.discovery.clone(),
         principals: loaded.bindings.principals.clone(),
         channels: loaded.bindings.channels.clone(),
         s3: loaded.bindings.s3.clone(),
@@ -651,6 +655,15 @@ pub fn run(
     // (`render_init_job` and this refusal share the one predicate,
     // `config::builds_no_snapshot`), not by these two comments agreeing —
     // but they should, so: they do.
+    if cell.def.discover.is_some() {
+        anyhow::bail!(
+            "cell '{}' discovers its interface (`discover.from: {}`) and materializes \
+             nothing — there is no snapshot to commit. Use `datamk sync` to refresh the \
+             discovered interface, then `datamk verify` / `datamk context`.",
+            cell.def.cell,
+            "sqlmesh"
+        );
+    }
     if crate::config::builds_no_snapshot(&cell.transforms) {
         anyhow::bail!(
             "cell '{}' has no materializing transforms — there is no snapshot to commit. Run \
@@ -1785,7 +1798,7 @@ fn bind_source(
             // loaded and the connection set up, `table:` and `query:` alike
             // — only what happens next (classification, `qualify()`) is
             // target-specific.
-            let alias = format!("__conn_{connection}");
+            let alias = connectors::attach_alias(connection);
             conn.execute_batch(config.install_load_sql())
                 .with_context(|| format!("loading DuckDB '{ty}' extension"))?;
             conn.execute_batch(&config.attach_sql(&alias))
@@ -3450,6 +3463,7 @@ mod tests {
             sources.insert("src".to_string(), ResolvedSource::Raw(uri.to_string()));
         }
         ResolvedBindings {
+            discover_max_age_secs: crate::catalog::record::DEFAULT_MAX_AGE_SECS,
             channels: vec![],
             catalog: None,
             storage: storage.to_string(),

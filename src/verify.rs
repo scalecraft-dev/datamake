@@ -308,7 +308,7 @@ pub(crate) fn check_bind_target(export_name: &str, bind: &str, def: &CellDef) ->
 /// scan, ADR 0007 §4) it has never paid before.
 ///
 /// On success, when a live check ran, `datamk context`'s
-/// `observed.source_check` needs a persisted record — `verify` and
+/// the document's `source_check` needs a persisted record — `verify` and
 /// `context` are separate processes in CI, so the fact that a live check
 /// passed does not otherwise survive past this process exiting. Written to
 /// `.cell/source_check.json` (sibling of `.cell/published.json`, same
@@ -419,7 +419,7 @@ fn write_source_check_record(
 /// both paths in the same loop.
 /// Returns what the grain check measured, per route key — the numbers behind
 /// a passing check, for `.cell/source_check.json` and from there
-/// `observed.source_check.exports`. A grainless export contributes nothing:
+/// `exports[].check`. A grainless export contributes nothing:
 /// no check ran on it.
 pub fn check(
     conn: &Connection,
@@ -559,7 +559,7 @@ pub fn check(
 ///
 /// Issue #18: for a bound export, meaning satisfies this lint either way —
 /// authored locally (`description:`) or already available live at the
-/// source (`observed.source_descriptions`, i.e. the bound object has at
+/// source (the warehouse column descriptions `verify` records, i.e. the bound object has at
 /// least one warehouse-documented column). Deliberately NOT "restated
 /// locally" as the only path: `datamk interface import` exists precisely
 /// because copying warehouse prose into `cell.yaml` is the rot ADR 0012 §3
@@ -597,7 +597,7 @@ fn check_supported_have_descriptions(
              `docs:` page does not satisfy it, and neither does a bound source with no \
              warehouse-documented columns. One or two sentences: what one row means (ADR \
              0012 §3) — or, for a bound export, let the meaning already documented at the \
-             source satisfy this (`datamk verify` populates `observed.source_descriptions`). \
+             source satisfy this (`datamk verify` records the warehouse's column descriptions). \
              Supported is the deliberate promotion gesture; a supported export without \
              meaning anywhere is a promotion that didn't finish. Agents read `description` \
              before they fetch a page.",
@@ -1376,7 +1376,7 @@ interface:
 
     /// Issue #18: a `contract: supported` bound export with no local
     /// `description:` still passes when the bound source has at least one
-    /// warehouse-documented column in `observed.source_descriptions` — the
+    /// warehouse-documented column in the recorded source descriptions — the
     /// meaning is available, just not restated in `cell.yaml`. Forcing a
     /// local copy here is exactly the rot `datamk interface import` exists
     /// to avoid creating.

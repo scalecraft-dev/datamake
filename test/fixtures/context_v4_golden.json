@@ -1,0 +1,91 @@
+{
+  "datamk_context": 4,
+  "cell": "orders",
+  "status": "verified",
+  "grain_verified": true,
+  "description": "Daily order revenue by region.",
+  "from": {
+    "description": "cell.yaml"
+  },
+  "exports": [
+    {
+      "name": "orders_daily",
+      "version": "2.1.0",
+      "route": "orders_daily@2",
+      "contract": "supported",
+      "description": "One row per (order_date, region) with the summed order revenue.",
+      "freshness": "daily",
+      "grain": [
+        "order_date",
+        "region"
+      ],
+      "from": {
+        "description": "cell.yaml",
+        "grain": "cell.yaml"
+      },
+      "schema": {
+        "order_date": {
+          "type": "date",
+          "from": {
+            "type": "cell.yaml"
+          }
+        },
+        "region": {
+          "type": "string",
+          "from": {
+            "type": "cell.yaml"
+          }
+        },
+        "revenue": {
+          "type": "decimal",
+          "unit": "USD",
+          "description": "Gross order revenue, before refunds.",
+          "from": {
+            "type": "cell.yaml",
+            "unit": "cell.yaml",
+            "description": "cell.yaml"
+          }
+        }
+      },
+      "query": {
+        "filters": [
+          "order_date",
+          "region"
+        ],
+        "filter_semantics": "exact equality only — no ranges, no operators, no non-grain columns",
+        "limit_default": 100,
+        "limit_max": 1000,
+        "offset_max": 1000000,
+        "sample_request": "orders_daily@2?limit=10"
+      }
+    }
+  ],
+  "upstreams": [
+    {
+      "ref": "flights",
+      "version": 7
+    }
+  ],
+  "docs": [],
+  "include_request": "context?include=docs",
+  "build": {
+    "execution": 47,
+    "snapshot_id": 12,
+    "verify_outcome": "passed",
+    "started_at": "2026-07-13T10:00:00Z",
+    "finished_at": "2026-07-13T10:00:05Z",
+    "datamk_version": "0.0.12",
+    "data_as_of": "2026-07-13 10:00:04+00"
+  },
+  "freshness": {
+    "serving_execution": 47,
+    "latest_seen": 47,
+    "last_successful_poll_age_seconds": 3
+  },
+  "data": {
+    "served_here": true,
+    "channels": []
+  },
+  "notes": [],
+  "included": []
+}

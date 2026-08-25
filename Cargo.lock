@@ -1144,6 +1144,7 @@ dependencies = [
  "aws-credential-types",
  "axum",
  "clap",
+ "crc32fast",
  "duckdb",
  "futures",
  "indexmap",

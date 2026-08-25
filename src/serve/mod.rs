@@ -58,9 +58,11 @@ struct AppState {
     execution: std::sync::atomic::AtomicU64,
     /// Poll telemetry — what makes bounded staleness visible (ADR 0004 §6).
     freshness: Mutex<Freshness>,
-    /// The declared region of the context document (ADR 0012), precomputed —
-    /// the interface never changes for the lifetime of the process.
-    declared: crate::context::Declared,
+    /// The interface (ADR 0015) — every claim, no measurement — precomputed:
+    /// it never changes for the lifetime of the process. Warehouse column
+    /// descriptions (`.cell/source_descriptions.json`) are merged in here,
+    /// which is why they're loaded before it below.
+    interface: crate::context::Interface,
     /// The interface digest: `/context`'s `ETag`, `/openapi.json`'s
     /// `info.version`, and the `X-Datamk-Context-Digest` back-link header.
     digest: String,
@@ -104,7 +106,7 @@ struct AppState {
     /// omitted rather than blocking serving.
     probes: Mutex<indexmap::IndexMap<String, crate::context::ExportProbe>>,
     /// Cell-source name -> upstream ref (issue #7), precomputed once —
-    /// structural, derived only from `cell.yaml`, so (like `declared`) it
+    /// structural, derived only from `cell.yaml`, so (like `interface`) it
     /// never changes for the life of the process. The *values*
     /// (`execution`/`data_as_of`) still ride the poller-refreshed
     /// `run_summary` cache below, read fresh on every request — this map
@@ -118,7 +120,7 @@ struct AppState {
     docs_pages: Vec<crate::config::docs::DocsPage>,
     /// Docs page fingerprints (ADR 0013 §5), read from `published.json` at
     /// startup — a release-time fact, never recomputed from the live files
-    /// (which would tie `observed.docs` to "what's on disk right now"
+    /// (which would tie `docs[].sha256` to "what's on disk right now"
     /// instead of "what a release verified").
     docs_fingerprints: indexmap::IndexMap<String, crate::context::DocsFingerprint>,
     /// The docs-variant `ETag` suffix (ADR 0013 §6): a hash over `docs_pages`'
@@ -132,12 +134,6 @@ struct AppState {
     /// this deploy artifact. Startup-only, not poller-refreshed: see
     /// `build_state`'s doc comment for why.
     source_check: Option<crate::context::SourceCheck>,
-    /// The live-verify source-descriptions record (issue #6/#10), read once
-    /// at startup via `SourceDescriptionsRecord::fresh_for` — same
-    /// discipline, same artifact-shipping, same reason as `source_check`
-    /// immediately above (they are sibling files written by the same
-    /// `datamk verify` run).
-    source_descriptions: indexmap::IndexMap<String, indexmap::IndexMap<String, String>>,
     /// H3: a short hash over `source_check`/`source_descriptions`,
     /// precomputed at startup exactly like `docs_bundle_sha12` — folded
     /// into every `/context` `ETag`, not just the `?include=docs` variant.
@@ -237,6 +233,7 @@ pub async fn run(
     no_data: bool,
 ) -> Result<()> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
+    refuse_stale_discovery(&cell)?;
     let cell_name = cell.def.cell.clone();
     // Single-cell mode mounts at the root (ADR 0014): nesting it would break
     // every deployed URL, every Kubernetes probe path, and every `mesh emit`
@@ -313,6 +310,7 @@ pub async fn run_project(
         // a cell out removes it from the project file — an explicit,
         // reviewable act.
         let cell = engine::open_with(&pc.file, &pc.profile, /* read_only */ true, &budget)
+            .and_then(|c| refuse_stale_discovery(&c).map(|_| c))
             .with_context(|| {
                 format!(
                     "opening cells[{}] ({}, profile `{}`) declared in {} — every listed cell \
@@ -517,6 +515,21 @@ fn print_banner(port: u16, rows: &[BannerRow], project: bool) {
     println!();
 }
 
+/// ADR 0016 §5: a discovered cell with no fresh sidecar record must not
+/// start — it would serve a valid ETag over an empty interface,
+/// indistinguishable from "this cell has no exports" (ADR 0014 §6, startup
+/// is strict). Named, never silent.
+fn refuse_stale_discovery(cell: &engine::Cell) -> Result<()> {
+    if let Some(crate::config::Discovery::Stale(why)) = &cell.discovery {
+        anyhow::bail!(
+            "cell '{}' discovers its interface, but {why}. `serve` refuses to start over an \
+             empty interface.",
+            cell.def.cell
+        );
+    }
+    Ok(())
+}
+
 /// Build the serving state from an opened cell. Split from `run` so the
 /// in-process smoke tests can stand up the exact router `serve` binds,
 /// without a socket. Returns the store handle separately (published mode)
@@ -541,7 +554,7 @@ fn build_state(
     // The one visibility-filtered route list (ADR 0012 §4): the router's
     // dispatch map, the OpenAPI doc, and the context document all derive
     // from this single call — never three independent predicates. Includes
-    // bound exports (issue #6, binding model) — `declared` is unconditional
+    // bound exports (issue #6, binding model) — the interface is unconditional
     // (datamk owns the contract regardless of who owns the rows); `mounted`
     // is the snapshot-backed subset actually routed over HTTP.
     let all_routes = crate::context::discoverable_routes(&cell.def)?;
@@ -557,7 +570,19 @@ fn build_state(
     // amended) — never gated on --no-data. It's still null per-export for a
     // bound export, regardless of --no-data: that's a genuine interface
     // fact (issue #6), not a serving-mode one.
-    let declared = crate::context::declared(&cell.def, &all_routes);
+    // Issue #6/#10: the live-verify source-descriptions record
+    // (`.cell/source_descriptions.json`), read once at startup via
+    // `SourceDescriptionsRecord::fresh_for` — it lands on the bound exports'
+    // columns inside the interface (ADR 0015 §4), so it's loaded first.
+    // Startup-only, not poller-refreshed: it ships inside the same deploy
+    // artifact as `cell.yaml`, so a new record can only reach a running pod
+    // through a rollout (see `source_check` below for the full argument).
+    let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
+    let source_descriptions: indexmap::IndexMap<String, indexmap::IndexMap<String, String>> =
+        crate::manifest::SourceDescriptionsRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
+            .map(|r| r.sources.into_iter().collect())
+            .unwrap_or_default();
+    let interface = crate::context::interface(&cell.def, &all_routes, &source_descriptions);
     // Computed once, stored, and read from both the digest (below, via
     // `data`) and the per-request document (`context_doc`'s `s.served_here`)
     // — one fact, not two calls that could independently drift, since the
@@ -567,7 +592,7 @@ fn build_state(
         served_here,
         channels: cell.channels.clone(),
     };
-    let digest = crate::context::interface_digest(&cell.def.cell, &declared, &data);
+    let digest = crate::context::interface_digest(&cell.def.cell, &interface, &data);
     // Issue #7: structural only (source name -> upstream ref) — the
     // correlation key `context_doc` pairs against the poller-refreshed
     // `run_summary` cache on every request, never precomputed values.
@@ -628,17 +653,10 @@ fn build_state(
     // notice the same rollout the checksum annotation already rolls on.
     // `fresh_for` is the one place the digest+profile match happens
     // (`context::build_document` calls the same function).
-    let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
     let source_check =
         crate::manifest::SourceCheckRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
             .as_ref()
             .map(|r| crate::context::SourceCheck::from_record(r, &all_routes));
-    // Issue #6/#10: same fresh_for gate, same reason, sibling file — see
-    // `source_check` immediately above.
-    let source_descriptions: indexmap::IndexMap<String, indexmap::IndexMap<String, String>> =
-        crate::manifest::SourceDescriptionsRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
-            .map(|r| r.sources.into_iter().collect())
-            .unwrap_or_default();
     // H3: precomputed once here, from the exact two values above — never
     // recomputed on the request path, same discipline as `docs_bundle_sha12`.
     let observed_bundle_sha12 = observed_bundle_sha12(source_check.as_ref(), &source_descriptions);
@@ -667,7 +685,7 @@ fn build_state(
             latest_seen: execution,
             last_ok_poll_unix: store.as_ref().map(|_| unix_now()),
         }),
-        declared,
+        interface,
         digest,
         direct_attach,
         run_summary: Mutex::new(None),
@@ -683,7 +701,6 @@ fn build_state(
         docs_fingerprints,
         docs_bundle_sha12,
         source_check,
-        source_descriptions,
         observed_bundle_sha12,
         base_path: base_path.to_string(),
         cell: Mutex::new(cell),
@@ -755,6 +772,8 @@ fn probe_exports(
     use crate::context::{ColumnCoverage, ColumnValues, ExportProbe};
 
     let mut out = indexmap::IndexMap::new();
+    // One timestamp for the whole pass — the measurement's `at` (ADR 0015 §3).
+    let probed_at = crate::timeutil::rfc3339_utc(crate::timeutil::unix_now());
     for (route, export) in route_list {
         let snapshot = if export.contract == Contract::Supported {
             published.get(route).copied()
@@ -766,13 +785,11 @@ fn probe_exports(
             None => String::new(),
         };
         let source = export.source_object();
-        let mut probe = ExportProbe {
-            rows: conn
-                .prepare(&format!("SELECT count(*) FROM {source}{at}"))
-                .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-                .ok(),
-            ..ExportProbe::default()
-        };
+        let mut probe = ExportProbe::at(probed_at.clone());
+        probe.rows = conn
+            .prepare(&format!("SELECT count(*) FROM {source}{at}"))
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .ok();
 
         for g in &export.grain {
             let Some(spec) = export.schema.get(g) else {
@@ -861,7 +878,7 @@ fn probe_exports(
                         .collect::<Vec<_>>()
                         .join("&");
                     // Relative to the document's own URL, exactly like
-                    // `sample_request` — this one rides `observed` and never
+                    // `sample_request` — this one is a measurement (`probe`) and never
                     // reaches the digest, but a caller must resolve both the
                     // same way.
                     probe.example_request = Some(format!("{route}?{params}&limit=10"));
@@ -1306,7 +1323,7 @@ async fn context_doc(
     let probes = s.probes.lock().expect("probes mutex poisoned").clone();
     let mut doc = crate::context::assemble(crate::context::Facts {
         cell: s.cell_name.clone(),
-        declared: s.declared.clone(),
+        interface: s.interface.clone(),
         provenance,
         // Issue #16: the record `datamk verify` persisted, read once at
         // startup (`build_state`) — not a live warehouse check performed by
@@ -1320,7 +1337,6 @@ async fn context_doc(
         upstreams,
         probes,
         docs_fingerprints: s.docs_fingerprints.clone(),
-        source_descriptions: s.source_descriptions.clone(),
         served_here: s.served_here,
         channels: s.channels.clone(),
         direct_attach: s.direct_attach,
@@ -1350,21 +1366,7 @@ async fn context_doc(
         // `200`, empty pages when the cell declares none — not an error;
         // `included` is what tells an agent it asked and got a truthful
         // (possibly empty) answer, distinct from "server predates this field".
-        doc.included = vec!["docs".to_string()];
-        doc.docs = Some(
-            s.docs_pages
-                .iter()
-                .map(|p| {
-                    (
-                        p.target.clone(),
-                        crate::context::DocsContentEntry {
-                            media_type: p.media_type.clone(),
-                            content: p.content.to_string(),
-                        },
-                    )
-                })
-                .collect(),
-        );
+        doc.inline_docs(&s.docs_pages);
     }
     (
         StatusCode::OK,
@@ -1669,6 +1671,8 @@ mod tests {
             freshness: None,
             visibility: Visibility::Discoverable,
             contract: Contract::Experimental,
+            from: Default::default(),
+            discovered: None,
         }
     }
 
@@ -1947,6 +1951,26 @@ mod tests {
 #[cfg(test)]
 mod smoke {
     use super::*;
+
+    /// The export record for `route` in a v4 document (ADR 0015).
+    fn export_doc<'a>(v: &'a serde_json::Value, route: &str) -> &'a serde_json::Value {
+        v["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["route"] == route)
+            .unwrap_or_else(|| panic!("no export {route} in {v}"))
+    }
+
+    /// The docs record for `target` in a v4 document (ADR 0015).
+    fn docs_page<'a>(v: &'a serde_json::Value, target: &str) -> &'a serde_json::Value {
+        v["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["target"] == target)
+            .unwrap_or_else(|| panic!("no docs page {target} in {v}"))
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -1977,6 +2001,7 @@ mod smoke {
             crate::init::run(crate::cli::InitArgs {
                 name: "smoke".to_string(),
                 path: Some(dir.clone()),
+                from: None,
             })
             .expect("init scaffold");
             crate::engine::run(
@@ -2215,7 +2240,7 @@ mod smoke {
     /// is not the BigQuery metadata job (already pinned in
     /// `bigquery.rs`'s own unit tests) but the loading/serving wiring: both
     /// doors reading the same file through the same `fresh_for` gate and
-    /// agreeing on `observed.source_descriptions`.
+    /// agreeing on the bound exports' warehouse descriptions.
     fn built_all_never_cell_with_descriptions() -> &'static Scaffold {
         use std::sync::OnceLock;
         static CELL: OnceLock<Scaffold> = OnceLock::new();
@@ -2337,14 +2362,14 @@ mod smoke {
             let (status, body) = get(&router, "/context", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(v["datamk_context"], 3);
+            assert_eq!(v["datamk_context"], 4);
             assert_eq!(v["cell"], "smoke");
             assert_eq!(v["status"], "draft");
             assert_eq!(v["grain_verified"], false);
-            assert!(v["observed"]["provenance"].is_null(), "{body}");
-            assert_eq!(v["declared"]["exports"][0]["route"], "orders_daily@2");
+            assert!(v.get("build").is_none(), "{body}");
+            assert_eq!(v["exports"][0]["route"], "orders_daily@2");
             assert_eq!(
-                v["declared"]["exports"][0]["query"]["sample_request"],
+                v["exports"][0]["query"]["sample_request"],
                 "orders_daily@2?limit=10"
             );
             assert_eq!(v["data"]["served_here"], true);
@@ -2528,7 +2553,7 @@ mod smoke {
             let (status, body) = get(&router, "/context", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            let probe = &v["observed"]["exports"]["orders_daily@2"];
+            let probe = &export_doc(&v, "orders_daily@2")["probe"];
             assert_eq!(probe["rows"], 4, "{body}");
             assert_eq!(probe["coverage"]["order_date"]["min"], "2026-06-01");
             assert_eq!(probe["coverage"]["order_date"]["max"], "2026-06-02");
@@ -2583,8 +2608,8 @@ mod smoke {
             // mounts the route — that claim is `data.served_here` (asserted
             // above) and the route's own 404, not a second, digest-moving
             // copy of the same fact.
-            assert!(v["declared"]["exports"][0]["query"].is_object(), "{body}");
-            let probe = &v["observed"]["exports"]["orders_daily@2"];
+            assert!(v["exports"][0]["query"].is_object(), "{body}");
+            let probe = &export_doc(&v, "orders_daily@2")["probe"];
             // Value lists are row-derived data — withheld. Coverage stays:
             // an aggregate that names no entity.
             assert!(probe.get("values").is_none(), "{body}");
@@ -2632,9 +2657,9 @@ mod smoke {
             // The fact that changed with the flag: still does.
             assert_ne!(a["data"]["served_here"], b["data"]["served_here"]);
             // The fact that must NOT change with the flag anymore: doesn't.
-            assert!(a["declared"]["exports"][0]["query"].is_object(), "{body_a}");
+            assert!(a["exports"][0]["query"].is_object(), "{body_a}");
             assert_eq!(
-                a["declared"]["exports"][0]["query"], b["declared"]["exports"][0]["query"],
+                a["exports"][0]["query"], b["exports"][0]["query"],
                 "query must not depend on --no-data: {body_a} / {body_b}"
             );
         });
@@ -2674,7 +2699,7 @@ mod smoke {
             let (status, body) = get(&router, "/context", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            let exports = v["declared"]["exports"].as_array().unwrap();
+            let exports = v["exports"].as_array().unwrap();
             let stg = exports
                 .iter()
                 .find(|e| e["name"] == "stg")
@@ -2695,10 +2720,10 @@ mod smoke {
             // No swap-time probe ran against it either — its `source_object`
             // names no lake relation.
             assert!(
-                v["observed"]["exports"].get("virtual_pii@1").is_none(),
+                export_doc(&v, "virtual_pii@1").get("probe").is_none(),
                 "{body}"
             );
-            let stg_probe = &v["observed"]["exports"]["stg@1"];
+            let stg_probe = &export_doc(&v, "stg@1")["probe"];
             assert_eq!(
                 stg_probe["rows"], 2,
                 "stg's own probe is unaffected: {body}"
@@ -2819,16 +2844,10 @@ mod smoke {
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["status"], "verified_at_source", "{body}");
             assert_eq!(v["grain_verified"], true, "{body}");
-            assert_eq!(v["observed"]["source_check"]["outcome"], "passed", "{body}");
-            assert!(
-                v["observed"]["source_check"]["checked_at"].is_string(),
-                "{body}"
-            );
+            assert_eq!(v["source_check"]["outcome"], "passed", "{body}");
+            assert!(v["source_check"]["checked_at"].is_string(), "{body}");
             // The profile never rides the wire (it's a gate, not a fact).
-            assert!(
-                v["observed"]["source_check"].get("profile").is_none(),
-                "{body}"
-            );
+            assert!(v["source_check"].get("profile").is_none(), "{body}");
             // The draft-only notes (NOTE_DIRECT_ATTACH/NOTE_VIRTUAL_CELL/
             // NOTE_NOTHING_BUILT) are gone now that status isn't Draft — but
             // NOTE_NO_ROUTES_MOUNTED (issue #17) is not a draft note, it's a
@@ -3022,7 +3041,14 @@ mod smoke {
             assert!(!plain_etag.contains("~docs"), "{plain_etag}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["included"], serde_json::json!([]));
-            assert!(v["docs"].is_null(), "{body}");
+            assert!(
+                v["docs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.get("content").is_none()),
+                "{body}"
+            );
             assert_eq!(
                 headers.get(header::CACHE_CONTROL).unwrap(),
                 "private",
@@ -3044,18 +3070,18 @@ mod smoke {
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["included"], serde_json::json!(["docs"]));
             assert_eq!(
-                v["docs"]["cell"]["media_type"],
+                docs_page(&v, "cell")["media_type"],
                 "text/markdown; charset=utf-8"
             );
             assert!(
-                v["docs"]["cell"]["content"]
+                docs_page(&v, "cell")["content"]
                     .as_str()
                     .unwrap()
                     .contains("Docs demo"),
                 "{body}"
             );
             assert!(
-                v["docs"]["orders@1"]["content"]
+                docs_page(&v, "orders@1")["content"]
                     .as_str()
                     .unwrap()
                     .contains("One row per order"),
@@ -3070,7 +3096,11 @@ mod smoke {
             assert_eq!(status, StatusCode::OK, "{default_body}");
             let dv: serde_json::Value = serde_json::from_str(&default_body).unwrap();
             assert!(
-                dv["observed"]["docs"].is_null() || dv["observed"]["docs"] == serde_json::json!({}),
+                dv["docs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.get("sha256").is_none()),
                 "{default_body}"
             );
 
@@ -3186,7 +3216,7 @@ mod smoke {
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["included"], serde_json::json!(["docs"]));
-            assert_eq!(v["docs"], serde_json::json!({}));
+            assert_eq!(v["docs"], serde_json::json!([]));
         });
     }
 
@@ -3233,7 +3263,7 @@ mod smoke {
             assert_eq!(v["data"]["served_here"], false);
             assert_eq!(v["included"], serde_json::json!(["docs"]));
             assert!(
-                v["docs"]["cell"]["content"]
+                docs_page(&v, "cell")["content"]
                     .as_str()
                     .unwrap()
                     .contains("Docs demo"),
@@ -3333,14 +3363,16 @@ mod smoke {
             assert!(hosted.get("cell_yaml_digest").is_none(), "{hosted}");
             assert_eq!(portable["data"]["served_here"], false, "{portable}");
             assert!(
-                portable["observed"]["exports"]
-                    .as_object()
-                    .is_none_or(|m| m.is_empty()),
-                "{portable}"
+                portable["exports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.get("probe").is_none()),
+                "a file never probes rows: {portable}"
             );
-            assert!(portable["observed"]["freshness"].is_null(), "{portable}");
+            assert!(portable.get("freshness").is_none(), "{portable}");
             assert!(
-                hosted["observed"]["freshness"].is_null(),
+                hosted.get("freshness").is_none(),
                 "none of this test's fixtures are published-mode, so hosted should have no \
                  freshness block either — if this fires, add a real asymmetry check instead of \
                  stripping blind: {hosted}"
@@ -3362,14 +3394,12 @@ mod smoke {
                 if let Some(data) = obj.get_mut("data").and_then(|d| d.as_object_mut()) {
                     data.remove("served_here");
                 }
-                if let Some(observed) = obj.get_mut("observed").and_then(|o| o.as_object_mut()) {
-                    observed.remove("exports");
-                    observed.remove("freshness");
-                    // Collapse to the portable shape (`null`) when nothing
-                    // but always-serialized `null`s remains — see the
-                    // `observed.exports` doc note above.
-                    if observed.values().all(serde_json::Value::is_null) {
-                        obj.insert("observed".to_string(), serde_json::Value::Null);
+                obj.remove("freshness");
+                if let Some(exports) = obj.get_mut("exports").and_then(|e| e.as_array_mut()) {
+                    for e in exports.iter_mut() {
+                        if let Some(e) = e.as_object_mut() {
+                            e.remove("probe");
+                        }
                     }
                 }
                 if let Some(notes) = obj.get_mut("notes").and_then(|n| n.as_array_mut()) {
@@ -3569,8 +3599,8 @@ mod smoke {
                 let vm: serde_json::Value = serde_json::from_str(&body_m).unwrap();
                 assert_eq!(vu["declared"], vm["declared"], "{body_u}\n{body_m}");
                 assert_eq!(
-                    vu["declared"]["exports"][0]["query"]["sample_request"],
-                    vm["declared"]["exports"][0]["query"]["sample_request"],
+                    vu["exports"][0]["query"]["sample_request"],
+                    vm["exports"][0]["query"]["sample_request"],
                     "the sample request string itself must not change"
                 );
             });

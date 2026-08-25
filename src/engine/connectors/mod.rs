@@ -11,6 +11,7 @@
 //! `config::connections::`. This file is dispatch only.
 
 mod bigquery;
+mod duckdb_file;
 mod postgres;
 mod snowflake;
 
@@ -21,6 +22,18 @@ use std::path::Path;
 
 use crate::config::{ConnectionTarget, ResolvedConnection, ResolvedSource, SnowflakeAuth};
 use crate::engine::MarkValue;
+
+/// The attach alias the engine mounts a connection under (`__conn_<name>`,
+/// see `engine::bind_sources`) — the one place the convention is spelled,
+/// so classification of a DuckDB-file connection reads the same alias the
+/// bind attached.
+pub fn attach_alias(connection: &str) -> String {
+    format!("__conn_{connection}")
+}
+
+/// The alias `catalog::warehouse` attaches a DuckDB-file warehouse under
+/// when there is no engine bind at all (a `datamk sync`).
+pub const DUCKDB_CLASSIFY_ALIAS: &str = "__datamk_wh";
 
 /// Which binding path a warehouse object gets. The names come from the
 /// first connector (BigQuery), where the split falls out of its Storage
@@ -143,7 +156,7 @@ impl ClassifyCache {
             .unwrap_or_else(|| vec![table.to_string()]);
         let refs: Vec<&str> = group_tables.iter().map(String::as_str).collect();
 
-        match connector.classify_objects(duckdb, &refs) {
+        match connector.classify_objects_as(duckdb, &attach_alias(connection), &refs) {
             Ok(meta) => {
                 let result = meta.get(table).cloned();
                 self.by_group.insert(key, meta);
@@ -224,6 +237,7 @@ impl ResolvedConnection {
             ResolvedConnection::Bigquery { .. } => "bigquery",
             ResolvedConnection::Postgres { .. } => "postgres",
             ResolvedConnection::Snowflake { .. } => "snowflake",
+            ResolvedConnection::Duckdb { .. } => "duckdb",
         }
     }
 
@@ -236,6 +250,8 @@ impl ResolvedConnection {
             // the metadata-DB catalog path works.
             ResolvedConnection::Postgres { .. } => postgres::INSTALL_LOAD_SQL,
             ResolvedConnection::Snowflake { .. } => snowflake::INSTALL_LOAD_SQL,
+            // Built in: a DuckDB file needs no extension at all.
+            ResolvedConnection::Duckdb { .. } => "",
         }
     }
 
@@ -281,6 +297,7 @@ impl ResolvedConnection {
                 sslmode,
                 alias,
             ),
+            ResolvedConnection::Duckdb { path } => duckdb_file::attach_sql(path, alias),
         }
     }
 
@@ -318,6 +335,9 @@ impl ResolvedConnection {
                 sslmode,
                 password.as_ref().map(|p| p.0.as_str()),
             ),
+            ResolvedConnection::Duckdb { path } => anyhow::Error::new(err).context(format!(
+                "attaching connection '{connection}' (duckdb file '{path}', read-only)"
+            )),
         }
     }
 
@@ -333,6 +353,7 @@ impl ResolvedConnection {
             ResolvedConnection::Snowflake { database, .. } => {
                 snowflake::qualify(alias, database, table)
             }
+            ResolvedConnection::Duckdb { .. } => duckdb_file::qualify(alias, table),
         }
     }
 
@@ -346,7 +367,9 @@ impl ResolvedConnection {
             ResolvedConnection::Bigquery { credentials, .. } => credentials.as_deref(),
             // Postgres auth is per-connection `CREATE SECRET` material (or
             // libpq's ambient chain) — nothing process-global, like Snowflake.
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => None,
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => None,
         }
     }
 
@@ -357,9 +380,11 @@ impl ResolvedConnection {
     pub fn staging_uri(&self) -> Option<&str> {
         match self {
             ResolvedConnection::Bigquery { staging_uri, .. } => staging_uri.as_deref(),
-            // Neither has a jobs-API result ceiling: Snowflake streams over
-            // Arrow, Postgres over the wire protocol.
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => None,
+            // None has a jobs-API result ceiling: Snowflake streams over
+            // Arrow, Postgres over the wire protocol, DuckDB is local.
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => None,
         }
     }
 
@@ -367,7 +392,7 @@ impl ResolvedConnection {
     /// path (BigQuery: Application Default Credentials). Called once per run
     /// from `prepare()`, only for a connector whose `credentials()` is
     /// `Some` — never Snowflake.
-    fn point_credentials_at(&self, path: &str) {
+    pub fn point_credentials_at(&self, path: &str) {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::point_adc_at(path),
             ResolvedConnection::Snowflake { .. } => {
@@ -376,6 +401,42 @@ impl ResolvedConnection {
             ResolvedConnection::Postgres { .. } => {
                 unreachable!("postgres has no process-global credential file")
             }
+            ResolvedConnection::Duckdb { .. } => {
+                unreachable!("a duckdb file has no credential file")
+            }
+        }
+    }
+
+    /// BigQuery only: classify `tables` that live in `project` — a catalog
+    /// other than the connection's own (ADR 0016 §4: one discovered cell
+    /// spans a modeling project's catalogs, e.g. `dw-main-bronze/silver/
+    /// gold`, while one connection names one project). The job is billed
+    /// to the connection's `billing_project` (else its `project`), so the
+    /// caller needs `bigquery.jobs.create` there and metadata read on
+    /// `project`. Any other connector: a single-database connection cannot
+    /// reach another catalog, so this is an error naming that.
+    pub fn classify_objects_in_project(
+        &self,
+        conn: &duckdb::Connection,
+        project: &str,
+        tables: &[&str],
+    ) -> Result<IndexMap<String, ObjectMeta>> {
+        match self {
+            ResolvedConnection::Bigquery {
+                project: own,
+                billing_project,
+                ..
+            } => bigquery::classify_objects(
+                conn,
+                project,
+                Some(billing_project.as_deref().unwrap_or(own)),
+                tables,
+            ),
+            other => bail!(
+                "a {} connection reads one database; objects in catalog '{project}' are not \
+                 reachable through it",
+                other.type_name()
+            ),
         }
     }
 
@@ -384,9 +445,12 @@ impl ResolvedConnection {
     /// or `::Query` and capture its warehouse-native column types. Callers
     /// should go through `ClassifyCache` rather than calling this directly,
     /// so a run issues at most one job per dataset.
-    pub fn classify_objects(
+    /// `alias` is the attach alias a DuckDB-file connection is mounted
+    /// under (the other connectors don't need one to classify).
+    pub fn classify_objects_as(
         &self,
         conn: &duckdb::Connection,
+        alias: &str,
         tables: &[&str],
     ) -> Result<IndexMap<String, ObjectMeta>> {
         match self {
@@ -403,6 +467,9 @@ impl ResolvedConnection {
             // tables, views, and materialized views uniformly (live-verified)
             // — so there is equally nothing to look up.
             ResolvedConnection::Postgres { .. } => postgres::classify_objects(tables),
+            // Local and free: types and comments straight off
+            // `duckdb_columns()` on the attached file.
+            ResolvedConnection::Duckdb { .. } => duckdb_file::classify_objects(conn, alias, tables),
         }
     }
 
@@ -439,6 +506,7 @@ impl ResolvedConnection {
             // routes a Postgres source here — but the answer is coherent
             // (same shape as the engine's own Table-kind staging SQL).
             ResolvedConnection::Postgres { .. } => postgres::read_sql(alias, table, predicate),
+            ResolvedConnection::Duckdb { .. } => duckdb_file::read_sql(alias, table, predicate),
         }
     }
 
@@ -449,9 +517,11 @@ impl ResolvedConnection {
     fn is_jobs_permission_denied(&self, err: &anyhow::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_jobs_permission_denied(err),
-            // Neither runs a classification job, so there is nothing to be
-            // denied — a classify error is always a genuine failure.
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => false,
+            // None runs a remote classification job, so there is nothing to
+            // be denied — a classify error is always a genuine failure.
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => false,
         }
     }
 
@@ -465,10 +535,10 @@ impl ResolvedConnection {
             // Unreachable in practice — Snowflake/Postgres classification
             // never returns `Ok(None)`, so the probe that calls this never
             // runs.
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => {
-                anyhow::Error::new(err)
-                    .context(format!("probing source '{name}' ({table}) before bind"))
-            }
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => anyhow::Error::new(err)
+                .context(format!("probing source '{name}' ({table}) before bind")),
         }
     }
 
@@ -506,6 +576,9 @@ impl ResolvedConnection {
             ResolvedConnection::Postgres { database, user, .. } => {
                 postgres::rewrite_stage_error(err, name, describe, database, user, context)
             }
+            ResolvedConnection::Duckdb { path } => anyhow::Error::new(err).context(format!(
+                "{context}: reading {describe} for source '{name}' from duckdb file '{path}'"
+            )),
         }
     }
 
@@ -517,7 +590,9 @@ impl ResolvedConnection {
     pub fn is_response_too_large(&self, err: &duckdb::Error) -> bool {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_response_too_large(err),
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => false,
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => false,
         }
     }
 
@@ -556,6 +631,10 @@ impl ResolvedConnection {
                 "postgres has no oversized-result export path (internal error) — please \
                  report this"
             ),
+            ResolvedConnection::Duckdb { .. } => bail!(
+                "duckdb has no oversized-result export path (internal error) — please \
+                 report this"
+            ),
         }
     }
 
@@ -575,6 +654,9 @@ impl ResolvedConnection {
             } => bigquery::query_read_sql(project, billing_project.as_deref(), query),
             ResolvedConnection::Snowflake { .. } => snowflake::query_read_sql(alias, query),
             ResolvedConnection::Postgres { .. } => postgres::query_read_sql(alias, query),
+            // A duckdb file has no server: the author's query runs locally
+            // over the attached database, verbatim.
+            ResolvedConnection::Duckdb { .. } => format!("SELECT * FROM ({query})"),
         }
     }
 
@@ -602,6 +684,10 @@ impl ResolvedConnection {
                 "postgres has no oversized-result export path (internal error) — please \
                  report this"
             ),
+            ResolvedConnection::Duckdb { .. } => bail!(
+                "duckdb has no oversized-result export path (internal error) — please \
+                 report this"
+            ),
         }
     }
 
@@ -624,7 +710,9 @@ impl ResolvedConnection {
             // Neither has a free dry-run (Postgres's EXPLAIN estimates rows
             // but validates nothing a real read wouldn't) — the engine skips
             // the preflight silently, an expected capability gap.
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => None,
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => None,
         }
     }
 
@@ -636,7 +724,9 @@ impl ResolvedConnection {
         match self {
             ResolvedConnection::Bigquery { .. } => bigquery::is_dry_run_query_error(err),
             // No dry-run runs for either, so no failure to classify.
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => false,
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => false,
         }
     }
 
@@ -655,6 +745,7 @@ impl ResolvedConnection {
             // scale-zero NUMERIC cursor is a genuine decimal, not
             // Snowflake's everything-is-NUMBER(38,0) situation.
             ResolvedConnection::Postgres { .. } => false,
+            ResolvedConnection::Duckdb { .. } => false,
         }
     }
 
@@ -686,6 +777,13 @@ impl ResolvedConnection {
                     format!("staging source '{name}' -> {describe} from Postgres")
                 }
             }
+            ResolvedConnection::Duckdb { .. } => {
+                if describe == "query" {
+                    format!("staging query source '{name}' from the duckdb file")
+                } else {
+                    format!("staging source '{name}' -> {describe} from the duckdb file")
+                }
+            }
         }
     }
 
@@ -697,7 +795,9 @@ impl ResolvedConnection {
         match self {
             ResolvedConnection::Bigquery { .. } => "view",
             // What the author declared is a table path.
-            ResolvedConnection::Snowflake { .. } | ResolvedConnection::Postgres { .. } => "table",
+            ResolvedConnection::Snowflake { .. }
+            | ResolvedConnection::Postgres { .. }
+            | ResolvedConnection::Duckdb { .. } => "table",
         }
     }
 
@@ -714,6 +814,9 @@ impl ResolvedConnection {
             ),
             ResolvedConnection::Snowflake { .. } => snowflake::stage_narration(name, table),
             ResolvedConnection::Postgres { .. } => postgres::stage_narration(name, table),
+            ResolvedConnection::Duckdb { .. } => {
+                format!("source '{name}' reads {table} through the attached duckdb file.")
+            }
         }
     }
 
@@ -731,6 +834,10 @@ impl ResolvedConnection {
             ResolvedConnection::Postgres { .. } => {
                 postgres::stage_incremental_narration(name, table)
             }
+            ResolvedConnection::Duckdb { .. } => format!(
+                "source '{name}' reads {table} through the attached duckdb file with the \
+                 watermark predicate pushed into the scan."
+            ),
         }
     }
 
@@ -743,6 +850,11 @@ impl ResolvedConnection {
             ),
             ResolvedConnection::Snowflake { .. } => snowflake::query_stage_narration(name),
             ResolvedConnection::Postgres { .. } => postgres::query_stage_narration(name),
+            ResolvedConnection::Duckdb { .. } => {
+                format!(
+                    "source '{name}' is a query source — executing over the attached duckdb file"
+                )
+            }
         }
     }
 }
