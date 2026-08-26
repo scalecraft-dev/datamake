@@ -151,7 +151,6 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
     };
     let profile_path = dir.join("profiles").join(format!("{profile}.yaml"));
     let raw = Bindings::load(&profile_path)?;
-    let resolved = crate::config::resolve(&def, &raw)?;
     let state = named_connection(&raw, &d.state, &dir)
         .with_context(|| format!("resolving `discover.state: {}`", d.state))?;
     let wh = named_connection(&raw, &d.warehouse, &dir)
@@ -211,7 +210,6 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
         datamk_version: env!("CARGO_PKG_VERSION").to_string(),
         cell_yaml_digest,
         profile: profile.to_string(),
-        max_age_secs: resolved.discover_max_age_secs,
         pins,
         catalog,
     };
@@ -466,6 +464,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(
+            dir.join("docs/documented.md"),
+            "# Documented\n\nHow to use this export, at length.",
+        )
+        .unwrap();
         sqlmesh::state::fixture::build_file(&dir.join("state.db"));
         std::fs::write(dir.join("cell.yaml"), cell_yaml).unwrap();
         std::fs::write(
@@ -498,7 +502,8 @@ mod tests {
         \x20     as: documented\n\
         \x20     version: 2.0.0\n\
         \x20     contract: supported\n\
-        \x20     description: Authored, so it wins.\n";
+        \x20     description: Authored, so it wins.\n\
+        \x20     docs: docs/documented.md\n";
 
     #[test]
     fn sync_then_load_then_context_then_verify_end_to_end() {
@@ -537,9 +542,21 @@ mod tests {
         assert_eq!(loaded.def.interface.len(), 5);
         assert_eq!(loaded.def.sources.len(), 5);
 
-        let doc = crate::context::build_document(&file, "local", true).unwrap();
+        let doc = crate::context::build_document(&file, "local", false).unwrap();
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["discovered_from"]["tool"], "sqlmesh");
+        // overrides[].docs: the page rides the export's route key, inlined.
+        let page = v["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["target"] == "documented@2")
+            .expect("an override's docs page");
+        assert_eq!(page["source_path"], "docs/documented.md");
+        assert!(page["content"]
+            .as_str()
+            .unwrap()
+            .contains("How to use this export"));
         assert_eq!(v["discovered_from"]["environment"], "prod");
         assert_eq!(v["discovered_from"]["evidence"], "environment_row");
         assert!(v["discovered_from"]["plan_id"].is_string());
@@ -677,28 +694,29 @@ mod tests {
         let dir = scaffold("stale", CELL);
         let file = dir.join("cell.yaml");
         sync(&file, "local", false).unwrap();
-        // Age it past max_age.
-        let mut record = DeployedCatalogRecord::load(&dir).unwrap();
-        record.written_at = "2020-01-01T00:00:00Z".to_string();
-        record.write(&dir).unwrap();
-        let loaded = crate::config::load(&file, "local").unwrap();
+        // A profile switch: the record attests `local`, not `prod`.
+        std::fs::copy(
+            dir.join("profiles/local.yaml"),
+            dir.join("profiles/prod.yaml"),
+        )
+        .unwrap();
+        let loaded = crate::config::load(&file, "prod").unwrap();
         match loaded.discovery {
-            Some(crate::config::Discovery::Stale(record::Staleness::Expired { .. })) => {}
+            Some(crate::config::Discovery::Stale(record::Staleness::Profile { .. })) => {}
             other => panic!("{other:?}"),
         }
         assert!(loaded.def.interface.is_empty());
-        let doc = crate::context::build_document(&file, "local", true).unwrap();
+        let doc = crate::context::build_document(&file, "prod", true).unwrap();
         assert!(
             doc.notes
                 .iter()
-                .any(|n| n.contains("past the profile's max_age")),
+                .any(|n| n.contains("synced under profile 'local'")),
             "{:?}",
             doc.notes
         );
         assert!(doc.exports.is_empty());
 
         // A cell.yaml edit invalidates it too.
-        sync(&file, "local", false).unwrap();
         std::fs::write(&file, format!("{CELL}access:\n  shareable: true\n")).unwrap();
         let loaded = crate::config::load(&file, "local").unwrap();
         assert!(matches!(

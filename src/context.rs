@@ -1363,7 +1363,9 @@ pub fn build_document(
     // makes at startup, so the two doors can never digest different bytes.
     let cell_yaml_digest = cell_yaml_digest_of(file)?;
 
-    let (provenance, upstreams) = if direct_attach {
+    // A cell with no materializing transforms never publishes — its storage
+    // is never touched, so no store client (and no store credentials) here.
+    let (provenance, upstreams) = if direct_attach || is_all_never {
         (None, Vec::new())
     } else {
         let store = crate::store::Store::for_storage(

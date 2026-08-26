@@ -6,6 +6,25 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Changed — discovered cells, after the first production run (ADR 0016 amendment 2026-08-26)
+
+- `verify` now reads each discovered export from the model's own catalog:
+  on BigQuery the synthesized source is `project.dataset.table`, classified
+  in that project and billed to the connection. The BigQuery connector
+  accepts three-part paths on any `table:` source (jobs-API read).
+- `discover.overrides[].docs` — a per-export docs page (ADR 0013 rules).
+- `discover.select` is AND across keys (tags/schemas/models), as documented;
+  it was OR, over-selecting silently.
+- `verify`, `context`, `serve` on a cell with no materializing transforms
+  never touch `storage:` — no object-store credentials, no `catalog:`
+  needed; no "no catalog to attach yet" log line.
+- **Removed** `discover.max_age` (profile) and the record's expiry: a
+  discovered cell's record refreshes on deploy (`sqlmesh plan prod` →
+  `datamk sync` → `datamk deploy`) and is as current as the last deploy by
+  construction. `deploy` renders no Builder CronJob for such a cell.
+- Document: a bound export has no `query` key (was documented as `null`);
+  `binding.object` is project-qualified on BigQuery.
+
 ### Added — discovered cells: a SQLMesh project's deployed models as an interface (ADR 0016)
 
 `discover:` in `cell.yaml` points a cell at a SQLMesh project; `datamk sync`

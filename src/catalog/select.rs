@@ -32,10 +32,14 @@ pub fn selected(d: &Discover, kind: &str, schema: &str, object: &str, tags: &[St
     if !kind_ok {
         return false;
     }
-    let by_tag = !d.select.tags.is_empty() && d.select.tags.iter().any(|t| tags.contains(t));
-    let by_schema = !d.select.schemas.is_empty() && d.select.schemas.iter().any(|s| s == schema);
-    let by_model = !d.select.models.is_empty() && d.select.models.iter().any(|m| m == object);
-    if !(by_tag || by_schema || by_model) {
+    // OR within a key, AND across the keys that are set: `schemas: [a]` +
+    // `tags: [t]` is "models in schema a that carry tag t" — the guide's
+    // rule, and the one that doesn't silently over-select into another
+    // catalog.
+    let by_tag = d.select.tags.is_empty() || d.select.tags.iter().any(|t| tags.contains(t));
+    let by_schema = d.select.schemas.is_empty() || d.select.schemas.iter().any(|s| s == schema);
+    let by_model = d.select.models.is_empty() || d.select.models.iter().any(|m| m == object);
+    if !(by_tag && by_schema && by_model) {
         return false;
     }
     if d.exclude.models.iter().any(|m| m == object)
@@ -119,7 +123,18 @@ fn lineage(model: &DeployedModel, by_model_name: &IndexMap<&str, String>) -> (Ve
 /// `Source::Connection` on `discover.warehouse`, named like the export; the
 /// tool's and the warehouse's claims carry their origins in `from`
 /// (ADR 0015 §2); overrides win and are `cell.yaml`'s.
-pub fn materialize(def: &mut CellDef, d: &Discover, catalog: &DeployedCatalog) -> Result<()> {
+///
+/// `keep_catalog`: the warehouse connection can address another catalog
+/// (BigQuery: a project), so the synthesized source names the model's own
+/// — `project.dataset.table` — and `verify` reads it from there. A
+/// single-database connection (Postgres, a DuckDB file) gets
+/// `schema.table`.
+pub fn materialize(
+    def: &mut CellDef,
+    d: &Discover,
+    catalog: &DeployedCatalog,
+    keep_catalog: bool,
+) -> Result<()> {
     let names = export_names(d, &catalog.models)?;
     // Route keys by model name, for lineage — computed before the exports
     // so a parent later in the list still resolves.
@@ -206,7 +221,10 @@ pub fn materialize(def: &mut CellDef, d: &Discover, catalog: &DeployedCatalog) -
             source_name.clone(),
             Source::Connection {
                 connection: d.warehouse.clone(),
-                table: Some(m.object.clone()),
+                table: Some(match (&m.catalog, keep_catalog) {
+                    (Some(c), true) => format!("{c}.{}", m.object),
+                    _ => m.object.clone(),
+                }),
                 query: None,
                 incremental: None,
             },
@@ -219,7 +237,7 @@ pub fn materialize(def: &mut CellDef, d: &Discover, catalog: &DeployedCatalog) -
             source: None,
             bind: Some(source_name),
             description,
-            docs: None,
+            docs: o.and_then(|o| o.docs.clone()),
             grain,
             schema,
             freshness: None,
@@ -298,22 +316,60 @@ mod tests {
             let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
             selected(&d, kind, schema, object, &tags)
         };
-        assert!(t("FULL", "marts", "marts.x", &["gold"]));
-        assert!(t("VIEW", "invoice", "invoice.y", &[]));
+        // AND across keys: in `invoice` AND tagged `gold`.
+        assert!(t("FULL", "invoice", "invoice.x", &["gold"]));
+        assert!(
+            !t("FULL", "marts", "marts.x", &["gold"]),
+            "right tag, wrong schema"
+        );
+        assert!(
+            !t("VIEW", "invoice", "invoice.y", &[]),
+            "right schema, no tag"
+        );
         assert!(!t("FULL", "marts", "marts.z", &["silver"]));
         assert!(
-            !t("EXTERNAL", "invoice", "invoice.ext", &[]),
+            !t("EXTERNAL", "invoice", "invoice.ext", &["gold"]),
             "EXTERNAL excluded by default"
         );
-        assert!(!t("SEED", "invoice", "invoice.seed", &[]));
+        assert!(!t("SEED", "invoice", "invoice.seed", &["gold"]));
         assert!(
-            !t("FULL", "invoice", "invoice.scratch", &[]),
+            !t("FULL", "invoice", "invoice.scratch", &["gold"]),
             "explicit exclude wins"
         );
+
+        // A single key: OR within it.
+        let one = discover("from: sqlmesh\nstate: s\nwarehouse: w\nselect:\n  schemas: [a, b]\n");
+        assert!(selected(&one, "FULL", "a", "a.x", &[]) && selected(&one, "FULL", "b", "b.y", &[]));
+        assert!(!selected(&one, "FULL", "c", "c.z", &[]));
 
         let d2 = discover("from: sqlmesh\nstate: s\nwarehouse: w\nselect:\n  schemas: [invoice]\n  kinds: [EXTERNAL]\n");
         assert!(selected(&d2, "EXTERNAL", "invoice", "invoice.ext", &[]));
         assert!(!selected(&d2, "FULL", "invoice", "invoice.y", &[]));
+
+        // The over-selection the beta hit: schemas + tags must intersect.
+        let both = discover("from: sqlmesh\nstate: s\nwarehouse: w\nselect:\n  schemas: [ape_mktg]\n  tags: [adverity]\n");
+        let adverity = ["adverity".to_string()];
+        assert!(!selected(
+            &both,
+            "FULL",
+            "ape_stg_adverity",
+            "ape_stg_adverity.raw",
+            &adverity
+        ));
+        assert!(selected(
+            &both,
+            "FULL",
+            "ape_mktg",
+            "ape_mktg.spend",
+            &adverity
+        ));
+        assert!(!selected(
+            &both,
+            "FULL",
+            "ape_mktg",
+            "ape_mktg.fct_lead",
+            &["qfai".to_string()]
+        ));
     }
 
     #[test]
@@ -378,7 +434,7 @@ mod tests {
             unselected_models: 1,
         };
         let mut def: CellDef = serde_yaml::from_str("cell: c\n").unwrap();
-        materialize(&mut def, &d, &catalog).unwrap();
+        materialize(&mut def, &d, &catalog, false).unwrap();
 
         assert_eq!(def.interface.len(), 2);
         let flights = &def.interface[0];
@@ -413,5 +469,16 @@ mod tests {
         assert_eq!(disc.depends_on_unselected, 1);
         assert_eq!(disc.at, "2026-08-25T04:00:00Z");
         assert_eq!(def.discovered_from.as_ref().unwrap().plan_id, "p1");
+
+        // A catalog-addressing warehouse (BigQuery) keeps the model's own
+        // catalog on the source, so `verify` reads it from there.
+        let mut def2: CellDef = serde_yaml::from_str("cell: c\n").unwrap();
+        materialize(&mut def2, &d, &catalog, true).unwrap();
+        match &def2.sources["inv_flights"] {
+            Source::Connection { table, .. } => {
+                assert_eq!(table.as_deref(), Some("db.inv.flights"))
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

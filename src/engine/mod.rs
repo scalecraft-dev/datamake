@@ -282,6 +282,26 @@ fn setup(
             .with_context(|| format!("setting threads to {threads}"))?;
     }
 
+    // A cell with no materializing transforms (issue #6; every discovered
+    // cell, ADR 0016) never reads or writes its storage or its catalog:
+    // `verify`/`context`/`serve` need neither the object store's
+    // credentials nor its shape. Only the secrets its *sources* need are
+    // registered, and no `lake` is attached at all.
+    if tolerate_missing_catalog {
+        let (uses_s3, uses_gcs) = store_secrets_needed("", b);
+        if uses_s3 || uses_gcs {
+            conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+                .context("loading httpfs extension")?;
+        }
+        if uses_s3 {
+            create_s3_secret(conn, b.s3.as_ref())?;
+        }
+        if uses_gcs {
+            create_gcs_secret(conn, b.gcs.as_ref())?;
+        }
+        return Ok(None);
+    }
+
     let storage = resolve_storage(&b.storage, dir)?;
 
     let (uses_s3, uses_gcs) = store_secrets_needed(&storage, b);
@@ -3463,7 +3483,6 @@ mod tests {
             sources.insert("src".to_string(), ResolvedSource::Raw(uri.to_string()));
         }
         ResolvedBindings {
-            discover_max_age_secs: crate::catalog::record::DEFAULT_MAX_AGE_SECS,
             channels: vec![],
             catalog: None,
             storage: storage.to_string(),

@@ -73,9 +73,11 @@ connections:
   warehouse:
     type: bigquery
     project: dw-main-silver
-discover:
-  max_age: 48h
 ```
+
+`storage:` is required by the profile shape but never read or written for a
+discovered cell — no object-store credentials are needed for `sync`,
+`verify`, `context` or `serve`.
 
 A modeling project usually spans catalogs (`dw-main-bronze`/`silver`/
 `gold` as three BigQuery projects). One BigQuery `warehouse` connection
@@ -91,10 +93,22 @@ store held in Postgres or a DuckDB file is supported; BigQuery/Snowflake
 state stores are not yet. The warehouse can be BigQuery, Postgres, or a
 DuckDB file (Snowflake: not yet).
 
-Cloud SQL IAM authentication is not built in: DuckDB's Postgres scanner
-speaks libpq, so an IAM token is a `${VAR}` password with an hour's life,
-or the Auth Proxy runs beside the job. `sync` runs and exits, so that is a
-job-wrapper concern.
+### Cloud SQL state stores
+
+datamk speaks libpq (DuckDB's Postgres scanner), not the Cloud SQL Python
+connector. The whole recipe:
+
+```bash
+cloud-sql-proxy --auto-iam-authn <project>:<region>:<instance> --port 5432 &
+export SQLMESH_STATE_USER=<your IAM principal>          # a service account's IAM user name
+export SQLMESH_STATE_PASSWORD=$(gcloud auth print-access-token)   # drops .gserviceaccount.com
+datamk sync -f cell.yaml -p prod
+```
+
+with `host: 127.0.0.1`, `port: "5432"`, `sslmode: disable` (the proxy
+terminates TLS locally) on the state connection. In a job, the proxy is a
+sidecar and the token comes from the pod's service account. `sync` runs and
+exits; the token's one-hour life is never a problem.
 
 ## Sync
 
@@ -112,7 +126,9 @@ Next:
   datamk serve   -p prod    # /context + /openapi.json; rows stay in the warehouse
 ```
 
-`sync` is the only step that needs credentials. It reads the state store
+`sync` is the only step that needs credentials. Each BigQuery
+`INFORMATION_SCHEMA` read is one job per (project, dataset) and bills
+BigQuery's 10 MiB-per-table minimum. It reads the state store
 (read-only `SELECT`s over `_versions`, `_environments`, `_snapshots`,
 `_intervals` — no Python, no SQLMesh install) and the warehouse's
 `INFORMATION_SCHEMA` (batched per schema), and writes one file. Everything
@@ -152,12 +168,13 @@ SQLMesh fails loud rather than being misread.
 | verb | on a discovered cell |
 |---|---|
 | `run` | refuses — nothing to build; use `sync` |
-| `verify` | live-checks every export's declared types and grain against the warehouse, exactly like a hand-authored bound export; earns `status: verified_at_source` |
+| `verify` | live-checks every export's types and grain against the warehouse, each read from the model's own project through the jobs API; earns `status: verified_at_source`. The grain check scans the table — mind the bill on large models |
 | `context` | the document, with `discovered_from` and per-export `deployed`; a draft with a note if the record is missing or stale |
 | `serve` | serves `/context` + `/openapi.json`; **refuses to start** without a fresh record (an empty interface with a valid ETag would read as "no exports") |
 | `release` | pins `supported` exports; the meaning ratchet hashes authored prose only, so an upstream description edit moves the ETag, never the release gate |
 | `status` | the plan, sync time, and export count |
 | `attach`, `rollback` | refuse — datamk owns no rows or lineage here |
+| `deploy` | renders a Server only — no Builder CronJob, no init Job (nothing to build); the record ships in the artifact |
 
 ## Versions and contracts
 
@@ -189,8 +206,8 @@ did not — the upstream moved a contract datamk promised; bump the version
       "invoice_amount": { "type": "NUMERIC", "description": "…",
                           "from": { "type": "warehouse", "description": "sqlmesh" } }
     },
-    "query": null,
-    "binding": { "source": "flight_spend", "object": "invoice.flight_spend", "connection": "warehouse" },
+    "binding": { "source": "flight_spend", "object": "dw-main-silver.invoice.flight_spend",
+                 "connection": "warehouse" },
     "depends_on": ["public_advertisers@1", "ui_ui_flights@1"],
     "depends_on_unselected": 2,
     "deployed": { "at": "2026-08-25T04:02:11Z", "model": "dw-main-silver.invoice.flight_spend",
@@ -201,20 +218,65 @@ did not — the upstream moved a contract datamk promised; bump the version
 }
 ```
 
+There is no `query` key: a bound export has no data route (a hand-authored
+one emits `query: null` for the same fact; the field is simply absent
+here). `binding.object` is the model's own project-qualified object on
+BigQuery, the bare `schema.table` on a single-database warehouse.
+
 `deployed` and `discovered_from` are measurements (they carry `at`/
 `synced_at`) and sit outside the interface digest: an upstream tag or cron
 edit never moves the ETag. `description` and `schema` are the interface, so
 an upstream *meaning* change does — correctly. `depends_on` names selected
 parents by route key; unselected ones are a count, never names.
 
-## Staleness
+## Docs pages
 
-The record carries the profile's `max_age` (default 48h). Past it, `serve`
-refuses and `context` says so in `notes[]`. A `cell.yaml` edit or a profile
-switch invalidates it too. Between syncs, a warehouse object altered outside
-a SQLMesh plan is invisible — that window is the price of a serving path
-with no credentials; `verify` on a schedule closes it to the schedule's
-period.
+A discovered export's meaning fields live upstream. The one authored thing
+per export that has no home there is the long-form consumer page — how to
+join it, what not to use it for — and that is `docs:` on an override,
+exactly as on a hand-authored export (ADR 0013): one relative path, under
+the cell directory, 64 KiB per page, 256 KiB per cell.
+
+```
+cells/ape/
+├── cell.yaml
+├── docs/
+│   ├── cell.md                 # cell-level: what this set of models is for
+│   └── paid_media_daily.md     # one page per export that needs one
+└── .cell/deployed_catalog.json # written by sync, never by hand
+```
+
+```yaml
+docs: docs/cell.md
+discover:
+  overrides:
+    - model: ape_mktg.paid_media_daily
+      as: paid_media_daily
+      docs: docs/paid_media_daily.md      # an override may carry docs alone
+```
+
+The page lands in `docs[]` under the export's route key
+(`paid_media_daily@1`), with `content` under `?include=docs`; adding or
+renaming a page moves the digest, editing its prose does not, and `release`
+folds it into the meaning ratchet.
+
+## Deploying, and when the record refreshes
+
+A discovered cell's interface changes when the SQLMesh project's `prod`
+changes, so the pipeline is the contract:
+
+```
+sqlmesh plan prod  →  datamk sync -p prod  →  datamk deploy -p prod
+```
+
+The record `sync` wrote ships inside the deploy artifact; `deploy` renders a
+Server only — no Builder CronJob and no init Job, since there is nothing to
+build. There is deliberately **no clock**: the record is exactly as current
+as the last deploy by construction, and `discovered_from.plan_id` /
+`synced_at` say which plan a reader is looking at. What does invalidate it:
+a `cell.yaml` edit since the sync, or a profile other than the one it was
+synced under — then `serve` refuses to start and `context` says so in
+`notes[]`.
 
 ## Checking the inline-comment extractor against your project
 

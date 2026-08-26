@@ -94,25 +94,40 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
     // consumer of `def.interface`/`def.sources` shares, so `context`,
     // `serve`, `verify`, `release` and `openapi` iterate the same `Vec` a
     // hand-authored cell gives them and never learn a second path.
+    let profile_path = dir.join("profiles").join(format!("{profile}.yaml"));
+    let raw = Bindings::load(&profile_path)?;
     let discovery = match &def.discover {
         None => None,
         Some(d) => {
             let digest = crate::context::cell_yaml_digest_of(file)?;
-            match crate::catalog::record::DeployedCatalogRecord::fresh_for(
-                &dir,
-                &digest,
-                profile,
-                crate::timeutil::unix_now(),
-            ) {
+            match crate::catalog::record::DeployedCatalogRecord::fresh_for(&dir, &digest, profile) {
                 Ok(record) => {
                     let d = d.clone();
-                    crate::catalog::select::materialize(&mut def, &d, &record.catalog)
-                        .with_context(|| {
-                            format!(
-                                "materializing the discovered interface from {}",
-                                crate::catalog::record::DeployedCatalogRecord::path(&dir).display()
-                            )
-                        })?;
+                    // BigQuery addresses other projects through one
+                    // connection; a Postgres/DuckDB connection is one
+                    // database.
+                    let keep_catalog = matches!(
+                        raw.connections.get(&d.warehouse),
+                        Some(schema::Connection::Bigquery(_))
+                    );
+                    crate::catalog::select::materialize(
+                        &mut def,
+                        &d,
+                        &record.catalog,
+                        keep_catalog,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "materializing the discovered interface from {}",
+                            crate::catalog::record::DeployedCatalogRecord::path(&dir).display()
+                        )
+                    })?;
+                    // ADR 0013 caps and path rules apply to an override's
+                    // `docs:` exactly as to an authored export's — checked
+                    // here, since the interface didn't exist at parse time.
+                    docs::validate_all(&dir, &def).with_context(|| {
+                        format!("validating cell definition {}", file.display())
+                    })?;
                     Some(Discovery::Fresh {
                         synced_at: record.catalog.synced_at.clone(),
                         plan_id: record.catalog.plan_id.clone(),
@@ -123,8 +138,6 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
             }
         }
     };
-    let profile_path = dir.join("profiles").join(format!("{profile}.yaml"));
-    let raw = Bindings::load(&profile_path)?;
     let mut bindings = resolve(&def, &raw)?;
     // A relative `type: duckdb` connection path resolves against the cell
     // directory, like every other profile path.
