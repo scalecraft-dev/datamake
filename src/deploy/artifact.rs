@@ -101,22 +101,37 @@ impl CellArtifact {
         } else {
             None
         };
-        let source_check = if dir.join(".cell").join("source_check.json").exists() {
-            Some(read_artifact(dir, ".cell/source_check.json")?)
-        } else {
-            None
+        // The digest-gated sidecars ship only when they attest THIS
+        // `cell.yaml` — a record `serve` would omit as stale has no business
+        // in the artifact (it would still roll the workload's content hash).
+        let digest = crate::context::sha256_hex(&cell_yaml.bytes);
+        let sidecar = |rel: &str| -> Result<Option<ArtifactFile>> {
+            let path = dir.join(rel);
+            if !path.exists() {
+                return Ok(None);
+            }
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let stamped: Option<String> = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| {
+                    v.get("cell_yaml_digest")
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string)
+                });
+            if stamped.as_deref() != Some(digest.as_str()) {
+                tracing::warn!(
+                    file = rel,
+                    "not shipping: its cell_yaml_digest does not match this cell.yaml (stale — \
+                     re-run the command that writes it)"
+                );
+                return Ok(None);
+            }
+            read_artifact(dir, rel).map(Some)
         };
-        let source_descriptions = if dir.join(".cell").join("source_descriptions.json").exists() {
-            Some(read_artifact(dir, ".cell/source_descriptions.json")?)
-        } else {
-            None
-        };
-
-        let deployed_catalog = if dir.join(".cell").join("deployed_catalog.json").exists() {
-            Some(read_artifact(dir, ".cell/deployed_catalog.json")?)
-        } else {
-            None
-        };
+        let source_check = sidecar(".cell/source_check.json")?;
+        let source_descriptions = sidecar(".cell/source_descriptions.json")?;
+        let deployed_catalog = sidecar(".cell/deployed_catalog.json")?;
         let content_hash = content_hash(
             &cell_yaml,
             &sql,
@@ -297,9 +312,24 @@ mod tests {
         assert!(without.source_check.is_none());
 
         std::fs::create_dir_all(dir.join(".cell")).unwrap();
+        // A record stamped with another cell.yaml's digest is stale and
+        // must not ship — `serve` would omit it anyway.
         std::fs::write(
             dir.join(".cell/source_check.json"),
             r#"{"outcome":"passed","checked_at":"t","datamk_version":"v","cell_yaml_digest":"d","profile":"p"}"#,
+        )
+        .unwrap();
+        let stale = CellArtifact::collect(&dir, "cell.yaml", &def).unwrap();
+        assert!(
+            stale.source_check.is_none(),
+            "a stale sidecar must not ship"
+        );
+        let digest = crate::context::cell_yaml_digest_of(&dir.join("cell.yaml")).unwrap();
+        std::fs::write(
+            dir.join(".cell/source_check.json"),
+            format!(
+                r#"{{"outcome":"passed","checked_at":"t","datamk_version":"v","cell_yaml_digest":"{digest}","profile":"p"}}"#
+            ),
         )
         .unwrap();
         let with = CellArtifact::collect(&dir, "cell.yaml", &def).unwrap();

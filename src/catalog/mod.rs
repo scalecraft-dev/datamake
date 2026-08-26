@@ -205,6 +205,17 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
         }
     }
 
+    // A page an override names is validated here — at the step that has
+    // credentials — not first at `context`/`serve`: materialize into a
+    // scratch copy exactly as `config::load` will, and apply ADR 0013's
+    // path and size rules to it.
+    {
+        let mut preview = def.clone();
+        select::materialize(&mut preview, &d, &catalog, false)?;
+        crate::config::docs::validate_all(&dir, &preview)
+            .with_context(|| format!("validating cell definition {}", file.display()))?;
+    }
+
     let record = DeployedCatalogRecord {
         written_at: crate::timeutil::rfc3339_utc(now),
         datamk_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -725,6 +736,39 @@ mod tests {
                 record::Staleness::CellYamlChanged
             ))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_docs_page_fails_at_sync_not_at_serve() {
+        let dir = scaffold("docs", CELL);
+        let file = dir.join("cell.yaml");
+        let absolute = dir.join("docs/documented.md").display().to_string();
+        std::fs::write(
+            &file,
+            CELL.replace("docs: docs/documented.md", &format!("docs: {absolute}")),
+        )
+        .unwrap();
+        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        assert!(
+            err.contains("absolute paths and `..` are rejected"),
+            "{err}"
+        );
+        std::fs::write(
+            &file,
+            CELL.replace("docs: docs/documented.md", "docs: ../outside.md"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("outside.md"), "x").unwrap();
+        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        assert!(
+            err.contains("absolute paths and `..` are rejected"),
+            "{err}"
+        );
+        std::fs::write(dir.join("docs/documented.md"), "x".repeat(70_000)).unwrap();
+        std::fs::write(&file, CELL).unwrap();
+        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        assert!(err.contains("max 65536"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

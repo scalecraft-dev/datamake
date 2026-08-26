@@ -1228,7 +1228,12 @@ pub struct CellLocation {
 /// A binding profile: the environment-specific config for one target (local, prod,
 /// …). Loaded from `profiles/<name>.yaml`, never from `cell.yaml` — the same cell
 /// runs everywhere; only the profile differs. Values may use `${VAR}` for secrets.
+///
+/// Unknown keys are errors: a profile is a closed shape, and a key that
+/// nothing reads (a typo, or a field a release removed — `discover.max_age`
+/// was one) must not pass silently as if it were doing something.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bindings {
     /// Mode by presence (ADR 0004 §11). Present ⇒ direct attach: a local
     /// `.ducklake` file path or a self-managed `sqlite:`/`postgres:` DSN —
