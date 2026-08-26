@@ -754,17 +754,25 @@ mod tests {
             err.contains("absolute paths and `..` are rejected"),
             "{err}"
         );
+        // A page that exists but sits OUTSIDE the cell directory — the file
+        // must really be there, or the read fails before the escape check.
+        let outside = dir.parent().unwrap().join(format!(
+            "outside-{}.md",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&outside, "x").unwrap();
+        let rel = format!("../{}", outside.file_name().unwrap().to_string_lossy());
         std::fs::write(
             &file,
-            CELL.replace("docs: docs/documented.md", "docs: ../outside.md"),
+            CELL.replace("docs: docs/documented.md", &format!("docs: {rel}")),
         )
         .unwrap();
-        std::fs::write(dir.join("outside.md"), "x").unwrap();
         let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
         assert!(
             err.contains("absolute paths and `..` are rejected"),
             "{err}"
         );
+        let _ = std::fs::remove_file(&outside);
         std::fs::write(dir.join("docs/documented.md"), "x".repeat(70_000)).unwrap();
         std::fs::write(&file, CELL).unwrap();
         let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
