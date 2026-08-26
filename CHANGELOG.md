@@ -6,6 +6,25 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Fixed — discovered cells, 0.0.22 re-test
+
+- **`verify` failed on every discovered cell** ("names project … cannot
+  read through the Storage Read API … internal error"): the BigQuery
+  connector's `qualify` refused the project-qualified sources 0.0.21
+  introduced, before classification ever ran. A path naming the
+  connection's own project is the attach read; another project is the
+  jobs-API read, billed to the connection — in `qualify` itself, so every
+  caller gets a working relation.
+- An override's `docs:` page is validated at `sync` (path rules, caps),
+  not first at `context`/`serve`.
+- Profiles are a closed shape: an unknown key such as the removed
+  `discover.max_age` is a parse error, not silently ignored.
+- `deploy` ships a digest-gated sidecar (`source_check`,
+  `source_descriptions`, `deployed_catalog`) only when it attests the
+  current `cell.yaml`; a stale one no longer rides the ConfigMap.
+- Guide: one cell per modeling project; "stale" wording; docs validation
+  verbs.
+
 ### Changed — discovered cells, after the first production run (ADR 0016 amendment 2026-08-26)
 
 - `verify` now reads each discovered export from the model's own catalog:

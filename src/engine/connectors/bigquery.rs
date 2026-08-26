@@ -32,16 +32,34 @@ pub(super) fn attach_sql(project: &str, billing_project: Option<&str>, alias: &s
 
 /// Validate + quote a `dataset.table` path, resolving it under the attach
 /// alias for a DuckDB (Storage Read API) reference.
-pub(super) fn qualify(alias: &str, table: &str) -> Result<String> {
-    let (project, dataset, tbl) = split_table_path(table)?;
-    if let Some(p) = project {
-        // The attach is one project; a foreign object is classified
-        // `Query` and never reaches the Storage Read API path.
-        bail!(
-            "'{table}' names project '{p}', which the attach for this connection cannot read \
-             through the Storage Read API — a `project.dataset.table` source reads through the \
-             jobs API (internal error if this is reached; please report it)"
-        );
+pub(super) fn qualify(
+    alias: &str,
+    project: &str,
+    billing_project: Option<&str>,
+    table: &str,
+) -> Result<String> {
+    let (proj, dataset, tbl) = split_table_path(table)?;
+    match proj {
+        // The connection's own project, spelled out: the attach reads it.
+        None => {}
+        Some(p) if p == project => {}
+        // Another project (ADR 0016 §4): the attach cannot reach it, so the
+        // relation IS the jobs-API read — classification marks such an
+        // object `Query` anyway, and this keeps every caller that only
+        // wants "a relation for this table" (the classification-denied
+        // probe included) working without knowing the difference.
+        Some(_) => {
+            let meta = ObjectMeta {
+                kind: ObjectKind::Query,
+                columns: IndexMap::new(),
+                descriptions: IndexMap::new(),
+            };
+            let google = google_select(project, table, &meta, None)?;
+            return Ok(format!(
+                "({})",
+                wrap_bigquery_query(project, billing_project, &google, false)
+            ));
+        }
     }
     Ok(format!(
         "\"{}\".\"{}\".\"{}\"",
@@ -424,7 +442,7 @@ pub(super) fn read_sql(
     predicate: Option<&CursorPredicate>,
 ) -> Result<String> {
     match meta.kind {
-        ObjectKind::Table => storage_read_sql(alias, table, predicate),
+        ObjectKind::Table => storage_read_sql(alias, project, billing_project, table, predicate),
         ObjectKind::Query => jobs_read_sql(project, billing_project, table, meta, predicate),
     }
 }
@@ -434,10 +452,12 @@ pub(super) fn read_sql(
 /// staging SELECT), so pushdown and every existing test are preserved.
 fn storage_read_sql(
     alias: &str,
+    project: &str,
+    billing_project: Option<&str>,
     table: &str,
     predicate: Option<&CursorPredicate>,
 ) -> Result<String> {
-    let qualified = qualify(alias, table)?;
+    let qualified = qualify(alias, project, billing_project, table)?;
     Ok(match predicate {
         Some(p) => {
             let cq = p.cursor.replace('"', "\"\"");
@@ -756,7 +776,7 @@ mod tests {
     #[test]
     fn bigquery_qualify_accepts_dataset_table() {
         assert_eq!(
-            qualify("__conn_crm", "sales.accounts").unwrap(),
+            qualify("__conn_crm", "crm-proj", None, "sales.accounts").unwrap(),
             "\"__conn_crm\".\"sales\".\"accounts\""
         );
     }
@@ -764,7 +784,7 @@ mod tests {
     #[test]
     fn bigquery_qualify_quotes_identifiers() {
         assert_eq!(
-            qualify("__conn_crm", "sa\"les.acc\"ounts").unwrap(),
+            qualify("__conn_crm", "crm-proj", None, "sa\"les.acc\"ounts").unwrap(),
             "\"__conn_crm\".\"sa\"\"les\".\"acc\"\"ounts\""
         );
     }
@@ -772,14 +792,33 @@ mod tests {
     #[test]
     fn bigquery_qualify_rejects_one_and_three_part_names() {
         for bad in ["accounts", "sales.", ".accounts", ""] {
-            let err = qualify("__conn_crm", bad).unwrap_err().to_string();
+            let err = qualify("__conn_crm", "crm-proj", None, bad)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("dataset.table"), "for '{bad}': {err}");
         }
-        // A three-part name is legal for the jobs path, never for the attach.
-        let err = qualify("__conn_crm", "proj.sales.accounts")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("jobs API"), "{err}");
+        // The connection's own project spelled out is the attach path;
+        // another project is the jobs-API read, billed to the connection.
+        assert_eq!(
+            qualify("__conn_crm", "crm-proj", None, "crm-proj.sales.accounts").unwrap(),
+            "\"__conn_crm\".\"sales\".\"accounts\""
+        );
+        let foreign = qualify(
+            "__conn_crm",
+            "crm-proj",
+            Some("bill"),
+            "other.sales.accounts",
+        )
+        .unwrap();
+        assert!(
+            foreign.starts_with("(SELECT * FROM bigquery_query('crm-proj'"),
+            "{foreign}"
+        );
+        assert!(
+            foreign.contains("`other.sales.accounts`")
+                && foreign.contains("billing_project := 'bill'"),
+            "{foreign}"
+        );
     }
 
     // --- read_sql: storage path (Part 2) -----------------------------------

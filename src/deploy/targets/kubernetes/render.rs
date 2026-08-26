@@ -836,9 +836,15 @@ mod tests {
             std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
             std::fs::copy(&src, &dst).unwrap();
         }
+        let digest = crate::context::cell_yaml_digest_of(&scratch.join("cell.yaml")).unwrap();
+        let record = |checked_at: &str| {
+            format!(
+                r#"{{"outcome":"passed","checked_at":"{checked_at}","datamk_version":"0.0.14","cell_yaml_digest":"{digest}","profile":"prod"}}"#
+            )
+        };
         std::fs::write(
             scratch.join(".cell/source_check.json"),
-            r#"{"outcome":"passed","checked_at":"2026-08-10T00:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod"}"#,
+            record("2026-08-10T00:00:00Z"),
         )
         .unwrap();
 
@@ -848,7 +854,7 @@ mod tests {
         };
         std::fs::write(
             scratch.join(".cell/source_check.json"),
-            r#"{"outcome":"passed","checked_at":"2026-08-10T00:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod"}"#,
+            record("2026-08-10T00:00:00Z"),
         )
         .unwrap();
         let art_with = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();
@@ -867,7 +873,7 @@ mod tests {
         // A second, later checked_at (a re-verify) must also move the hash.
         std::fs::write(
             scratch.join(".cell/source_check.json"),
-            r#"{"outcome":"passed","checked_at":"2026-08-10T01:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod"}"#,
+            record("2026-08-10T01:00:00Z"),
         )
         .unwrap();
         let art_later = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();
@@ -906,9 +912,12 @@ mod tests {
         }
 
         let art_without = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();
+        let digest = crate::context::cell_yaml_digest_of(&scratch.join("cell.yaml")).unwrap();
         std::fs::write(
             scratch.join(".cell/source_descriptions.json"),
-            r#"{"written_at":"2026-08-10T00:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"x","profile":"prod","sources":{"raw":{"amount":"Gross order amount before tax."}}}"#,
+            format!(
+                r#"{{"written_at":"2026-08-10T00:00:00Z","datamk_version":"0.0.14","cell_yaml_digest":"{digest}","profile":"prod","sources":{{"raw":{{"amount":"Gross order amount before tax."}}}}}}"#
+            ),
         )
         .unwrap();
         let art_with = CellArtifact::collect(&scratch, "cell.yaml", &def).unwrap();

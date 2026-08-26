@@ -50,13 +50,15 @@ access:
 `discover:` and any of `sources:`/`transforms:`/`interface:` together is
 a parse error: a discovered cell computes nothing and authors no export
 list. `select` has no "everything" default — an interface is an explicit
-export list, and a 2,000-model DAG is not one. A project becomes several
-narrow cells (one per schema, tag, or team), composed in `datamk.yaml` like
-any others.
+export list, and a 2,000-model DAG is not one. The shape that shipped is
+**one cell per modeling project**, its `select` naming the models that
+project publishes; a project whose models serve unrelated consumers can be
+split into several cells, composed in `datamk.yaml` like any others.
 
 The profile names two connections — the tool's **state store** and the
-**warehouse** where the deployed objects live — plus how old the sync
-record may get:
+**warehouse** where the deployed objects live. A profile is a closed
+shape: an unknown key (a typo, or a field a release removed) is a parse
+error, never silently ignored.
 
 ```yaml
 # profiles/prod.yaml
@@ -169,7 +171,7 @@ SQLMesh fails loud rather than being misread.
 |---|---|
 | `run` | refuses — nothing to build; use `sync` |
 | `verify` | live-checks every export's types and grain against the warehouse, each read from the model's own project through the jobs API; earns `status: verified_at_source`. The grain check scans the table — mind the bill on large models |
-| `context` | the document, with `discovered_from` and per-export `deployed`; a draft with a note if the record is missing or stale |
+| `context` | the document, with `discovered_from` and per-export `deployed`; a draft with a note if the record is missing, or was synced from a different `cell.yaml` or profile |
 | `serve` | serves `/context` + `/openapi.json`; **refuses to start** without a fresh record (an empty interface with a valid ETag would read as "no exports") |
 | `release` | pins `supported` exports; the meaning ratchet hashes authored prose only, so an upstream description edit moves the ETag, never the release gate |
 | `status` | the plan, sync time, and export count |
@@ -258,7 +260,9 @@ discover:
 The page lands in `docs[]` under the export's route key
 (`paid_media_daily@1`), with `content` under `?include=docs`; adding or
 renaming a page moves the digest, editing its prose does not, and `release`
-folds it into the meaning ratchet.
+folds it into the meaning ratchet. A page that breaks the rules (outside
+the cell directory, absolute, over the cap) fails `sync` — the step that
+has credentials — as well as `context` and `serve`.
 
 ## Deploying, and when the record refreshes
 

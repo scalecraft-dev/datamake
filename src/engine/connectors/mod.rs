@@ -348,7 +348,11 @@ impl ResolvedConnection {
     /// wrapper for Snowflake (ADR 0009 §1a — there is no attach).
     pub fn qualify(&self, alias: &str, table: &str) -> Result<String> {
         match self {
-            ResolvedConnection::Bigquery { .. } => bigquery::qualify(alias, table),
+            ResolvedConnection::Bigquery {
+                project,
+                billing_project,
+                ..
+            } => bigquery::qualify(alias, project, billing_project.as_deref(), table),
             ResolvedConnection::Postgres { .. } => postgres::qualify(alias, table),
             ResolvedConnection::Snowflake { database, .. } => {
                 snowflake::qualify(alias, database, table)
