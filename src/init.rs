@@ -113,13 +113,12 @@ connections:
   warehouse:
     type: duckdb
     path: ../my-sqlmesh-project/db.db   # where the deployed models' objects live
-# discover:
-#   max_age: 48h                 # how old .cell/deployed_catalog.json may be before
-#                                # `serve` refuses it (default 48h)
 "#;
 
 const DISCOVERED_PROFILE_PROD: &str = r#"# Binding profile: prod. Environment-specific; values may reference ${VARS}.
-storage: gs://your-bucket/cells/this-cell   # published-artifact mode: no `catalog:`
+# A discovered cell materializes nothing: `storage:` is never read or written
+# (no object-store credentials are needed), and there is no `catalog:`.
+storage: gs://your-bucket/cells/this-cell
 channels:
   - "Rows live in the warehouse; see each export's binding.object. Request access: <your link>"
 connections:
@@ -129,11 +128,9 @@ connections:
     database: sqlmesh
     user: ${SQLMESH_STATE_USER}
     password: ${SQLMESH_STATE_PASSWORD}
-  warehouse:                      # the deployed models' objects
-    type: bigquery
+  warehouse:                      # the deployed models' objects; models in other
+    type: bigquery                # projects are read from their own, billed here
     project: ${GCP_PROJECT}
-discover:
-  max_age: 48h
 "#;
 
 fn write(path: &Path, contents: &str) -> Result<()> {

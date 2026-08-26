@@ -294,15 +294,12 @@ so a fresh sync reaches a pod by rollout.
 (`src/engine/mod.rs:361-369`), and `attach`/`rollback`/`status` assume it.
 Two artifact kinds in a layout that knows one is the wrong trade.
 
-**Freshness.** `fresh_for` keys on `(cell_yaml_digest, profile)` — correct
-for the existing sidecars, useless here: a discovered cell's `cell.yaml`
-never changes when the SQLMesh project does. So the record additionally
-carries `max_age` (profile-bound, default `48h`), and:
-
-- `serve` **refuses to start** on a missing or expired record — never an
-  empty interface with a valid ETag (ADR 0014 §6, startup is strict).
-- `context` emits the document with `status: draft` and an engine note
-  naming the age, so a stale portable artifact says so.
+**Freshness.** `fresh_for` keys on `(cell_yaml_digest, profile)` and
+nothing else — see the 2026-08-26 amendment, which removed the `max_age`
+clock this section originally carried. `serve` **refuses to start** on a
+missing or invalidated record — never an empty interface with a valid ETag
+(ADR 0014 §6, startup is strict); `context` emits `status: draft` with an
+engine note naming why.
 
 The staleness window is a named property of the design: a warehouse object
 altered outside a SQLMesh plan is invisible until the next `sync` or
@@ -520,3 +517,46 @@ DAG, not a catalog of it.
    competitor. Falsifier: the target agents all hold warehouse access; then
    the delta shrinks to lineage, intervals, plan pinning, and grain, and
    the artifact is still worth having but the cell wrapper is not.
+
+## Amendment (2026-08-26): the first production run
+
+Six change requests from running `0.0.20` against two SQLMesh projects
+(the 1,969-model monorepo and a 93-model project; cross-catalog selection,
+Cloud SQL state through the Auth Proxy). Landed in `0.0.21`:
+
+1. **`verify` reads each export from the model's own catalog.** `sync`
+   already did; `verify`'s bind path classified everything against the
+   connection's project. A discovered export's synthesized source now
+   carries `project.dataset.table` when the warehouse is BigQuery, and the
+   BigQuery connector accepts a three-part path: classified in its own
+   project's `INFORMATION_SCHEMA`, billed to the connection, and always
+   read through the jobs API (the attach is one project). `binding.object`
+   is therefore project-qualified on BigQuery — the verbatim source, as
+   ADR 0012 requires.
+2. **`overrides[].docs`** — the one authored thing per export with no home
+   upstream (ADR 0013 rules unchanged; validated after materialization).
+3. **`select` is AND across keys**, as §1 always said; the code OR'd them
+   and over-selected silently into other catalogs.
+4. **No storage for a cell that materializes nothing.** `verify`,
+   `context` and `serve` on a no-snapshot cell register no store secrets,
+   attach no catalog, and never touch `storage:` — so a `gs://` profile
+   needs no HMAC pair and a local one no `catalog:`.
+5. **The record refreshes on deploy, and only on deploy — `max_age` is
+   removed.** The deploy is downstream of `sqlmesh plan`: `plan prod` →
+   `sync` → `deploy`. The record is as current as the last deploy by
+   construction, `discovered_from.{plan_id, synced_at}` name the plan, and
+   a clock could only produce false alarms. `deploy` renders a Server only
+   for a no-snapshot cell (no Builder CronJob, no init Job). The polling/
+   runtime-reload shape (a sync CronJob writing to storage, `serve`
+   swapping the interface) was considered and rejected: it is a second
+   refresh path for a cell whose interface is supposed to move exactly
+   when the upstream deploys.
+6. Guide: Cloud SQL recipe promoted to a section; the emitted document has
+   no `query` key on a bound export; docs on discovered cells; the scaffold's
+   `gs://` profile no longer implies `gcs:` credentials.
+
+What held without change: cross-catalog sync through one connection,
+IAM-token state attach through the proxy, provenance (191/191 columns from
+the tool on the smaller project; 52/55 honestly `none` on the monorepo
+slice), in-cell lineage, and the refusal semantics.
+

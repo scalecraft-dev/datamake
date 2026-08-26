@@ -33,7 +33,16 @@ pub(super) fn attach_sql(project: &str, billing_project: Option<&str>, alias: &s
 /// Validate + quote a `dataset.table` path, resolving it under the attach
 /// alias for a DuckDB (Storage Read API) reference.
 pub(super) fn qualify(alias: &str, table: &str) -> Result<String> {
-    let (dataset, tbl) = split_dataset_table(table)?;
+    let (project, dataset, tbl) = split_table_path(table)?;
+    if let Some(p) = project {
+        // The attach is one project; a foreign object is classified
+        // `Query` and never reaches the Storage Read API path.
+        bail!(
+            "'{table}' names project '{p}', which the attach for this connection cannot read \
+             through the Storage Read API — a `project.dataset.table` source reads through the \
+             jobs API (internal error if this is reached; please report it)"
+        );
+    }
     Ok(format!(
         "\"{}\".\"{}\".\"{}\"",
         quote(alias),
@@ -42,15 +51,21 @@ pub(super) fn qualify(alias: &str, table: &str) -> Result<String> {
     ))
 }
 
-/// `dataset.table` — exactly two non-empty dot-separated parts; the project
-/// comes from the connection, never a third part.
-fn split_dataset_table(table: &str) -> Result<(&str, &str)> {
+/// `dataset.table`, or `project.dataset.table` for an object in another
+/// project read through this connection (ADR 0016 §4: a modeling project's
+/// catalogs). A three-part path always routes through the jobs API, billed
+/// to the connection — the attach (Storage Read API) is one project.
+pub(super) fn split_table_path(table: &str) -> Result<(Option<&str>, &str, &str)> {
     match table.split('.').collect::<Vec<_>>().as_slice() {
-        [dataset, tbl] if !dataset.is_empty() && !tbl.is_empty() => Ok((dataset, tbl)),
+        [dataset, tbl] if !dataset.is_empty() && !tbl.is_empty() => Ok((None, dataset, tbl)),
+        [project, dataset, tbl]
+            if !project.is_empty() && !dataset.is_empty() && !tbl.is_empty() =>
+        {
+            Ok((Some(project), dataset, tbl))
+        }
         _ => bail!(
-            "bigquery source table must be `dataset.table`, got '{table}' \
-             (the project comes from the connection; a cross-project read \
-             is a second connection, not a three-part name)"
+            "bigquery source table must be `dataset.table` (the connection's project) or \
+             `project.dataset.table`, got '{table}'"
         ),
     }
 }
@@ -63,7 +78,7 @@ pub(super) fn point_adc_at(path: &str) {
 }
 
 /// A BigQuery identifier for GoogleSQL backtick-quoting. A backtick in the
-/// identifier is rejected rather than escaped — `qualify()`/`split_dataset_table`
+/// identifier is rejected rather than escaped — `qualify()`/`split_table_path`
 /// already constrain table-path shape, so a backtick here can only be an
 /// operator error (or something adversarial) worth surfacing loudly, not
 /// silently working around.
@@ -84,15 +99,31 @@ pub(super) fn classify_objects(
     billing_project: Option<&str>,
     tables: &[&str],
 ) -> Result<IndexMap<String, ObjectMeta>> {
-    let mut by_dataset: IndexMap<&str, Vec<(&str, &str)>> = IndexMap::new();
+    // Batched per (project, dataset): a three-part path reads its own
+    // project's INFORMATION_SCHEMA, billed to the connection's billing
+    // project (else its project) — never to the foreign project.
+    let mut by_dataset: IndexMap<(&str, &str), Vec<(&str, &str)>> = IndexMap::new();
     for &t in tables {
-        let (dataset, tbl) = split_dataset_table(t)?;
-        by_dataset.entry(dataset).or_default().push((t, tbl));
+        let (proj, dataset, tbl) = split_table_path(t)?;
+        by_dataset
+            .entry((proj.unwrap_or(project), dataset))
+            .or_default()
+            .push((t, tbl));
     }
 
+    let billing = billing_project.unwrap_or(project);
     let mut out = IndexMap::new();
-    for (dataset, group) in by_dataset {
-        classify_one_dataset(conn, project, billing_project, dataset, &group, &mut out)?;
+    for ((proj, dataset), group) in by_dataset {
+        classify_one_dataset(conn, proj, Some(billing), dataset, &group, &mut out)?;
+        if proj != project {
+            // The attach is the connection's project: a foreign object can
+            // only be read through the jobs API, whatever its table type.
+            for (whole, _) in &group {
+                if let Some(m) = out.get_mut(*whole) {
+                    m.kind = ObjectKind::Query;
+                }
+            }
+        }
     }
     Ok(out)
 }
@@ -430,8 +461,8 @@ fn google_select(
     meta: &ObjectMeta,
     predicate: Option<&CursorPredicate>,
 ) -> Result<String> {
-    let (dataset, tbl) = split_dataset_table(table)?;
-    let proj_ident = bq_ident(project)?;
+    let (proj, dataset, tbl) = split_table_path(table)?;
+    let proj_ident = bq_ident(proj.unwrap_or(project))?;
     let ds_ident = bq_ident(dataset)?;
     let tbl_ident = bq_ident(tbl)?;
 
@@ -740,10 +771,15 @@ mod tests {
 
     #[test]
     fn bigquery_qualify_rejects_one_and_three_part_names() {
-        for bad in ["accounts", "proj.sales.accounts", "sales.", ".accounts", ""] {
+        for bad in ["accounts", "sales.", ".accounts", ""] {
             let err = qualify("__conn_crm", bad).unwrap_err().to_string();
             assert!(err.contains("dataset.table"), "for '{bad}': {err}");
         }
+        // A three-part name is legal for the jobs path, never for the attach.
+        let err = qualify("__conn_crm", "proj.sales.accounts")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("jobs API"), "{err}");
     }
 
     // --- read_sql: storage path (Part 2) -----------------------------------
@@ -1193,6 +1229,50 @@ mod tests {
                 "must default to warn-and-proceed, not gate: {msg}"
             );
         }
+    }
+
+    /// ADR 0016 §4: a three-part path reads its own project through the
+    /// jobs API, billed to the connection.
+    #[test]
+    fn three_part_paths_route_to_their_own_project() {
+        assert_eq!(
+            split_table_path("dw-main-bronze.ape_stg.calls").unwrap(),
+            (Some("dw-main-bronze"), "ape_stg", "calls")
+        );
+        assert_eq!(split_table_path("ds.t").unwrap(), (None, "ds", "t"));
+        assert!(split_table_path("a.b.c.d").is_err());
+        let meta = ObjectMeta {
+            kind: ObjectKind::Query,
+            columns: IndexMap::new(),
+            descriptions: IndexMap::new(),
+        };
+        let sql = google_select(
+            "dw-main-silver",
+            "dw-main-bronze.ape_stg.calls",
+            &meta,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT * FROM `dw-main-bronze.ape_stg.calls`");
+        let sql = google_select("dw-main-silver", "ape_stg.calls", &meta, None).unwrap();
+        assert_eq!(sql, "SELECT * FROM `dw-main-silver.ape_stg.calls`");
+        // The jobs wrapper still bills the connection's project.
+        let wrapped = jobs_read_sql(
+            "dw-main-silver",
+            None,
+            "dw-main-bronze.ape_stg.calls",
+            &meta,
+            None,
+        )
+        .unwrap();
+        assert!(
+            wrapped.contains("bigquery_query('dw-main-silver'"),
+            "{wrapped}"
+        );
+        assert!(
+            wrapped.contains("`dw-main-bronze.ape_stg.calls`"),
+            "{wrapped}"
+        );
     }
 
     #[test]

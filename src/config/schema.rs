@@ -180,6 +180,12 @@ pub struct Override {
     /// carried alongside (one home per fact, ADR 0015 §2).
     #[serde(default)]
     pub description: Option<String>,
+    /// A long-form consumer page for this export (ADR 0013), the one
+    /// authored thing per export that has no home upstream — served under
+    /// the export's route key exactly as for a hand-authored export. Same
+    /// path rules and caps.
+    #[serde(default)]
+    pub docs: Option<String>,
 }
 
 /// The tool-side facts of one discovered export (ADR 0016 §7): a measured
@@ -1259,19 +1265,6 @@ pub struct Bindings {
     /// real one in prod.
     #[serde(default)]
     pub connections: IndexMap<String, Connection>,
-    /// ADR 0016 §5: how old a `.cell/deployed_catalog.json` may be before
-    /// `serve` refuses it and `context` reports it stale. Environment — a
-    /// prod cell resynced hourly and a laptop resynced weekly differ here.
-    #[serde(default)]
-    pub discover: Option<DiscoverBinding>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DiscoverBinding {
-    /// `48h` (default), `7d`, `30m`…
-    #[serde(default)]
-    pub max_age: Option<String>,
 }
 
 // Connector config shapes live in `config::connections` (one module per

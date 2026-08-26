@@ -19,9 +19,6 @@ pub struct ResolvedBindings {
     /// Operator hints for where rows live when not served over HTTP
     /// (ADR 0012 §4) — pass-through environment strings, env-expanded.
     pub channels: Vec<String>,
-    /// ADR 0016 §5: the profile's `discover.max_age`, in seconds (default
-    /// `catalog::record::DEFAULT_MAX_AGE_SECS`).
-    pub discover_max_age_secs: u64,
 }
 
 /// A source with env references expanded.
@@ -354,13 +351,7 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
         );
     }
 
-    let discover_max_age_secs = match b.discover.as_ref().and_then(|d| d.max_age.as_deref()) {
-        Some(raw) => crate::catalog::record::parse_duration(&expand(raw)?)
-            .map_err(|e| e.context("profile `discover.max_age`"))?,
-        None => crate::catalog::record::DEFAULT_MAX_AGE_SECS,
-    };
     Ok(ResolvedBindings {
-        discover_max_age_secs,
         catalog: expand_opt(&b.catalog)?,
         storage,
         s3,
@@ -660,7 +651,6 @@ mod tests {
             principals: None,
             cells,
             connections: IndexMap::new(),
-            discover: None,
         }
     }
 
@@ -692,7 +682,6 @@ mod tests {
             principals: None,
             cells: IndexMap::new(),
             connections: IndexMap::new(),
-            discover: None,
         };
         let r = resolve(&def, &b).unwrap();
         match r.sources.get("raw").unwrap() {
@@ -754,7 +743,6 @@ mod tests {
             principals: None,
             cells: IndexMap::new(),
             connections: IndexMap::new(),
-            discover: None,
         };
         let err = resolve(&def, &b).unwrap_err().to_string();
         assert!(err.contains("missing"), "unexpected error: {err}");
@@ -783,7 +771,6 @@ mod tests {
             }),
         );
         let b = Bindings {
-            discover: None,
             channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
@@ -839,7 +826,6 @@ mod tests {
             }),
         );
         let b = Bindings {
-            discover: None,
             channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
@@ -894,7 +880,6 @@ mod tests {
             principals: None,
             cells: IndexMap::new(),
             connections: IndexMap::new(),
-            discover: None,
         };
         let err = resolve(&def, &b).unwrap_err().to_string();
         assert!(err.contains("connections.crm"), "unexpected error: {err}");
@@ -913,7 +898,6 @@ mod tests {
             }),
         );
         Bindings {
-            discover: None,
             channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
@@ -1054,7 +1038,6 @@ mod tests {
             }),
         );
         Bindings {
-            discover: None,
             channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
@@ -1171,7 +1154,6 @@ mod tests {
             }),
         );
         Bindings {
-            discover: None,
             channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
@@ -1228,7 +1210,6 @@ mod tests {
             }),
         );
         Bindings {
-            discover: None,
             channels: vec![],
             catalog: Some("c".into()),
             storage: "s".into(),
@@ -1534,7 +1515,6 @@ mod tests {
             principals: None,
             cells: IndexMap::new(),
             connections: IndexMap::new(),
-            discover: None,
         };
         let r = resolve(&def, &b).unwrap();
         let s3 = r.s3.unwrap();
@@ -1573,7 +1553,6 @@ mod tests {
             principals: None,
             cells: IndexMap::new(),
             connections: IndexMap::new(),
-            discover: None,
         };
         let r = resolve(&def, &b).unwrap();
         let gcs = r.gcs.unwrap();

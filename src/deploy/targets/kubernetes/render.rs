@@ -654,6 +654,13 @@ fn render_deployment(input: &RenderInput) -> Deployment {
 /// `schedule` — serve-only, no CronJob. No checksum annotations: the CronJob
 /// gets a fresh pod (and a fresh ConfigMap/Secret mount) every run regardless.
 fn render_cronjob(input: &RenderInput) -> Option<CronJob> {
+    // No Builder for a cell with nothing to build (an all-bound or
+    // discovered cell, ADR 0016 §5): `run` would refuse inside the pod. A
+    // discovered cell's interface is refreshed by the deploy that follows a
+    // `sqlmesh plan`, not by a schedule.
+    if input.all_bound {
+        return None;
+    }
     let schedule = input.k8s.schedule.clone()?;
 
     let container = Container {
