@@ -6,6 +6,13 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added — `serve` shuts down gracefully on SIGTERM/SIGINT
+
+Stops accepting, drains in-flight requests for up to `--drain-timeout`
+seconds (default 10), exits 0; one log line on receipt and one on exit. A
+container with `datamk serve` as PID 1 previously ignored SIGTERM and was
+SIGKILLed after the full grace period — mid-request — on every rollout.
+
 ### Fixed — discovered cells, 0.0.22 re-test
 
 - **`verify` failed on every discovered cell** ("names project … cannot

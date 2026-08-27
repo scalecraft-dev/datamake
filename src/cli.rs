@@ -386,4 +386,11 @@ pub struct ServeArgs {
     /// alone. There is no per-cell way to turn it off.
     #[arg(long)]
     pub no_data: bool,
+    /// On SIGTERM/SIGINT: stop accepting connections, finish in-flight
+    /// requests for up to this many seconds, then exit 0 — the shape a
+    /// rollout, scale-down, or node drain expects behind a readiness probe.
+    /// Requests still open when the drain expires are dropped, with a
+    /// warning. Keep it under the orchestrator's termination grace period.
+    #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+    pub drain_timeout: u64,
 }

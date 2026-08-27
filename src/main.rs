@@ -109,6 +109,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     a.poll_interval,
                     a.max_concurrency,
                     a.no_data,
+                    a.drain_timeout,
                 )
                 .await
             } else {
@@ -120,6 +121,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     a.poll_interval,
                     a.max_concurrency,
                     a.no_data,
+                    a.drain_timeout,
                 )
                 .await
             }

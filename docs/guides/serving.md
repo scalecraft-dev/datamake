@@ -155,6 +155,20 @@ digest regardless of which variant produced them. Both `/context` and
 all-or-nothing, and a shared cache keyed on URI alone could otherwise hand
 a cached 200 to a caller with no token.
 
+## Stopping
+
+`serve` handles `SIGTERM` and `SIGINT`: it stops accepting connections
+(so a readiness probe on `/` fails from that moment and an orchestrator
+routes new traffic elsewhere), finishes in-flight requests for up to
+`--drain-timeout` seconds (default 10), and exits 0. Requests still open
+when the drain expires are dropped, with a warning. One log line on
+receipt, one on exit.
+
+Run it as PID 1 (`exec datamk serve …`) — no init shim or signal-forwarding
+wrapper is needed — and keep `--drain-timeout` under the orchestrator's
+termination grace period (Kubernetes: `terminationGracePeriodSeconds`,
+30 s by default).
+
 ## Throttling
 
 `serve` applies one concurrency cap per served cell (`--max-concurrency`,

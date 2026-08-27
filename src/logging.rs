@@ -384,6 +384,7 @@ mod tests {
             poll_interval: 15,
             max_concurrency: crate::serve::DEFAULT_MAX_CONCURRENCY,
             no_data: false,
+            drain_timeout: 10,
         });
 
         assert_eq!(command_name(&run), Some("run"));
