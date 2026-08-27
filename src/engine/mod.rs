@@ -268,7 +268,25 @@ fn setup(
     // cells.
     let mem = match &budget.memory_limit {
         Some(m) => Some(m.clone()),
-        None => std::env::var("DATAMK_MEMORY_LIMIT").ok(),
+        None => std::env::var("DATAMK_MEMORY_LIMIT")
+            .ok()
+            .filter(|m| !m.is_empty())
+            .or_else(|| {
+                // In a container, DuckDB's default (a fraction of HOST RAM)
+                // is the wrong number: the kernel kills the process at the
+                // cgroup limit long before DuckDB would spill. Default to
+                // 75% of the cgroup's limit when one is set.
+                cgroup_memory_limit_bytes().map(|limit| {
+                    let mb = limit / 4 * 3 / (1024 * 1024);
+                    tracing::info!(
+                        cgroup_limit_bytes = limit,
+                        memory_limit = %format!("{mb}MB"),
+                        "container memory limit detected — DuckDB memory_limit defaults to 75% \
+                         of it (override with DATAMK_MEMORY_LIMIT)"
+                    );
+                    format!("{mb}MB")
+                })
+            }),
     };
     if let Some(mem) = mem.filter(|m| !m.is_empty()) {
         conn.execute_batch(&format!("SET memory_limit = '{}';", esc(&mem)))
@@ -450,6 +468,57 @@ fn load_catalog_extension(conn: &Connection, catalog: &str) -> Result<()> {
     conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
         .with_context(|| format!("loading DuckDB '{ext}' extension for catalog '{catalog}'"))?;
     Ok(())
+}
+
+/// `datamk debug install-extensions`: fetch every extension the engine may
+/// `INSTALL` at first use into DuckDB's extension directory for this
+/// user, so an image bakes them and a pod never reaches the registry.
+pub fn install_extensions() -> Result<()> {
+    let conn = Connection::open_in_memory().context("opening an in-memory DuckDB")?;
+    for stmt in [
+        "INSTALL ducklake;",
+        "INSTALL httpfs;",
+        "INSTALL json;",
+        "INSTALL postgres;",
+        "INSTALL sqlite;",
+        "INSTALL bigquery FROM community;",
+    ] {
+        conn.execute_batch(stmt).with_context(|| {
+            format!("running `{stmt}` (needs network to the extension registry)")
+        })?;
+        eprintln!("ok  {stmt}");
+    }
+    Ok(())
+}
+
+/// The container's memory limit, if this process runs under one: cgroup v2
+/// `memory.max`, else v1 `memory.limit_in_bytes`. `None` on a host without
+/// a limit (`max`, or a v1 sentinel in the exabytes) or outside Linux.
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    cgroup_memory_limit_from(
+        std::path::Path::new("/sys/fs/cgroup/memory.max"),
+        std::path::Path::new("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    )
+}
+
+fn cgroup_memory_limit_from(v2: &Path, v1: &Path) -> Option<u64> {
+    for path in [v2, v1] {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw == "max" {
+            return None;
+        }
+        if let Ok(n) = raw.parse::<u64>() {
+            // v1 reports an enormous sentinel when unlimited.
+            if n < (1u64 << 60) && n > 0 {
+                return Some(n);
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Which store secrets `setup` must register: `(s3, gcs)`. Per scheme in
@@ -3354,6 +3423,32 @@ fn resolve_local(p: &str, dir: &Path, is_dir: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_memory_limit_reads_v2_then_v1_and_ignores_unlimited() {
+        let dir = std::env::temp_dir().join(format!("datamk-cgroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v2 = dir.join("memory.max");
+        let v1 = dir.join("memory.limit_in_bytes");
+        std::fs::write(&v2, "2147483648\n").unwrap();
+        assert_eq!(cgroup_memory_limit_from(&v2, &v1), Some(2_147_483_648));
+        std::fs::write(&v2, "max\n").unwrap();
+        assert_eq!(cgroup_memory_limit_from(&v2, &v1), None);
+        std::fs::remove_file(&v2).unwrap();
+        std::fs::write(&v1, "9223372036854771712\n").unwrap();
+        assert_eq!(
+            cgroup_memory_limit_from(&v2, &v1),
+            None,
+            "v1 unlimited sentinel"
+        );
+        std::fs::write(&v1, "1073741824").unwrap();
+        assert_eq!(cgroup_memory_limit_from(&v2, &v1), Some(1_073_741_824));
+        assert_eq!(
+            cgroup_memory_limit_from(&dir.join("nope"), &dir.join("nope2")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn esc_doubles_single_quotes() {

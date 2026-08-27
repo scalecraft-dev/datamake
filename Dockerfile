@@ -91,4 +91,11 @@ ENV SNOWFLAKE_ADBC_DRIVER_PATH=/usr/local/lib/libadbc_driver_snowflake.so
 # persistent-file-log feature in the deployed image; a local/dev invocation
 # of this same binary outside the image still gets it by default.
 ENV DATAMK_LOG=off
+# Bake every DuckDB extension the engine may INSTALL at first use (~200 MB:
+# ducklake, httpfs, json, postgres, sqlite, community bigquery) into the
+# image, so a pod needs no registry egress and no exec-capable scratch
+# filesystem at start-up. DuckDB looks them up under $HOME/.duckdb; the
+# image runs as root, so that is /root. A deployment that runs as another
+# user must set HOME (or DUCKDB extension_directory) accordingly.
+RUN datamk debug install-extensions
 ENTRYPOINT ["datamk"]

@@ -47,6 +47,25 @@ and `/openapi.json`'s `info.version`. Requesting `?include=docs` (below)
 gets its own `ETag` variant, so caching stays correct per variant; the
 digest itself never moves for a prose-only change.
 
+## One export at a time
+
+An agent answering one question wants one export's contract and page, not
+the whole cell. `GET /context/<route>` is the same document narrowed to
+that export — `exports[]` of length one, `docs[]` reduced to the cell page
+and that export's — with its own `ETag` variant and `?include=docs` working
+as on `/context`:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://orders.data.internal/context/orders_daily@2?include=docs"
+datamk context -f cell.yaml --export orders_daily@2        # the portable twin
+```
+
+Bound exports (no data route) are addressable here too. An unknown route is
+a 404 whose body names the routes that exist. `/openapi.json` advertises the
+path with `route` enumerated from the discoverable exports. The query
+grammar stays closed: unknown parameters are still 400.
+
 ## What's inside
 
 The document is **flat** — one level, no regions — and every fact says

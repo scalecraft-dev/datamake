@@ -94,6 +94,12 @@ pub struct Discover {
     pub exclude: Exclude,
     #[serde(default)]
     pub on_unresolvable: OnUnresolvable,
+    /// What `sync` does with an override whose model is not among the
+    /// selected models — gone from the environment (renamed, moved to
+    /// another schema) or excluded by `select`. An override is an authored
+    /// promise about a named model; it never disappears silently.
+    #[serde(default)]
+    pub on_missing_override: OnMissingOverride,
     /// Refine a discovered model; never invent one.
     #[serde(default)]
     pub overrides: Vec<Override>,
@@ -157,6 +163,14 @@ pub enum OnUnresolvable {
     Fail,
     /// Drop it, and name it in the document's `notes[]`.
     Exclude,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnMissingOverride {
+    #[default]
+    Warn,
+    Fail,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

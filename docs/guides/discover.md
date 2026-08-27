@@ -108,9 +108,32 @@ datamk sync -f cell.yaml -p prod
 ```
 
 with `host: 127.0.0.1`, `port: "5432"`, `sslmode: disable` (the proxy
-terminates TLS locally) on the state connection. In a job, the proxy is a
+terminates TLS locally) on the state connection. `password:` must resolve
+to a non-empty string even though the proxy ignores it — a placeholder is
+fine; empty is rejected at profile load. In a job, the proxy is a
 sidecar and the token comes from the pod's service account. `sync` runs and
 exits; the token's one-hour life is never a problem.
+
+## Running in a container
+
+- **Memory.** `verify` stages every bound object through DuckDB; DuckDB's
+  default memory limit is a fraction of *host* RAM, which inside a cgroup is
+  the wrong number — the kernel kills the process before DuckDB would
+  spill. datamk reads the container's cgroup limit and defaults DuckDB to
+  75% of it (logged at start-up); set `DATAMK_MEMORY_LIMIT` to choose
+  explicitly, and keep the pod's limit above what a staged read needs.
+- **Extensions.** A fresh binary downloads ~200 MB of DuckDB extensions
+  (ducklake, httpfs, json, postgres, sqlite, community bigquery) from the
+  registry at first use into `$HOME/.duckdb`, and needs an exec-capable
+  filesystem to load them. The release image bakes them
+  (`datamk debug install-extensions` at build); if you build your own,
+  do the same.
+- **Storage.** With an all-bound (discovered) cell, `serve` polls nothing
+  and never touches `storage:` at steady state.
+- **verify cost.** Every `verify` stages every bound object — on the live
+  ape cell, 1.8M rows and ~450 MB billed per run. Don't run it at every pod
+  start on a cell with big tables; run it on a schedule (a CronJob calling
+  `datamk verify -p prod`, shipping the record with the next deploy).
 
 ## Sync
 
@@ -157,6 +180,17 @@ A model whose columns can't be resolved (undeclared, and no warehouse
 object — usually not yet planned, or a missing metadata grant) fails the
 sync with the three fixes named; `on_unresolvable: exclude` drops it and
 lists it in the document's `notes[]` instead.
+
+An override names a model. If that model is no longer among the selected
+ones — renamed, moved to another schema, removed, or excluded by `select`
+— `sync` warns, naming the model and the export and docs page that will not
+appear; `on_missing_override: fail` makes it refuse instead. It never
+vanishes silently.
+
+A newly deployed model that lands in a selected schema is picked up by the
+next `sync`; if the serving identity lacks a grant on what it reads,
+`verify` fails on it. A grant precedes every newly served model; `exclude`
+is the escape until it lands.
 
 **Deployed reality only.** `sync` reads the environment row a plan
 promoted, joins snapshots on `(name, identifier)` — never on name alone —

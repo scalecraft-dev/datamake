@@ -6,6 +6,25 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added — `GET /context/{route}` and `datamk context --export` (ADR 0012 amendment 2026-08-27)
+
+One export's slice of the context document: same schema, `exports[]` of
+length one, `docs[]` reduced to the cell page and that export's; own ETag
+variant; `?include=docs` as on `/context`; 404 names the real routes;
+advertised in `/openapi.json` with `route` enumerated.
+
+### Added — container-aware DuckDB memory default
+
+Inside a cgroup, DuckDB's `memory_limit` defaults to 75% of the container's
+limit (logged at start-up); `DATAMK_MEMORY_LIMIT` still overrides. The
+release image bakes every extension the engine may `INSTALL`
+(`datamk debug install-extensions`).
+
+### Changed — discovered cells: `discover.on_missing_override: warn | fail`
+
+An override whose model is gone or unselected warns by default, naming the
+model and what will not appear; `fail` refuses the sync.
+
 ### Added — `serve` shuts down gracefully on SIGTERM/SIGINT
 
 Stops accepting, drains in-flight requests for up to `--drain-timeout`

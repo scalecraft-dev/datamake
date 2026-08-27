@@ -115,6 +115,12 @@ pub enum DebugCommand {
         /// The JSON file described above.
         file: PathBuf,
     },
+    /// Pre-install every DuckDB extension the engine may `INSTALL` at
+    /// first use (ducklake, httpfs, json, postgres, sqlite, and the
+    /// community `bigquery`) into this user's DuckDB extension directory —
+    /// what an image build runs so a pod needs no registry egress and no
+    /// exec-capable scratch filesystem at start-up.
+    InstallExtensions,
 }
 
 #[derive(Args)]
@@ -253,6 +259,11 @@ pub struct ContextArgs {
     /// a dangling pointer), so this is a negative flag.
     #[arg(long)]
     pub no_docs: bool,
+    /// Narrow the document to one export's route key (`orders_daily@2`):
+    /// the same shape with `exports[]` and `docs[]` reduced to that export
+    /// — the portable twin of `GET /context/<route>`.
+    #[arg(long, value_name = "ROUTE")]
+    pub export: Option<String>,
 }
 
 #[derive(Args)]

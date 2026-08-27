@@ -155,6 +155,13 @@ digest regardless of which variant produced them. Both `/context` and
 all-or-nothing, and a shared cache keyed on URI alone could otherwise hand
 a cached 200 to a caller with no token.
 
+## Memory in a container
+
+DuckDB sizes its default memory limit from host RAM; under a cgroup that is
+the wrong number. datamk reads the container's limit (`memory.max` /
+`memory.limit_in_bytes`) and defaults DuckDB to 75% of it, logging the
+value at start-up. `DATAMK_MEMORY_LIMIT` overrides it.
+
 ## Stopping
 
 `serve` handles `SIGTERM` and `SIGINT`: it stops accepting connections
