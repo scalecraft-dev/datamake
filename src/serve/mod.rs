@@ -731,10 +731,11 @@ fn build_state(
         // the callable HTTP surface, and the data routes are not mounted.
         // Never-backed exports are always excluded (issue #6) — `mounted`
         // already dropped them regardless of --no-data.
-        openapi: openapi::generate(
+        openapi: openapi::generate_with_all(
             &cell.def.cell,
             cell.def.description.as_deref(),
             if data_mounted { &mounted } else { &[] },
+            &all_routes,
             &digest,
             base_path,
         ),
@@ -1045,6 +1046,10 @@ fn cell_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health))
         .route("/context", get(context_doc))
+        // One export's slice of the same document (ADR 0012 §4, amended
+        // 2026-08-27): an agent answering one question fetches one contract
+        // and one page. Same shape, own ETag variant.
+        .route("/context/:route", get(context_export))
         .route("/openapi.json", get(openapi_doc))
         .route("/:route", get(serve_export))
         .with_state(state)
@@ -1312,29 +1317,128 @@ async fn context_doc(
     // bundle only for `?include=docs`. A cell with neither observed input
     // present keeps the exact byte-identical default ETag it always had
     // (mesh.rs copies this verbatim into `context_digest`).
+    let etag = context_etag(&s, want_docs, None);
+    if matches_etag(&headers, &etag) {
+        return not_modified(etag);
+    }
+    let mut doc = build_context_document(&s);
+    if want_docs {
+        doc.inline_docs(&s.docs_pages);
+    }
+    context_response(etag, doc)
+}
+
+/// `GET /context/{route}`: the document narrowed to one export. 404 —
+/// post-auth, like a data route — names the routes that exist, so a wrong
+/// guess is one hop from a right one.
+async fn context_export(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(route): axum::extract::Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize(&s, &headers) {
+        return resp;
+    }
+    let sections = match validate_include(&pairs) {
+        Ok(s) => s,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let want_docs = sections.iter().any(|s| s == "docs");
+    if !s.routes.contains_key(&route) {
+        let mut known: Vec<&str> = s.routes.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no export '{route}' — discoverable exports: {}. See GET {}/context.",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                },
+                s.base_path
+            ),
+        )
+            .into_response();
+    }
+    let etag = context_etag(&s, want_docs, Some(&route));
+    if matches_etag(&headers, &etag) {
+        return not_modified(etag);
+    }
+    let mut doc = build_context_document(&s);
+    doc.narrow_to(&route);
+    if want_docs {
+        let pages: Vec<&crate::config::docs::DocsPage> = s
+            .docs_pages
+            .iter()
+            .filter(|p| p.target == "cell" || p.target == route)
+            .collect();
+        doc.inline_docs(pages);
+    }
+    context_response(etag, doc)
+}
+
+/// The ETag for one representation of the context document (ADR 0013 §6).
+/// The interface digest names the interface; the ETag names a
+/// representation — the suffixes are precomputed at startup, never on the
+/// request path, and layer independently: `~observed.<hash>` (H3) folds in
+/// `source_check`/`source_descriptions` — startup-fixed facts that can newly
+/// appear across a rollout with `cell.yaml` byte-identical — and is present
+/// on every variant whenever there's an observed input; `~export.<route>`
+/// names a per-export narrowing; `~docs.<bundle sha>` adds the docs-content
+/// bundle for `?include=docs`. A cell with neither observed input present
+/// keeps the exact byte-identical default ETag it always had (mesh.rs copies
+/// this verbatim into `context_digest`).
+fn context_etag(s: &AppState, want_docs: bool, export: Option<&str>) -> String {
     let mut etag = format!("\"{}", s.digest);
     if let Some(obs) = &s.observed_bundle_sha12 {
         etag.push_str(&format!("~observed.{obs}"));
+    }
+    if let Some(route) = export {
+        etag.push_str(&format!("~export.{route}"));
     }
     if want_docs {
         etag.push_str(&format!("~docs.{}", s.docs_bundle_sha12));
     }
     etag.push('"');
-    if headers
+    etag
+}
+
+fn matches_etag(headers: &HeaderMap, etag: &str) -> bool {
+    headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == etag)
-    {
-        return (
-            StatusCode::NOT_MODIFIED,
-            [
-                (header::ETAG, etag),
-                (header::CACHE_CONTROL, "private".to_string()),
-            ],
-        )
-            .into_response();
-    }
+}
 
+fn not_modified(etag: String) -> Response {
+    (
+        StatusCode::NOT_MODIFIED,
+        [
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "private".to_string()),
+        ],
+    )
+        .into_response()
+}
+
+fn context_response(etag: String, doc: crate::context::ContextDocument) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "private".to_string()),
+        ],
+        Json(doc),
+    )
+        .into_response()
+}
+
+/// The live document, assembled from the request-time facts (the poller's
+/// caches) on top of the startup-fixed interface. Shared by the whole-cell
+/// and per-export doors so the two can never disagree.
+fn build_context_document(s: &AppState) -> crate::context::ContextDocument {
     let execution = s.execution.load(std::sync::atomic::Ordering::Relaxed);
 
     // Provenance only when the cached summary describes the execution being
@@ -1427,21 +1531,7 @@ async fn context_doc(
         doc.notes
             .push(crate::context::NOTE_NO_ROUTES_MOUNTED.to_string());
     }
-    if want_docs {
-        // `200`, empty pages when the cell declares none — not an error;
-        // `included` is what tells an agent it asked and got a truthful
-        // (possibly empty) answer, distinct from "server predates this field".
-        doc.inline_docs(&s.docs_pages);
-    }
-    (
-        StatusCode::OK,
-        [
-            (header::ETAG, etag),
-            (header::CACHE_CONTROL, "private".to_string()),
-        ],
-        Json(doc),
-    )
-        .into_response()
+    doc
 }
 
 /// The back-link headers every data-route response carries (ADR 0012 §4) —
@@ -2756,6 +2846,61 @@ mod smoke {
     }
 
     // --- issue #6: bound exports — described, not routed --------------------
+
+    /// ADR 0012 §4 amendment (2026-08-27): one export's slice of the
+    /// document, same shape, own ETag variant, 404 naming the real routes.
+    #[test]
+    fn context_export_narrows_the_document_to_one_export() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context/orders_daily@2", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["datamk_context"], 4);
+            assert_eq!(v["exports"].as_array().unwrap().len(), 1);
+            assert_eq!(v["exports"][0]["route"], "orders_daily@2");
+            assert_eq!(v["cell"], "smoke");
+
+            let (status, body) = get(&router, "/context/nope@1", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains("orders_daily@2"), "{body}");
+
+            let (status, body) = get(&router, "/context/orders_daily@2?include=dcos", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+            // Own ETag, distinct from the whole document's; round-trips to 304.
+            let (_, h_all, _) = get_with_headers(&router, "/context", &[]).await;
+            let (_, h_one, _) = get_with_headers(&router, "/context/orders_daily@2", &[]).await;
+            let etag_all = h_all
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let etag_one = h_one
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_ne!(etag_all, etag_one);
+            assert!(etag_one.contains("~export.orders_daily@2"), "{etag_one}");
+            let (status, _, _) = get_with_headers(
+                &router,
+                "/context/orders_daily@2",
+                &[("if-none-match", &etag_one)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED);
+
+            // Advertised per export in the spec.
+            let (_, body) = get(&router, "/openapi.json", None).await;
+            let spec: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let route_enum =
+                &spec["paths"]["/context/{route}"]["get"]["parameters"][0]["schema"]["enum"];
+            assert_eq!(route_enum, &serde_json::json!(["orders_daily@2"]), "{body}");
+        });
+    }
 
     #[test]
     fn never_backed_export_is_declared_with_null_query_and_absent_from_openapi() {

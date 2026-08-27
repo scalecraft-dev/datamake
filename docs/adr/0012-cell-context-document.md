@@ -733,3 +733,27 @@ open. The only fix that isn't docs-in-JSON is a typed column property the
 engine can verify — a period/point-in-time attribute beside `unit`, making
 "these two are not comparable" derivable rather than asserted. Not decided
 here.
+
+## Amendment (2026-08-27): `GET /context/{route}`
+
+§4 said "one document, one route" and refused per-export routes. The first
+production consumer — an MCP tool answering one question — showed the cost:
+a 48 KB fetch and client-side filtering to get one export's contract and
+page, growing with every export. The document stays one document; it gains
+one more door onto a slice of itself:
+
+- `GET /context/{route}` returns the **same schema**, with `exports[]`
+  reduced to the named export and `docs[]` to the cell page plus that
+  export's page. `?include=docs` works as on `/context`. Own ETag variant
+  (`~export.<route>`). 404, post-auth, names the routes that exist. Bound
+  exports are addressable (they have no data route, but they have a
+  contract).
+- `/openapi.json` advertises it with `route` enumerated from the
+  discoverable exports.
+- `datamk context --export <route>` is the portable twin.
+
+Not added: `/docs/{route}` as a separate text/markdown door — the page
+rides `docs[].content` under `?include=docs` on the narrowed document,
+which is one shape for consumers rather than two. Reopen if a consumer
+needs the raw page without JSON.
+

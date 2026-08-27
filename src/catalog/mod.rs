@@ -299,10 +299,11 @@ fn read_sqlmesh(
     };
     let all = state::read_models(conn, STATE_ALIAS, schema, &env)?;
     let total = all.len();
-    let selected: Vec<state::StateModel> = all
+    let (selected, unselected): (Vec<state::StateModel>, Vec<state::StateModel>) = all
         .into_iter()
-        .filter(|m| select::selected(d, &m.kind, &m.name.schema, &m.name.object(), &m.tags))
-        .collect();
+        .partition(|m| select::selected(d, &m.kind, &m.name.schema, &m.name.object(), &m.tags));
+    let unselected_objects: std::collections::HashSet<String> =
+        unselected.iter().map(|m| m.name.object()).collect();
     if selected.is_empty() {
         bail!(
             "`discover.select` matched none of the {total} models in environment '{}' — \
@@ -310,6 +311,39 @@ fn read_sqlmesh(
              the catalog: `invoice.flight_spend`).",
             env.name
         );
+    }
+    // An override names a model; if that model isn't among the selected
+    // ones the promise it carries (a version, a contract, a docs page)
+    // would vanish from the document without a word — say so, or refuse.
+    let selected_objects: std::collections::HashSet<String> =
+        selected.iter().map(|m| m.name.object()).collect();
+    for o in &d.overrides {
+        if selected_objects.contains(&o.model) {
+            continue;
+        }
+        let why = if unselected_objects.contains(&o.model) {
+            "is deployed but excluded by `discover.select`/`exclude`"
+        } else {
+            "is no longer deployed in this environment (renamed, moved to another schema, or removed)"
+        };
+        let msg = format!(
+            "override for model '{}' {why} — the export{}{} it promised will not appear",
+            o.model,
+            o.as_name
+                .as_deref()
+                .map(|a| format!(" '{a}'"))
+                .unwrap_or_default(),
+            o.docs
+                .as_deref()
+                .map(|p| format!(" and its docs page {p}"))
+                .unwrap_or_default()
+        );
+        match d.on_missing_override {
+            crate::config::OnMissingOverride::Warn => tracing::warn!("{msg}"),
+            crate::config::OnMissingOverride::Fail => bail!(
+                "{msg}. Update or remove the override, or set `discover.on_missing_override: warn`."
+            ),
+        }
     }
     let intervals = state::read_intervals(conn, STATE_ALIAS, schema, &selected)?;
 
@@ -777,6 +811,41 @@ mod tests {
         std::fs::write(&file, CELL).unwrap();
         let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
         assert!(err.contains("max 65536"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An override whose model is gone or unselected warns by default and
+    /// can be made to fail — never vanishes silently.
+    #[test]
+    fn a_missing_override_warns_by_default_and_fails_on_request() {
+        let dir = scaffold(
+            "missing",
+            &CELL.replace(
+                "    - model: sqlmesh_example.documented_model\n",
+                "    - model: sqlmesh_example.renamed_away\n      as: gone\n    - model: sqlmesh_example.documented_model\n",
+            ),
+        );
+        let file = dir.join("cell.yaml");
+        sync(&file, "local", false).expect("warn is the default");
+        let doc = crate::context::build_document(&file, "local", true).unwrap();
+        assert!(doc.exports.iter().all(|e| e.name != "gone"));
+        let strict = std::fs::read_to_string(&file).unwrap().replace(
+            "  overrides:\n",
+            "  on_missing_override: fail\n  overrides:\n",
+        );
+        std::fs::write(&file, strict).unwrap();
+        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        assert!(
+            err.contains("sqlmesh_example.renamed_away") && err.contains("no longer deployed"),
+            "{err}"
+        );
+        // Deployed but excluded by select says so too.
+        let excluded = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("sqlmesh_example.renamed_away", "sqlmesh_example.seed_model");
+        std::fs::write(&file, excluded).unwrap();
+        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        assert!(err.contains("excluded by `discover.select`"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

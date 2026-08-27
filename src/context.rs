@@ -1057,6 +1057,24 @@ pub fn assemble(facts: Facts) -> ContextDocument {
 }
 
 impl ContextDocument {
+    /// Narrow the document to one export (ADR 0012 §4 amendment,
+    /// 2026-08-27): `exports[]` keeps the record whose route is `route`,
+    /// `docs[]` keeps the cell page and that export's page, everything
+    /// cell-level stays. Same shape as the full document — a consumer
+    /// parses one schema — so an agent answering one question fetches one
+    /// export's contract and page, not the whole cell. Returns `false`,
+    /// leaving the document untouched, when no discoverable export has that
+    /// route.
+    pub fn narrow_to(&mut self, route: &str) -> bool {
+        if !self.exports.iter().any(|e| e.route == route) {
+            return false;
+        }
+        self.exports.retain(|e| e.route == route);
+        self.docs
+            .retain(|d| d.target == "cell" || d.target == route);
+        true
+    }
+
     /// The interface this document carries — the same records, measurements
     /// and all; `interface_digest`'s projection ignores those by
     /// construction, so digesting this equals digesting the interface the
@@ -1345,10 +1363,23 @@ pub fn cell_yaml_digest_of(file: &std::path::Path) -> Result<String> {
 /// only (mirroring `serve --no-data`'s withholding idiom). `included` is
 /// truthful in both cases, so a consumer never needs to know which door
 /// produced the file.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_document(
     file: &std::path::Path,
     profile: &str,
     no_docs: bool,
+) -> Result<ContextDocument> {
+    build_document_for(file, profile, no_docs, None)
+}
+
+/// `build_document`, optionally narrowed to one export's route (`datamk
+/// context --export <route>`, the portable twin of `GET /context/<route>`).
+/// An unknown route is an error naming the ones that exist.
+pub fn build_document_for(
+    file: &std::path::Path,
+    profile: &str,
+    no_docs: bool,
+    export: Option<&str>,
 ) -> Result<ContextDocument> {
     let loaded = crate::config::load(file, profile)?;
     let routes = discoverable_routes(&loaded.def)?;
@@ -1454,6 +1485,23 @@ pub fn build_document(
         doc.inline_docs(&pages);
     }
 
+    if let Some(route) = export {
+        if !doc.narrow_to(route) {
+            anyhow::bail!(
+                "no export '{route}' — discoverable exports: {}",
+                if doc.exports.is_empty() {
+                    "none".to_string()
+                } else {
+                    doc.exports
+                        .iter()
+                        .map(|e| e.route.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+        }
+    }
+
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
     doc.cell_yaml_digest = Some(cell_yaml_digest);
 
@@ -1470,10 +1518,11 @@ pub fn emit(
     profile: &str,
     out: Option<&std::path::Path>,
     no_docs: bool,
+    export: Option<&str>,
 ) -> Result<()> {
     use anyhow::Context as _;
 
-    let doc = build_document(file, profile, no_docs)?;
+    let doc = build_document_for(file, profile, no_docs, export)?;
     let json = serde_json::to_string_pretty(&doc)?;
     match out {
         Some(path) => {
@@ -2354,7 +2403,14 @@ interface:
         .unwrap();
 
         let default_out = dir.join("context.json");
-        emit(&dir.join("cell.yaml"), "local", Some(&default_out), false).unwrap();
+        emit(
+            &dir.join("cell.yaml"),
+            "local",
+            Some(&default_out),
+            false,
+            None,
+        )
+        .unwrap();
         let default_doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&default_out).unwrap()).unwrap();
         assert_eq!(default_doc["included"], serde_json::json!(["docs"]));
@@ -2368,7 +2424,14 @@ interface:
         );
 
         let no_docs_out = dir.join("context_no_docs.json");
-        emit(&dir.join("cell.yaml"), "local", Some(&no_docs_out), true).unwrap();
+        emit(
+            &dir.join("cell.yaml"),
+            "local",
+            Some(&no_docs_out),
+            true,
+            None,
+        )
+        .unwrap();
         let no_docs_doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&no_docs_out).unwrap()).unwrap();
         assert_eq!(no_docs_doc["included"], serde_json::json!([]));
@@ -2435,7 +2498,7 @@ interface:
         );
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false).expect("emit the context document");
+        emit(&file, "local", Some(&out), false, None).expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(v["status"], "verified_at_source");
@@ -2528,7 +2591,7 @@ interface:
         crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false).expect("emit the context document");
+        emit(&file, "local", Some(&out), false, None).expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
 
@@ -2565,7 +2628,7 @@ interface:
         std::fs::write(&file, yaml).unwrap();
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false)
+        emit(&file, "local", Some(&out), false, None)
             .expect("emit must still succeed, just without the stale record");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();

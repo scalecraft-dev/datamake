@@ -27,7 +27,7 @@ pub use deploy::{DeployConfig, Target};
 pub use schema::{
     builds_no_snapshot, is_valid_identifier, Bindings, CellDef, ColumnSpec, Contract, Discover,
     DiscoverFrom, DiscoveredExport, DiscoveredFrom, Export, FromMap, MaterializeStrategy,
-    OnUnresolvable, Origin, Override, ResolvedTransform, Source, Visibility,
+    OnMissingOverride, OnUnresolvable, Origin, Override, ResolvedTransform, Source, Visibility,
 };
 // `pub(crate)`, not part of the flat `pub use` list above: every caller
 // (`verify.rs`, `deploy::preflight`, `config::mod::load` itself) is already

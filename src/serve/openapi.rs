@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 /// while three routes were live. Data path items stay gated on `routes`
 /// (empty under `--no-data`, since those affordances genuinely don't exist
 /// there).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate(
     cell: &str,
     description: Option<&str>,
@@ -24,9 +25,27 @@ pub fn generate(
     version: &str,
     base_path: &str,
 ) -> Value {
+    generate_with_all(cell, description, routes, routes, version, base_path)
+}
+
+/// `generate`, with the data routes (`routes`, what is mounted) and the
+/// discoverable routes (`all_routes`, every export `/context/{route}` can
+/// name — bound ones included) given separately.
+pub fn generate_with_all(
+    cell: &str,
+    description: Option<&str>,
+    routes: &[(String, Export)],
+    all_routes: &[(String, Export)],
+    version: &str,
+    base_path: &str,
+) -> Value {
     let mut paths = Map::new();
     paths.insert("/".to_string(), health_path_item());
     paths.insert("/context".to_string(), context_path_item());
+    paths.insert(
+        "/context/{route}".to_string(),
+        context_export_path_item(all_routes),
+    );
     paths.insert("/openapi.json".to_string(), openapi_path_item());
     for (route, export) in routes {
         paths.insert(format!("/{route}"), path_item(export));
@@ -317,6 +336,56 @@ fn export_schema() -> Value {
     })
 }
 
+/// `GET /context/{route}` (ADR 0012 §4, amended 2026-08-27): the document
+/// narrowed to one export — the same schema, `exports[]` of length one and
+/// `docs[]` reduced to the cell page and that export's. `route` is
+/// enumerated from the discoverable exports, bound ones included.
+fn context_export_path_item(all_routes: &[(String, Export)]) -> Value {
+    let sections: Vec<Value> = super::INCLUDE_SECTIONS.iter().map(|s| json!(s)).collect();
+    let routes: Vec<Value> = all_routes.iter().map(|(r, _)| json!(r)).collect();
+    json!({
+        "get": {
+            "summary": "One export's slice of the context document",
+            "description": "The same document as /context, with `exports[]` reduced to the \
+                            named export and `docs[]` to the cell page plus that export's — \
+                            for a consumer answering one question. Own ETag variant. \
+                            Bound exports are addressable here even though they have no \
+                            data route.",
+            "parameters": [
+                {
+                    "name": "route",
+                    "in": "path",
+                    "required": true,
+                    "description": "The export's route key (`name@major`).",
+                    "schema": { "type": "string", "enum": routes }
+                },
+                {
+                    "name": "include",
+                    "in": "query",
+                    "required": false,
+                    "style": "form",
+                    "explode": false,
+                    "description": "As on /context: `docs` inlines the cell page and this \
+                                    export's page.",
+                    "schema": { "type": "array", "items": { "type": "string", "enum": sections } }
+                }
+            ],
+            "responses": {
+                "200": {
+                    "description": "the context document, narrowed to one export",
+                    "content": { "application/json": { "schema": context_schema() } }
+                },
+                "304": { "description": "not modified" },
+                "400": { "description": "unknown query parameter or `include` section" },
+                "401": { "description": "missing or unknown bearer token (cell has access.roles)" },
+                "403": { "description": "cell is not shareable, or the token's roles do not \
+                                          include an allowed role" },
+                "404": { "description": "no such export — the body names the routes that exist" }
+            }
+        }
+    })
+}
+
 fn openapi_path_item() -> Value {
     json!({
         "get": {
@@ -504,7 +573,8 @@ mod tests {
         assert!(paths.contains_key("/"));
         assert!(paths.contains_key("/context"));
         assert!(paths.contains_key("/openapi.json"));
-        assert_eq!(paths.len(), 4, "{:?}", paths.keys().collect::<Vec<_>>());
+        assert!(paths.contains_key("/context/{route}"));
+        assert_eq!(paths.len(), 5, "{:?}", paths.keys().collect::<Vec<_>>());
 
         let params = doc["paths"]["/orders_daily@2"]["get"]["parameters"]
             .as_array()
@@ -638,7 +708,9 @@ mod tests {
         let paths = doc["paths"].as_object().unwrap();
         let keys: std::collections::BTreeSet<&str> = paths.keys().map(|k| k.as_str()).collect();
         let expected: std::collections::BTreeSet<&str> =
-            ["/", "/context", "/openapi.json"].into_iter().collect();
+            ["/", "/context", "/context/{route}", "/openapi.json"]
+                .into_iter()
+                .collect();
         assert_eq!(keys, expected);
     }
 
