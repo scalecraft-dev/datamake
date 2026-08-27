@@ -55,7 +55,7 @@ async-trait = "0.1"                                   # object_store::Credential
 # TLS handshake panics at runtime unless main() installs ring explicitly.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures = "0.3"                                       # drive object_store's list streams
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = "0.7"
 # Minimal serve throttling (ADR 0012 §7): a global concurrency cap with
 # load-shed -> 503. "util" also powers the in-process serve smoke tests

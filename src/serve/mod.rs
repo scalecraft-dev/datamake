@@ -231,6 +231,7 @@ pub async fn run(
     poll_interval: u64,
     max_concurrency: usize,
     no_data: bool,
+    drain_timeout: u64,
 ) -> Result<()> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
     refuse_stale_discovery(&cell)?;
@@ -272,7 +273,7 @@ pub async fn run(
     }
 
     let app = app(state, max_concurrency);
-    bind_and_serve(app, port).await
+    bind_and_serve(app, port, drain_timeout).await
 }
 
 /// Serve N cells from one process, each mounted at its own prefix
@@ -291,6 +292,7 @@ pub async fn run_project(
     poll_interval: u64,
     max_concurrency: usize,
     no_data: bool,
+    drain_timeout: u64,
 ) -> Result<()> {
     let n = project.cells.len();
     let budget = project_budget(n)?;
@@ -374,7 +376,12 @@ pub async fn run_project(
 
     print_banner(port, &rows, /* project */ true);
 
-    bind_and_serve(project_router(mounted, max_concurrency), port).await
+    bind_and_serve(
+        project_router(mounted, max_concurrency),
+        port,
+        drain_timeout,
+    )
+    .await
 }
 
 /// Assemble the project's router: `/` (outside every cell's throttle, so no
@@ -402,11 +409,69 @@ fn project_router(mounted: MountedCells, max_concurrency: usize) -> Router {
     app.fallback(project_not_found)
 }
 
-async fn bind_and_serve(app: Router, port: u16) -> Result<()> {
+/// Serve until SIGTERM/SIGINT, then drain: the listener stops accepting
+/// (a readiness probe on `/` fails from this moment, so an orchestrator
+/// routes new traffic elsewhere), in-flight requests get up to
+/// `drain_timeout` seconds to finish, and the process exits 0. A
+/// handler-less PID 1 would ignore SIGTERM and sit through the whole
+/// termination grace period before being SIGKILLed mid-request; the
+/// default disposition would drop every in-flight request instantly.
+async fn bind_and_serve(app: Router, port: u16, drain_timeout: u64) -> Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = stop_rx.await;
+        }),
+    );
+    tokio::pin!(server);
+    tokio::select! {
+        // The server ended on its own (an accept error) — surface it.
+        res = &mut server => {
+            res?;
+            Ok(())
+        }
+        signal = shutdown_signal() => {
+            tracing::info!(
+                signal,
+                drain_timeout_seconds = drain_timeout,
+                "shutdown requested: no longer accepting connections; draining in-flight requests"
+            );
+            let _ = stop_tx.send(());
+            match tokio::time::timeout(std::time::Duration::from_secs(drain_timeout), &mut server)
+                .await
+            {
+                Ok(res) => {
+                    res?;
+                    tracing::info!("stopped: in-flight requests drained");
+                }
+                Err(_) => tracing::warn!(
+                    drain_timeout_seconds = drain_timeout,
+                    "stopped: drain timeout exceeded with requests still in flight"
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl-C), naming which.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing the SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
 }
 
 /// Divide the operator's DuckDB memory budget across the mounted cells

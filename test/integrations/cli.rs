@@ -1343,3 +1343,77 @@ fn discovered_cell_syncs_describes_and_refuses_to_serve_without_a_record() {
 
     let _ = std::fs::remove_dir_all(&parent);
 }
+
+/// `serve` handles SIGTERM (0.0.25): stops accepting, drains, exits 0 —
+/// so a container with datamk as PID 1 stops in milliseconds instead of
+/// sitting through the termination grace period and being SIGKILLed.
+#[cfg(unix)]
+#[test]
+fn serve_exits_zero_promptly_on_sigterm() {
+    use std::io::{Read, Write};
+    let dir = all_bound_fixture("sigterm");
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let child = Command::new(bin())
+        .current_dir(&dir)
+        .args([
+            "serve",
+            "-f",
+            "cell.yaml",
+            "--port",
+            &port.to_string(),
+            "--drain-timeout",
+            "5",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawning datamk serve");
+
+    // Wait for the health route.
+    let started = std::time::Instant::now();
+    let mut healthy = false;
+    while started.elapsed() < std::time::Duration::from_secs(20) {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            if buf.starts_with("HTTP/1.") && buf.contains("200") {
+                healthy = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(healthy, "serve never became healthy on port {port}");
+
+    let sent = std::time::Instant::now();
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let out = child.wait_with_output().expect("waiting for datamk serve");
+    let took = sent.elapsed();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "serve must exit 0 on SIGTERM: {out:?}\n{text}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "took {took:?} to stop: {text}"
+    );
+    assert!(text.contains("shutdown requested"), "{text}");
+    assert!(
+        text.contains("stopped: in-flight requests drained"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
