@@ -66,6 +66,9 @@
       "version": 7
     }
   ],
+  "definitions": [],
+  "missing_terms": [],
+  "definitions_request": "context?terms=<term>[,<term>]&include=docs",
   "docs": [],
   "include_request": "context?include=docs",
   "build": {

@@ -134,6 +134,7 @@ async fn dispatch(command: Command) -> Result<()> {
             a.out.as_deref(),
             a.no_docs,
             a.export.as_deref(),
+            a.terms.as_deref(),
         ),
         Command::Mesh(a) => match a.command {
             cli::MeshCommand::Emit(e) => mesh::emit(

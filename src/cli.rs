@@ -264,6 +264,14 @@ pub struct ContextArgs {
     /// — the portable twin of `GET /context/<route>`.
     #[arg(long, value_name = "ROUTE")]
     pub export: Option<String>,
+    /// Narrow `definitions[]`/`docs[]` to a comma-separated list of terms
+    /// or aliases (ADR 0017), resolved against the whole cell and composing
+    /// with `--export` exactly as `?terms=` composes with
+    /// `/context/<route>`. Unlike the served door, an unknown term exits
+    /// non-zero, naming the known ones — a file written by `--out` cannot
+    /// be re-requested.
+    #[arg(long, value_name = "TERMS", value_delimiter = ',')]
+    pub terms: Option<Vec<String>>,
 }
 
 #[derive(Args)]

@@ -77,15 +77,29 @@ impl CellArtifact {
             sql.push(read_artifact(dir, t.file_path())?);
         }
 
-        // ADR 0013 §9: every declared `docs:` path, cell-level and every
-        // export's, deduplicated by relative path before reading — the same
-        // page may be named by more than one `docs:` field.
+        // ADR 0013 §9 / ADR 0017 §4: every declared `docs:` path — cell-
+        // level, every export's, the `definitions:` file (when authored as
+        // one), and every definition's own `docs:` page — deduplicated by
+        // relative path before reading, so the same file named by two
+        // fields collects once.
         let mut docs_paths: Vec<&str> = Vec::new();
         if let Some(p) = &def.docs {
             docs_paths.push(p.as_str());
         }
         for export in &def.interface {
             if let Some(p) = &export.docs {
+                if !docs_paths.contains(&p.as_str()) {
+                    docs_paths.push(p.as_str());
+                }
+            }
+        }
+        if let Some(p) = &def.definitions_file {
+            if !docs_paths.contains(&p.as_str()) {
+                docs_paths.push(p.as_str());
+            }
+        }
+        for d in &def.definitions {
+            if let Some(p) = &d.docs {
                 if !docs_paths.contains(&p.as_str()) {
                     docs_paths.push(p.as_str());
                 }
@@ -360,6 +374,59 @@ mod tests {
 
         let art = CellArtifact::collect(&dir, "cell.yaml", &def).unwrap();
         assert_eq!(art.docs.len(), 1, "{:?}", art.docs);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0017 §4: the definitions file and a definition's own `docs:`
+    /// page are collected into the same dedup-by-path pool as `docs:`, and
+    /// a definitions-only edit rolls `content_hash` — the deploy artifact
+    /// must not go stale behind a ConfigMap name that no longer matches
+    /// what it serves.
+    #[test]
+    fn collect_gathers_definitions_and_content_hash_moves_on_a_definitions_only_edit() {
+        let dir = tempdir("definitions");
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("term.md"), "Net revenue, long form v1.").unwrap();
+        std::fs::write(
+            dir.join("definitions.yaml"),
+            "definitions:\n  - term: net_revenue\n    description: Invoiced revenue.\n    \
+             docs: term.md\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: c\ndefinitions: definitions.yaml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+
+        let def1 = CellDef::load(&dir.join("cell.yaml")).unwrap();
+        let art1 = CellArtifact::collect(&dir, "cell.yaml", &def1).unwrap();
+        assert!(
+            art1.docs.iter().any(|f| f.rel_path == "definitions.yaml"),
+            "{:?}",
+            art1.docs
+        );
+        assert!(
+            art1.docs.iter().any(|f| f.rel_path == "term.md"),
+            "{:?}",
+            art1.docs
+        );
+
+        // Editing only the definition's long-form page (description and
+        // cell.yaml both untouched) must still move content_hash.
+        std::fs::write(dir.join("term.md"), "Net revenue, long form v2 — edited.").unwrap();
+        let def2 = CellDef::load(&dir.join("cell.yaml")).unwrap();
+        let art2 = CellArtifact::collect(&dir, "cell.yaml", &def2).unwrap();
+        assert_ne!(
+            art1.content_hash, art2.content_hash,
+            "a definitions-only edit must change content_hash"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

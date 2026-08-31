@@ -25,8 +25,8 @@ pub use bindings::resolve_named_connection;
 pub use bindings::Redacted;
 pub use deploy::{DeployConfig, Target};
 pub use schema::{
-    builds_no_snapshot, is_valid_identifier, Bindings, CellDef, ColumnSpec, Contract, Discover,
-    DiscoverFrom, DiscoveredExport, DiscoveredFrom, Export, FromMap, MaterializeStrategy,
+    builds_no_snapshot, is_valid_identifier, Bindings, CellDef, ColumnSpec, Contract, Definition,
+    Discover, DiscoverFrom, DiscoveredExport, DiscoveredFrom, Export, FromMap, MaterializeStrategy,
     OnMissingOverride, OnUnresolvable, Origin, Override, ResolvedTransform, Source, Visibility,
 };
 // `pub(crate)`, not part of the flat `pub use` list above: every caller
@@ -126,6 +126,13 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
                     // `docs:` exactly as to an authored export's — checked
                     // here, since the interface didn't exist at parse time.
                     docs::validate_all(&dir, &def).with_context(|| {
+                        format!("validating cell definition {}", file.display())
+                    })?;
+                    // ADR 0017 §1: `definitions[].applies_to` resolves
+                    // against the interface — deferred here for the same
+                    // reason `docs::validate_all` re-runs above, now that
+                    // the discovered interface exists.
+                    schema::validate_applies_to(&def).with_context(|| {
                         format!("validating cell definition {}", file.display())
                     })?;
                     Some(Discovery::Fresh {

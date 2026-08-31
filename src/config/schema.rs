@@ -46,6 +46,114 @@ pub struct CellDef {
     /// never authored, never serialized back into `cell.yaml`.
     #[serde(skip)]
     pub discovered_from: Option<DiscoveredFrom>,
+    /// `definitions:` as authored (ADR 0017 §1) — the inline list, or one
+    /// relative path to a file carrying the identical list. Resolved into
+    /// `definitions`/`definitions_file` by `CellDef::load`
+    /// (`resolve_definitions`); nothing past that point reads this field.
+    #[serde(default, rename = "definitions")]
+    pub definitions_source: Option<DefinitionsSource>,
+    /// Cell-level terms — the authoring form collapsed to one list
+    /// regardless of which shape `definitions:` used. Never read from or
+    /// written to `cell.yaml` directly; populated by `CellDef::load`.
+    #[serde(skip)]
+    pub definitions: Vec<Definition>,
+    /// The definitions file's cell-dir-relative path, when `definitions:`
+    /// named a file — `None` for the inline form or when absent. Kept so
+    /// `deploy::artifact::collect` can fold the file into `content_hash`
+    /// (ADR 0017 §4) the same way a `docs:` page is.
+    #[serde(skip)]
+    pub definitions_file: Option<String>,
+}
+
+/// One authored glossary term (ADR 0017 §1): a metric or business concept
+/// that spans several columns, several exports, or no column at all — the
+/// prose the four ADR 0012 §3 meaning fields have nowhere to hold. `term`
+/// and each alias are lookup keys (`GET /context?terms=`), not display
+/// strings, hence the closed grammar; `description` is the short form
+/// (`export.description`'s analogue); `docs:` is the long form (ADR 0013).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Definition {
+    /// `^[a-z0-9][a-z0-9_.-]*$`, ≤64 characters. Case-insensitive at lookup,
+    /// so the grammar is lowercase-only at authoring time — there is no
+    /// second casing to keep in sync.
+    pub term: String,
+    /// Alternate lookup strings, same grammar as `term`, ≤5. The recall
+    /// mechanism (ADR 0017 §3): an authored, collision-checked, cacheable
+    /// fact — never a fuzzy match.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Required, ≤1000 characters: orientation, not a page — long form goes
+    /// in `docs:`. Ships in the context document's `definitions[]` index
+    /// unconditionally (never gated behind `include=`).
+    pub description: String,
+    /// One long-form page, same path rules and caps as `docs:` elsewhere
+    /// (ADR 0013): resolved via `config::docs::resolve_path`, relative to
+    /// the cell dir, never `profiles/`/`.cell/`. Lands in `docs[]` as
+    /// `target: "definition:<term>"`.
+    #[serde(default)]
+    pub docs: Option<String>,
+    /// `name@major` or `name@major.column`; empty means cell-wide (applies
+    /// to no particular export). Validated against the discoverable
+    /// interface by `validate_applies_to` — deferred past `config::load`'s
+    /// discovery materialization for a `discover:` cell.
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+}
+
+/// `definitions:`'s two authoring shapes (ADR 0017 §1) — dispatch on YAML
+/// shape, not `#[serde(untagged)]` on `Vec<Definition>` directly, so a
+/// malformed inline entry (a typo'd field) gets `Definition`'s own
+/// `deny_unknown_fields` error instead of serde's generic "did not match
+/// any variant". A sequence of plain strings (a list of definitions files)
+/// is refused here — the plurality rule ADR 0013 §1 already applies to
+/// `docs:`, reused verbatim for `definitions:`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum DefinitionsSource {
+    Inline(Vec<Definition>),
+    /// One relative path to a file carrying `definitions: [...]` under the
+    /// same key — resolved via `config::docs::resolve_path`, so a large
+    /// glossary need not be commingled with `cell.yaml`.
+    File(String),
+}
+
+impl<'de> Deserialize<'de> for DefinitionsSource {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(s) => Ok(DefinitionsSource::File(s)),
+            serde_yaml::Value::Sequence(seq) => {
+                if !seq.is_empty()
+                    && seq
+                        .iter()
+                        .all(|v| matches!(v, serde_yaml::Value::String(_)))
+                {
+                    return Err(D::Error::custom(
+                        "`definitions:` names a list of files — only one file is allowed \
+                         (`definitions: path/to/file.yaml`); write the terms inline under \
+                         `definitions:` directly instead.",
+                    ));
+                }
+                let defs: Vec<Definition> = seq
+                    .into_iter()
+                    .map(serde_yaml::from_value)
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(D::Error::custom)?;
+                Ok(DefinitionsSource::Inline(defs))
+            }
+            other => Err(D::Error::custom(format!(
+                "`definitions:` must be a list of terms, or one relative path to a file \
+                 carrying the identical list under the same key, got {}",
+                yaml_kind(&other)
+            ))),
+        }
+    }
 }
 
 /// Where a claim came from (ADR 0015 §2). A **closed set** — an origin an
@@ -1374,22 +1482,121 @@ impl CellDef {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading cell definition {}", path.display()))?;
-        let def: CellDef = serde_yaml::from_str(&raw)
+        let mut def: CellDef = serde_yaml::from_str(&raw)
             .with_context(|| format!("parsing cell definition {}", path.display()))?;
         def.validate_prose()
             .with_context(|| format!("validating cell definition {}", path.display()))?;
         def.validate_discover()
+            .with_context(|| format!("validating cell definition {}", path.display()))?;
+        let dir = super::cell_dir(path);
+        // ADR 0017 §1: collapse `definitions:`'s two authoring shapes to one
+        // `Vec<Definition>` before anything downstream sees it — the file
+        // form's own path goes through the identical allowlist `docs:` uses.
+        def.resolve_definitions(&dir)
+            .with_context(|| format!("validating cell definition {}", path.display()))?;
+        def.validate_definitions()
             .with_context(|| format!("validating cell definition {}", path.display()))?;
         // ADR 0013: `docs:` paths are resolved (allowlist-by-construction:
         // relative, canonicalized, under the cell dir, never into
         // `profiles/` or `.cell/`) and cap-checked here, fail-loud — same
         // discipline as `principals:` (`load_principals`). Every caller of
         // `CellDef::load`/`config::load` gets a validated cell before
-        // anything opens a connection.
-        let dir = super::cell_dir(path);
+        // anything opens a connection. Runs after `resolve_definitions` so
+        // a definition's own `docs:` page joins the same cap pool.
         super::docs::validate_all(&dir, &def)
             .with_context(|| format!("validating cell definition {}", path.display()))?;
+        // ADR 0017 §1: `applies_to` resolves against the discoverable
+        // interface, which a `discover:` cell doesn't have until
+        // `config::load` materializes it from the sidecar record — deferred
+        // there for that case (ADR 0016 amendment item 2's placement).
+        if def.discover.is_none() {
+            validate_applies_to(&def)
+                .with_context(|| format!("validating cell definition {}", path.display()))?;
+        }
         Ok(def)
+    }
+
+    /// Collapse `definitions_source` (ADR 0017 §1) into `definitions`/
+    /// `definitions_file`. The one seam past which nothing reads
+    /// `definitions_source` again — it is `None` after this call regardless
+    /// of which shape was authored.
+    fn resolve_definitions(&mut self, dir: &Path) -> Result<()> {
+        match self.definitions_source.take() {
+            None => {}
+            Some(DefinitionsSource::Inline(defs)) => self.definitions = defs,
+            Some(DefinitionsSource::File(path)) => {
+                let text = super::docs::read_definitions_file(dir, &path)?;
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct DefinitionsFile {
+                    definitions: Vec<Definition>,
+                }
+                let parsed: DefinitionsFile = serde_yaml::from_str(&text)
+                    .with_context(|| format!("parsing definitions file {path}"))?;
+                self.definitions = parsed.definitions;
+                self.definitions_file = Some(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR 0017 §1: shape validation for `definitions[]` — term/alias
+    /// grammar, description length, cell-wide uniqueness (term and alias
+    /// names compared ASCII-case-insensitively across both sets), and the
+    /// per-cell/per-term caps. Does not resolve `applies_to` against the
+    /// interface (`validate_applies_to`'s job) — this runs before a
+    /// `discover:` cell's interface exists.
+    fn validate_definitions(&self) -> Result<()> {
+        if self.definitions.len() > MAX_DEFINITIONS {
+            bail!(
+                "cell declares {} definitions (max {MAX_DEFINITIONS}) — split the glossary, or \
+                 trim it to the terms agents actually look up.",
+                self.definitions.len()
+            );
+        }
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for d in &self.definitions {
+            validate_term_shape(&d.term, &d.term)?;
+            if d.description.trim().is_empty() {
+                bail!("definition '{}': `description` is required.", d.term);
+            }
+            if d.description.chars().count() > DEFINITION_DESC_MAX {
+                bail!(
+                    "definition '{}': `description` is {} characters (max \
+                     {DEFINITION_DESC_MAX}) — orientation, not a page; put long form in \
+                     `docs:`.",
+                    d.term,
+                    d.description.chars().count()
+                );
+            }
+            if d.aliases.len() > MAX_ALIASES {
+                bail!(
+                    "definition '{}': {} aliases declared (max {MAX_ALIASES}).",
+                    d.term,
+                    d.aliases.len()
+                );
+            }
+            for alias in &d.aliases {
+                validate_term_shape(alias, &d.term)?;
+            }
+            for name in std::iter::once(&d.term).chain(d.aliases.iter()) {
+                let key = name.to_ascii_lowercase();
+                if let Some(prev) = seen.get(&key) {
+                    bail!(
+                        "definitions '{prev}' and '{}' both use the name '{name}' \
+                         (case-insensitive) — term and alias names must be unique cell-wide.",
+                        d.term
+                    );
+                }
+                seen.insert(key, d.term.clone());
+            }
+            for entry in &d.applies_to {
+                if let Err(e) = parse_applies_to(entry) {
+                    bail!("definition '{}': {e}", d.term);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// ADR 0016 §1: a discovered cell computes nothing and authors no
@@ -1512,6 +1719,121 @@ impl CellDef {
     }
 }
 
+/// ADR 0017 §1 caps.
+const MAX_DEFINITIONS: usize = 256;
+const MAX_ALIASES: usize = 5;
+const TERM_MAX: usize = 64;
+const DEFINITION_DESC_MAX: usize = 1000;
+
+/// `^[a-z0-9][a-z0-9_.-]*$`, ≤64 characters — a term or alias. Lowercase
+/// only at authoring time: lookup is case-insensitive (ADR 0017 §3), so
+/// there is no second casing to keep in sync with this one.
+fn is_valid_term(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
+    first_ok
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'))
+        && s.len() <= TERM_MAX
+}
+
+fn validate_term_shape(s: &str, owning_term: &str) -> Result<()> {
+    if !is_valid_term(s) {
+        bail!(
+            "definition '{owning_term}': '{s}' is not a valid term/alias name — must match \
+             ^[a-z0-9][a-z0-9_.-]*$ and be at most {TERM_MAX} characters."
+        );
+    }
+    Ok(())
+}
+
+/// Parse an `applies_to` entry into `(route, column)` — `name@major` or
+/// `name@major.column`. Shape only; resolving the route/column against the
+/// interface is `validate_applies_to`'s job, since a `discover:` cell has
+/// no interface yet at grammar-check time.
+fn parse_applies_to(entry: &str) -> Result<(String, Option<String>)> {
+    let malformed = || {
+        anyhow::anyhow!(
+            "`applies_to` entry '{entry}' is not `name@major` or `name@major.column` — an \
+             export's route key, optionally with a column."
+        )
+    };
+    let (name, rest) = entry.split_once('@').ok_or_else(malformed)?;
+    if name.is_empty() || rest.is_empty() {
+        return Err(malformed());
+    }
+    match rest.split_once('.') {
+        Some((major, col)) => {
+            if major.is_empty() || col.is_empty() || !major.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(malformed());
+            }
+            Ok((format!("{name}@{major}"), Some(col.to_string())))
+        }
+        None => {
+            if !rest.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(malformed());
+            }
+            Ok((format!("{name}@{rest}"), None))
+        }
+    }
+}
+
+/// ADR 0017 §1: `applies_to` must resolve to a discoverable export, or one
+/// of its declared columns — an unknown route or column is a hard error
+/// naming what exists, the same orphan-prose discipline ADR 0012 §3
+/// ratchet 2 applies to column descriptions. Called from `CellDef::load`
+/// for an authored cell (the interface already exists there); deferred to
+/// `config::load`, after discovery materializes the interface, for a
+/// `discover:` cell.
+pub fn validate_applies_to(def: &CellDef) -> Result<()> {
+    if def.definitions.is_empty() {
+        return Ok(());
+    }
+    let routes = crate::context::discoverable_routes(def)?;
+    for d in &def.definitions {
+        for entry in &d.applies_to {
+            // Shape was already checked by `validate_definitions`; `expect`
+            // here would be reachable only if that check were skipped.
+            let (route, column) = parse_applies_to(entry)
+                .map_err(|e| anyhow::anyhow!("definition '{}': {e}", d.term))?;
+            let export = match routes.iter().find(|(r, _)| *r == route) {
+                Some((_, e)) => e,
+                None => {
+                    let known = if routes.is_empty() {
+                        "none".to_string()
+                    } else {
+                        routes
+                            .iter()
+                            .map(|(r, _)| r.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    bail!(
+                        "definition '{}': `applies_to` names '{route}', which is not a \
+                         discoverable export — known exports: {known}.",
+                        d.term
+                    );
+                }
+            };
+            if let Some(col) = column {
+                if !export.schema.contains_key(&col) {
+                    let known = if export.schema.is_empty() {
+                        "none declared".to_string()
+                    } else {
+                        export.schema.keys().cloned().collect::<Vec<_>>().join(", ")
+                    };
+                    bail!(
+                        "definition '{}': `applies_to` names column '{col}' on '{route}', \
+                         which has no such declared column — declared columns: {known}.",
+                        d.term
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Bindings {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path).with_context(|| {
@@ -1528,6 +1850,7 @@ impl Bindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn export(name: &str, version: &str, source: Option<&str>) -> Export {
         Export {
@@ -2609,5 +2932,302 @@ cells:
         ])
         .unwrap();
         assert!(!builds_no_snapshot(&some));
+    }
+
+    // --- ADR 0017 §1: definitions ------------------------------------------
+
+    /// Parse-then-resolve the inline form without touching the filesystem —
+    /// `resolve_definitions` only reads a file for the file form.
+    fn resolve_defs(yaml: &str) -> Result<CellDef> {
+        let mut def: CellDef = serde_yaml::from_str(yaml)?;
+        def.resolve_definitions(Path::new("/nonexistent/does/not/matter"))?;
+        Ok(def)
+    }
+
+    fn tempdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-schema-definitions-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn inline_definitions_parse_and_resolve() {
+        let def = resolve_defs(
+            "cell: c\n\
+             definitions:\n\
+             \x20 - term: net_revenue\n\
+             \x20   aliases: [nr, revenue_net]\n\
+             \x20   description: Invoiced revenue less credit memos.\n",
+        )
+        .unwrap();
+        assert_eq!(def.definitions.len(), 1);
+        let d = &def.definitions[0];
+        assert_eq!(d.term, "net_revenue");
+        assert_eq!(d.aliases, vec!["nr", "revenue_net"]);
+        assert!(def.definitions_source.is_none(), "consumed by resolve");
+        assert!(def.definitions_file.is_none(), "inline form sets no file");
+        def.validate_definitions()
+            .expect("well-formed inline definitions must pass");
+    }
+
+    #[test]
+    fn file_form_definitions_load_from_disk_via_celldef_load() {
+        let dir = tempdir("file-form");
+        std::fs::write(
+            dir.join("definitions.yaml"),
+            "definitions:\n  - term: net_revenue\n    description: Invoiced revenue less credit memos.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: c\ndefinitions: definitions.yaml\n",
+        )
+        .unwrap();
+        let def = CellDef::load(&dir.join("cell.yaml")).unwrap();
+        assert_eq!(def.definitions.len(), 1);
+        assert_eq!(def.definitions[0].term, "net_revenue");
+        assert_eq!(def.definitions_file.as_deref(), Some("definitions.yaml"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_list_of_definitions_files_is_refused() {
+        let err = resolve_defs("cell: c\ndefinitions: [a.yaml, b.yaml]\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("names a list of files"), "{msg}");
+        assert!(msg.contains("only one file is allowed"), "{msg}");
+    }
+
+    #[test]
+    fn a_definitions_mapping_is_refused_naming_the_two_valid_shapes() {
+        let err = resolve_defs("cell: c\ndefinitions:\n  net_revenue: x\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must be a list of terms"), "{msg}");
+        assert!(msg.contains("one relative path"), "{msg}");
+    }
+
+    #[test]
+    fn definition_unknown_field_is_rejected() {
+        let err = resolve_defs(
+            "cell: c\ndefinitions:\n  - term: x\n    description: y\n    expression: 1+1\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn term_grammar_rejects_uppercase_and_leading_symbol() {
+        for bad in ["Net_Revenue", "-net", "net revenue", &"x".repeat(65)] {
+            let def = resolve_defs(&format!(
+                "cell: c\ndefinitions:\n  - term: {bad}\n    description: d\n"
+            ))
+            .unwrap();
+            let err = def.validate_definitions().unwrap_err().to_string();
+            assert!(err.contains("not a valid term/alias name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn alias_grammar_is_checked_the_same_as_term() {
+        let def = resolve_defs(
+            "cell: c\ndefinitions:\n  - term: net_revenue\n    aliases: [Bad Alias]\n    description: d\n",
+        )
+        .unwrap();
+        let err = def.validate_definitions().unwrap_err().to_string();
+        assert!(err.contains("not a valid term/alias name"), "{err}");
+    }
+
+    #[test]
+    fn more_than_five_aliases_is_rejected() {
+        let def = resolve_defs(
+            "cell: c\ndefinitions:\n  - term: t\n    aliases: [a, b, c, d, e, f]\n    description: d\n",
+        )
+        .unwrap();
+        let err = def.validate_definitions().unwrap_err().to_string();
+        assert!(err.contains("6 aliases declared (max 5)"), "{err}");
+    }
+
+    #[test]
+    fn description_required_and_length_capped() {
+        let empty =
+            resolve_defs("cell: c\ndefinitions:\n  - term: t\n    description: \"\"\n").unwrap();
+        let err = empty.validate_definitions().unwrap_err().to_string();
+        assert!(err.contains("`description` is required"), "{err}");
+
+        let long = resolve_defs(&format!(
+            "cell: c\ndefinitions:\n  - term: t\n    description: \"{}\"\n",
+            "x".repeat(1001)
+        ))
+        .unwrap();
+        let err = long.validate_definitions().unwrap_err().to_string();
+        assert!(err.contains("max 1000"), "{err}");
+    }
+
+    /// Grammar restricts terms/aliases to lowercase, so an authored collision
+    /// is always an exact-string match — the case-insensitive comparison
+    /// rule (ADR 0017 §1) is defense in depth, exercised here with an
+    /// alias that reuses another definition's term verbatim.
+    #[test]
+    fn duplicate_term_and_alias_case_insensitive_names_both() {
+        let def = resolve_defs(
+            "cell: c\ndefinitions:\n  - term: net_revenue\n    description: a\n  - term: \
+             gross_revenue\n    aliases: [net_revenue]\n    description: b\n",
+        )
+        .unwrap();
+        let err = def.validate_definitions().unwrap_err().to_string();
+        assert!(err.contains("net_revenue"), "{err}");
+        assert!(err.contains("gross_revenue"), "{err}");
+        assert!(err.contains("case-insensitive"), "{err}");
+    }
+
+    #[test]
+    fn more_than_256_definitions_is_rejected() {
+        let mut yaml = "cell: c\ndefinitions:\n".to_string();
+        for i in 0..257 {
+            yaml.push_str(&format!("  - term: t{i}\n    description: d\n"));
+        }
+        let def = resolve_defs(&yaml).unwrap();
+        let err = def.validate_definitions().unwrap_err().to_string();
+        assert!(err.contains("257 definitions (max 256)"), "{err}");
+    }
+
+    #[test]
+    fn applies_to_malformed_shape_is_rejected() {
+        let def = resolve_defs(
+            "cell: c\ndefinitions:\n  - term: t\n    description: d\n    applies_to: [not_a_route]\n",
+        )
+        .unwrap();
+        let err = def.validate_definitions().unwrap_err().to_string();
+        assert!(err.contains("is not `name@major`"), "{err}");
+    }
+
+    fn cell_with_export_and_applies_to(applies_to: &str) -> CellDef {
+        let yaml = format!(
+            "cell: c\ndefinitions:\n  - term: net_revenue\n    description: d\n    \
+             applies_to: [{applies_to}]\ninterface:\n  - name: flight_spend\n    \
+             version: 1.0.0\n    schema:\n      invoice_amount: decimal\n"
+        );
+        resolve_defs(&yaml).unwrap()
+    }
+
+    #[test]
+    fn applies_to_resolves_a_whole_route() {
+        let def = cell_with_export_and_applies_to("flight_spend@1");
+        validate_applies_to(&def).expect("a real route must resolve");
+    }
+
+    #[test]
+    fn applies_to_resolves_a_route_and_column() {
+        let def = cell_with_export_and_applies_to("flight_spend@1.invoice_amount");
+        validate_applies_to(&def).expect("a real route+column must resolve");
+    }
+
+    #[test]
+    fn applies_to_unknown_route_names_the_known_ones() {
+        let def = cell_with_export_and_applies_to("nonexistent@1");
+        let err = validate_applies_to(&def).unwrap_err().to_string();
+        assert!(err.contains("not a discoverable export"), "{err}");
+        assert!(err.contains("flight_spend@1"), "{err}");
+    }
+
+    #[test]
+    fn applies_to_unknown_column_names_the_declared_ones() {
+        let def = cell_with_export_and_applies_to("flight_spend@1.nope");
+        let err = validate_applies_to(&def).unwrap_err().to_string();
+        assert!(err.contains("no such declared column"), "{err}");
+        assert!(err.contains("invoice_amount"), "{err}");
+    }
+
+    /// ADR 0017 §1: `applies_to` validation is deferred past `CellDef::load`
+    /// for a `discover:` cell — its interface doesn't exist at parse time,
+    /// so `load` must not fail merely because the interface is still empty.
+    #[test]
+    fn celldef_load_does_not_validate_applies_to_for_a_discover_cell() {
+        let dir = tempdir("discover-deferred");
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: c\ndefinitions:\n  - term: net_revenue\n    description: d\n    \
+             applies_to: [nonexistent@1]\ndiscover:\n  from: sqlmesh\n  state: \
+             sqlmesh_state\n  warehouse: warehouse\n  select:\n    schemas: [marts]\n",
+        )
+        .unwrap();
+        let def = CellDef::load(&dir.join("cell.yaml")).expect(
+            "load must not resolve `applies_to` against an interface a discover: cell doesn't \
+             have yet",
+        );
+        assert_eq!(def.definitions.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn definitions_file_path_into_profiles_is_denied() {
+        let dir = tempdir("file-into-profiles");
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("profiles/prod.yaml"), "s3:\n  secret: x\n").unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: c\ndefinitions: profiles/prod.yaml\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", CellDef::load(&dir.join("cell.yaml")).unwrap_err());
+        assert!(err.contains("resolves into the profile directory"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn definitions_file_over_the_cap_is_rejected() {
+        let dir = tempdir("file-cap");
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        let mut big = "definitions:\n".to_string();
+        big.push_str(
+            &"# padding\n".repeat(crate::config::docs::MAX_DEFINITIONS_FILE_BYTES / 10 + 1),
+        );
+        std::fs::write(dir.join("definitions.yaml"), big).unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: c\ndefinitions: definitions.yaml\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", CellDef::load(&dir.join("cell.yaml")).unwrap_err());
+        assert!(err.contains("bytes (max"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A definition's `docs:` page counts against the shared 256 KiB total
+    /// docs pool (ADR 0017 §1) — this fails through `docs::validate_all`,
+    /// which now sums cell + export + definition pages together.
+    #[test]
+    fn a_definitions_docs_page_joins_the_shared_total_cap() {
+        let dir = tempdir("definition-docs-total-cap");
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        // Every individual page must stay under the 64 KiB per-page cap
+        // (`docs::MAX_PAGE_BYTES`), so exceeding the 256 KiB total needs
+        // several max-sized pages — mirrors
+        // `docs::tests::rejects_pages_over_the_total_cap`.
+        let mut yaml = "cell: c\ndefinitions:\n".to_string();
+        for i in 0..5 {
+            let name = format!("term{i}.md");
+            std::fs::write(
+                dir.join(&name),
+                "x".repeat(crate::config::docs::MAX_PAGE_BYTES),
+            )
+            .unwrap();
+            yaml.push_str(&format!(
+                "  - term: t{i}\n    description: d\n    docs: {name}\n"
+            ));
+        }
+        std::fs::write(dir.join("cell.yaml"), yaml).unwrap();
+        let err = format!("{:#}", CellDef::load(&dir.join("cell.yaml")).unwrap_err());
+        assert!(err.contains("docs pages total"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

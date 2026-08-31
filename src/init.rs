@@ -66,6 +66,13 @@ fn discovered_cell_yaml(name: &str) -> String {
     format!(
         r#"cell: {name}
 description: One line — what this set of deployed models is for.
+# docs: docs/cell.md              # long-form overview (ADR 0013) — worth adding here:
+                                  # per-model prose lives on an override (see discover.md),
+                                  # but the cell page is where an agent looks first.
+# definitions:                    # a business glossary spanning several models, or concepts
+#   - term: net_revenue           #   tied to no column at all (ADR 0017) — the thing a
+#     description: Invoiced revenue less credit memos.  # discovered cell's per-model
+#     # applies_to: [paid_media_daily@1.revenue]         # overrides have nowhere to hold.
 
 # A DISCOVERED cell (ADR 0016): the interface is read from the SQLMesh
 # project's deployed state by `datamk sync`, never authored here. There is no
@@ -204,6 +211,14 @@ interface:                        # the export list - the public surface, single
     freshness: daily
     visibility: discoverable      # private | discoverable
     contract: experimental        # experimental | supported  (a reviewed edit; `release` then pins it)
+
+# docs: docs/cell.md              # long-form overview page, additive to description (ADR 0013)
+# definitions:                    # a business glossary: metric/concept definitions spanning
+#   - term: net_revenue           #   several columns, several exports, or no column at all —
+#     description: Invoiced revenue less credit memos.  # not per-model, so `docs:` on one
+#     # aliases: [nr]             #   export has nowhere to hold it. Looked up via
+#     # docs: docs/net_revenue.md #   `GET /context?terms=net_revenue` (ADR 0017).
+#     # applies_to: [orders_daily@2.revenue]  # name@major[.column]; omit for cell-wide
 
 access:                           # default-deny: the serving plane exposes data only when shareable
   shareable: true

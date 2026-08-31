@@ -23,8 +23,26 @@ use super::{CellDef, Export};
 /// transform's SQL, and `published.json`.
 pub const MAX_PAGE_BYTES: usize = 64 * 1024;
 /// Total cap across every docs page declared on a cell — the context
-/// document is one request an agent loads whole.
+/// document is one request an agent loads whole. A definition's `docs:`
+/// page counts against this pool too (ADR 0017 §1).
 pub const MAX_TOTAL_BYTES: usize = 256 * 1024;
+/// Cap on the `definitions:` file itself (ADR 0017 §1) — independent of
+/// `MAX_PAGE_BYTES`/`MAX_TOTAL_BYTES`: this file carries structured terms,
+/// not a prose page, so it gets its own budget rather than competing with
+/// docs pages for the shared one.
+pub const MAX_DEFINITIONS_FILE_BYTES: usize = 256 * 1024;
+
+/// Who a `docs:`-shaped path belongs to, for error messages and the
+/// `DocsPage`/error `target`/subject wording (`clause`/`clause_subject`).
+/// Not `Option<&str>` (the pre-ADR-0017 shape) because a definitions file
+/// is neither the cell nor an export.
+#[derive(Clone, Copy)]
+pub(crate) enum DocsOwner<'a> {
+    Cell,
+    Export(&'a str),
+    Definition(&'a str),
+    DefinitionsFile,
+}
 
 /// One loaded docs page: identity plus content, read exactly once.
 #[derive(Debug, Clone)]
@@ -57,24 +75,28 @@ pub(crate) fn guess_media_type(path: &str) -> &'static str {
     }
 }
 
-/// The subject clause a message opens with: `cell` (no export name) or
-/// `export '{name}':`. Every docs error is phrased around one of these two
+/// The subject clause a message opens with: `cell` / `export '{name}':` /
+/// `definition '{term}':`. Every docs error is phrased around one of these
 /// shapes, matching `validate_prose`'s existing "cell `description`" /
 /// "export '{name}': `description`" split.
-fn clause(export_name: Option<&str>) -> String {
-    match export_name {
-        Some(n) => format!("export '{n}':"),
-        None => "cell".to_string(),
+fn clause(owner: DocsOwner) -> String {
+    match owner {
+        DocsOwner::Cell => "cell".to_string(),
+        DocsOwner::Export(n) => format!("export '{n}':"),
+        DocsOwner::Definition(t) => format!("definition '{t}':"),
+        DocsOwner::DefinitionsFile => "the definitions file:".to_string(),
     }
 }
 
-/// `export '{name}'` / `the cell` — the noun form used inside the `reading
-/// docs page ... (referenced by ...)` anyhow context, distinct from
-/// `clause`'s statement-opening form.
-fn clause_subject(export_name: Option<&str>) -> String {
-    match export_name {
-        Some(n) => format!("export '{n}'"),
-        None => "the cell".to_string(),
+/// `export '{name}'` / `the cell` / `definition '{term}'` — the noun form
+/// used inside the `reading docs page ... (referenced by ...)` anyhow
+/// context, distinct from `clause`'s statement-opening form.
+fn clause_subject(owner: DocsOwner) -> String {
+    match owner {
+        DocsOwner::Cell => "the cell".to_string(),
+        DocsOwner::Export(n) => format!("export '{n}'"),
+        DocsOwner::Definition(t) => format!("definition '{t}'"),
+        DocsOwner::DefinitionsFile => "the definitions file".to_string(),
     }
 }
 
@@ -88,7 +110,7 @@ fn clause_subject(export_name: Option<&str>) -> String {
 /// 3. Explicitly denied entry into `profiles/` (the profile Secret mounts
 ///    there, `deploy/targets/kubernetes/render.rs`'s `PROFILE_MOUNT`) and
 ///    `.cell/` (engine-owned state, e.g. `published.json`).
-fn resolve_path(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result<PathBuf> {
+fn resolve_path(cell_dir: &Path, raw: &str, owner: DocsOwner) -> Result<PathBuf> {
     let rel = Path::new(raw);
     if rel.is_absolute() {
         bail!(
@@ -107,7 +129,7 @@ fn resolve_path(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result
     let resolved = candidate.canonicalize().with_context(|| {
         format!(
             "reading docs page {raw} (referenced by `docs:` on {})",
-            clause_subject(export_name)
+            clause_subject(owner)
         )
     })?;
     if !resolved.starts_with(&cell_dir_canon) {
@@ -122,14 +144,14 @@ fn resolve_path(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result
         bail!(
             "{} `docs` path {raw} resolves into the profile directory — docs must not expose \
              environment config.",
-            clause(export_name)
+            clause(owner)
         );
     }
     if inside.starts_with(".cell") {
         bail!(
             "{} `docs` path {raw} resolves into datamk's private state directory (.cell) — \
              docs must not reference engine-internal files.",
-            clause(export_name)
+            clause(owner)
         );
     }
     Ok(resolved)
@@ -139,19 +161,19 @@ fn resolve_path(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result
 /// the resolved absolute path and its content. Every failure mode fails
 /// loud: unreadable, oversized, empty, or non-UTF-8 — matching
 /// `load_principals`'s discipline for the profile's `principals:` file.
-fn read_one(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result<(PathBuf, String)> {
-    let resolved = resolve_path(cell_dir, raw, export_name)?;
+fn read_one(cell_dir: &Path, raw: &str, owner: DocsOwner) -> Result<(PathBuf, String)> {
+    let resolved = resolve_path(cell_dir, raw, owner)?;
     let bytes = std::fs::read(&resolved).with_context(|| {
         format!(
             "reading docs page {raw} (referenced by `docs:` on {})",
-            clause_subject(export_name)
+            clause_subject(owner)
         )
     })?;
     if bytes.len() > MAX_PAGE_BYTES {
         bail!(
             "{} docs page {raw} is {} bytes (max {MAX_PAGE_BYTES}) — the context document is \
              one request an agent loads whole; split the page or link out of it.",
-            clause(export_name),
+            clause(owner),
             bytes.len()
         );
     }
@@ -159,7 +181,7 @@ fn read_one(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result<(Pa
         bail!(
             "{} docs page {raw} is empty — an empty `docs:` page has nothing for an agent to \
              read; remove `docs:` or add content.",
-            clause(export_name)
+            clause(owner)
         );
     }
     let content = String::from_utf8(bytes).map_err(|_| {
@@ -169,6 +191,26 @@ fn read_one(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result<(Pa
         )
     })?;
     Ok((resolved, content))
+}
+
+/// Resolve+read the `definitions:` file (ADR 0017 §1), when `definitions:`
+/// named one — the identical allowlist `docs:` pages use
+/// (`resolve_path`), capped independently at `MAX_DEFINITIONS_FILE_BYTES`
+/// (this file carries structured terms, not a prose page, so it does not
+/// share the docs pool). Returns the raw YAML text; `CellDef::
+/// resolve_definitions` parses it.
+pub(crate) fn read_definitions_file(cell_dir: &Path, raw: &str) -> Result<String> {
+    let resolved = resolve_path(cell_dir, raw, DocsOwner::DefinitionsFile)?;
+    let bytes =
+        std::fs::read(&resolved).with_context(|| format!("reading definitions file {raw}"))?;
+    if bytes.len() > MAX_DEFINITIONS_FILE_BYTES {
+        bail!(
+            "the definitions file {raw} is {} bytes (max {MAX_DEFINITIONS_FILE_BYTES}).",
+            bytes.len()
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("the definitions file {raw} is not valid UTF-8."))
 }
 
 /// Validate every declared `docs:` page — cell-level plus every export
@@ -182,12 +224,20 @@ fn read_one(cell_dir: &Path, raw: &str, export_name: Option<&str>) -> Result<(Pa
 pub fn validate_all(cell_dir: &Path, def: &CellDef) -> Result<()> {
     let mut total = 0usize;
     if let Some(raw) = &def.docs {
-        let (_, content) = read_one(cell_dir, raw, None)?;
+        let (_, content) = read_one(cell_dir, raw, DocsOwner::Cell)?;
         total += content.len();
     }
     for export in &def.interface {
         if let Some(raw) = &export.docs {
-            let (_, content) = read_one(cell_dir, raw, Some(&export.name))?;
+            let (_, content) = read_one(cell_dir, raw, DocsOwner::Export(&export.name))?;
+            total += content.len();
+        }
+    }
+    // ADR 0017 §1: a definition's `docs:` page counts against the same
+    // per-page and total caps a cell/export page does.
+    for d in &def.definitions {
+        if let Some(raw) = &d.docs {
+            let (_, content) = read_one(cell_dir, raw, DocsOwner::Definition(&d.term))?;
             total += content.len();
         }
     }
@@ -217,18 +267,38 @@ pub fn load_declared(
 ) -> Result<Vec<DocsPage>> {
     let mut pages = Vec::new();
     if let Some(raw) = &def.docs {
-        pages.push(build_page(dir, "cell", raw, None)?);
+        pages.push(build_page(dir, "cell", raw, DocsOwner::Cell)?);
     }
     for (route, export) in routes {
         if let Some(raw) = &export.docs {
-            pages.push(build_page(dir, route, raw, Some(&export.name))?);
+            pages.push(build_page(
+                dir,
+                route,
+                raw,
+                DocsOwner::Export(&export.name),
+            )?);
+        }
+    }
+    // ADR 0017 §2: a definition's page is a `docs[]` entry with
+    // `target: "definition:<term>"` — the third target form beside `"cell"`
+    // and `name@major`. Definitions are cell-wide (not visibility-filtered
+    // like `routes`), so every declared page loads regardless of `routes`.
+    for d in &def.definitions {
+        if let Some(raw) = &d.docs {
+            let target = format!("definition:{}", d.term);
+            pages.push(build_page(
+                dir,
+                &target,
+                raw,
+                DocsOwner::Definition(&d.term),
+            )?);
         }
     }
     Ok(pages)
 }
 
-fn build_page(dir: &Path, target: &str, raw: &str, export_name: Option<&str>) -> Result<DocsPage> {
-    let (_, content) = read_one(dir, raw, export_name)?;
+fn build_page(dir: &Path, target: &str, raw: &str, owner: DocsOwner) -> Result<DocsPage> {
+    let (_, content) = read_one(dir, raw, owner)?;
     let sha256 = crate::context::sha256_hex(content.as_bytes());
     let bytes = content.len();
     Ok(DocsPage {

@@ -267,11 +267,27 @@ parents by route key; unselected ones are a count, never names.
 
 ## Docs pages
 
-A discovered export's meaning fields live upstream. The one authored thing
-per export that has no home there is the long-form consumer page — how to
-join it, what not to use it for — and that is `docs:` on an override,
-exactly as on a hand-authored export (ADR 0013): one relative path, under
-the cell directory, 64 KiB per page, 256 KiB per cell.
+Start with the cell page and the glossary, not per-export pages: `docs:`
+on the cell (ADR 0013) already ships on every `/context/<route>` and is
+the one place to say what this set of models is *for*, and `definitions:`
+(ADR 0017) is where metric/business concepts that span several models —
+or tie to no column at all — belong. A discovered export's meaning fields
+live upstream; neither of these does, so both are worth authoring here
+even on a cell that authors nothing else.
+
+```yaml
+docs: docs/cell.md
+definitions:
+  - term: net_revenue
+    description: Invoiced revenue less credit memos.
+    applies_to: [paid_media_daily@1.revenue]
+```
+
+The one authored thing *per export* that has no home upstream is the
+long-form consumer page — how to join it, what not to use it for — and
+that is `docs:` on an override, exactly as on a hand-authored export: one
+relative path, under the cell directory, 64 KiB per page, 256 KiB per cell
+(the glossary's own pages count against the same cap).
 
 ```
 cells/ape/
@@ -283,7 +299,6 @@ cells/ape/
 ```
 
 ```yaml
-docs: docs/cell.md
 discover:
   overrides:
     - model: ape_mktg.paid_media_daily
@@ -291,12 +306,13 @@ discover:
       docs: docs/paid_media_daily.md      # an override may carry docs alone
 ```
 
-The page lands in `docs[]` under the export's route key
-(`paid_media_daily@1`), with `content` under `?include=docs`; adding or
-renaming a page moves the digest, editing its prose does not, and `release`
-folds it into the meaning ratchet. A page that breaks the rules (outside
-the cell directory, absolute, over the cap) fails `sync` — the step that
-has credentials — as well as `context` and `serve`.
+The export page lands in `docs[]` under the export's route key
+(`paid_media_daily@1`); a definition's page lands under
+`definition:<term>` — both carry `content` under `?include=docs`. Adding
+or renaming a page moves the digest, editing its prose does not, and
+`release` folds every page into the meaning ratchet. A page that breaks
+the rules (outside the cell directory, absolute, over the cap) fails
+`sync` — the step that has credentials — as well as `context` and `serve`.
 
 ## Deploying, and when the record refreshes
 

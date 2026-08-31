@@ -736,6 +736,7 @@ fn build_state(
             cell.def.description.as_deref(),
             if data_mounted { &mounted } else { &[] },
             &all_routes,
+            &cell.def.definitions,
             &digest,
             base_path,
         ),
@@ -1235,46 +1236,122 @@ async fn health(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
 }
 
 /// The closed `include=` vocabulary (ADR 0013 §4) — the single source both
-/// `validate_include` and `openapi::generate`'s documented `enum` read, so
-/// the two can never drift.
+/// `validate_context_query` and `openapi::generate`'s documented `enum`
+/// read, so the two can never drift.
 pub(crate) const INCLUDE_SECTIONS: &[&str] = &["docs"];
 
-/// Validate `/context`'s query string against the closed grammar (ADR 0013
-/// §4): only `include` is accepted, and its value is a comma-separated list
-/// drawn from `INCLUDE_SECTIONS`. Returns the requested sections
-/// (deduplicated, insertion order) or the exact 400 message. Takes the raw
-/// pairs (not a `HashMap`) so repeated keys are seen rather than silently
-/// collapsed — irrelevant for the one key this grammar has today, but the
+/// `?terms=` cap (ADR 0017 §3) — the largest known estate at request time.
+const MAX_TERMS: usize = 64;
+
+/// The two query parameters `/context`/`/context/{route}` accept, already
+/// validated against the closed grammar — deduplicated, insertion order.
+struct ContextQuery {
+    include: Vec<String>,
+    terms: Vec<String>,
+}
+
+/// Validate `/context`'s query string against the closed `{include, terms}`
+/// grammar (ADR 0013 §4, extended by ADR 0017 §3): `include`'s value is a
+/// comma-separated list drawn from `INCLUDE_SECTIONS`; `terms`'s value is a
+/// comma-separated list of tokens matching `[A-Za-z0-9_.-]`, capped at
+/// `MAX_TERMS`. Any other parameter, an empty value, an empty segment, or
+/// an out-of-grammar token is a 400. Takes the raw pairs (not a `HashMap`)
+/// so repeated keys are seen rather than silently collapsed — the
 /// discipline `serve_export`'s `validate_params` already established.
-fn validate_include(pairs: &[(String, String)]) -> std::result::Result<Vec<String>, String> {
-    let mut sections: Vec<String> = Vec::new();
+fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<ContextQuery, String> {
+    let mut include: Vec<String> = Vec::new();
+    let mut terms: Vec<String> = Vec::new();
+    let mut terms_seen = 0usize;
     for (k, v) in pairs {
-        if k != "include" {
-            return Err(format!(
-                "unknown query parameter '{k}' — `/context` accepts `include` (sections: docs)"
-            ));
-        }
-        for tok in v.split(',') {
-            if tok.is_empty() {
-                // Covers both an entirely empty value (`?include=`, whose
-                // single `split` item is `""`) and a trailing/leading/double
-                // comma (`?include=docs,`) with one check.
-                return Err(
-                    "`include` must name at least one section — `/context` accepts: docs"
-                        .to_string(),
-                );
+        match k.as_str() {
+            "include" => {
+                for tok in v.split(',') {
+                    if tok.is_empty() {
+                        // Covers both an entirely empty value (`?include=`,
+                        // whose single `split` item is `""`) and a
+                        // trailing/leading/double comma (`?include=docs,`)
+                        // with one check.
+                        return Err(
+                            "`include` must name at least one section — `/context` accepts: docs"
+                                .to_string(),
+                        );
+                    }
+                    if !INCLUDE_SECTIONS.contains(&tok) {
+                        return Err(format!(
+                            "unknown `include` section '{tok}' — `/context` accepts: docs"
+                        ));
+                    }
+                    if !include.iter().any(|s| s == tok) {
+                        include.push(tok.to_string());
+                    }
+                }
             }
-            if !INCLUDE_SECTIONS.contains(&tok) {
+            "terms" => {
+                for tok in v.split(',') {
+                    if tok.is_empty() {
+                        return Err(
+                            "`terms` must name at least one term or alias — a comma-separated \
+                             list matching [A-Za-z0-9_.-]"
+                                .to_string(),
+                        );
+                    }
+                    if !tok
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+                    {
+                        return Err(format!(
+                            "`terms` token '{tok}' has characters outside [A-Za-z0-9_.-]"
+                        ));
+                    }
+                    terms_seen += 1;
+                    if terms_seen > MAX_TERMS {
+                        return Err(format!(
+                            "`terms` names more than {MAX_TERMS} tokens — narrow the request"
+                        ));
+                    }
+                    if !terms.iter().any(|s| s == tok) {
+                        terms.push(tok.to_string());
+                    }
+                }
+            }
+            other => {
                 return Err(format!(
-                    "unknown `include` section '{tok}' — `/context` accepts: docs"
+                    "unknown query parameter '{other}' — `/context` accepts `include` \
+                     (sections: docs) and `terms`"
                 ));
-            }
-            if !sections.iter().any(|s| s == tok) {
-                sections.push(tok.to_string());
             }
         }
     }
-    Ok(sections)
+    Ok(ContextQuery { include, terms })
+}
+
+/// Case-insensitive term/alias lookup over `s.interface.definitions`,
+/// resolved to canonical terms, deduplicated — the same resolution
+/// `ContextDocument::narrow_terms` performs, exposed standalone so the
+/// `ETag` (ADR 0017 §4) can be computed before assembling the document:
+/// bounded (`MAX_TERMS`), in-memory, over data already resident in
+/// `AppState` — the request path's first hashing.
+fn resolve_terms(s: &AppState, tokens: &[String]) -> Vec<String> {
+    let mut index: HashMap<String, &str> = HashMap::new();
+    for d in &s.interface.definitions {
+        index
+            .entry(d.term.to_ascii_lowercase())
+            .or_insert(d.term.as_str());
+        for alias in &d.aliases {
+            index
+                .entry(alias.to_ascii_lowercase())
+                .or_insert(d.term.as_str());
+        }
+    }
+    let mut matched: Vec<String> = Vec::new();
+    for tok in tokens {
+        if let Some(term) = index.get(&tok.to_ascii_lowercase()) {
+            if !matched.iter().any(|t| t == term) {
+                matched.push(term.to_string());
+            }
+        }
+    }
+    matched
 }
 
 /// `GET /context` (ADR 0012, docs door: ADR 0013 §4). Same auth tier as the
@@ -1299,31 +1376,43 @@ async fn context_doc(
         return resp;
     }
 
-    let sections = match validate_include(&pairs) {
-        Ok(s) => s,
+    let query = match validate_context_query(&pairs) {
+        Ok(q) => q,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let want_docs = sections.iter().any(|s| s == "docs");
+    let want_docs = query.include.iter().any(|s| s == "docs");
+    // ADR 0017 §3: an unresolved token still selects the (empty) `terms=`
+    // variant — `narrow_terms` reports it in `missing_terms`, never a 400.
+    let terms = (!query.terms.is_empty()).then(|| resolve_terms(&s, &query.terms));
 
     // The interface digest names the interface; the ETag names a
-    // representation of it (ADR 0013 §6) — both suffixes are precomputed at
-    // startup, never on the request path, and layer independently:
-    // `~observed.<hash>` (H3) folds in `source_check`/`source_descriptions`
-    // — startup-fixed facts that can newly appear across a rollout with
-    // `cell.yaml` byte-identical, which `interface_digest` alone would miss
-    // entirely (declared/data only, ADR 0012 §2) — and is present on every
-    // variant, default included, whenever there's an observed input to
-    // cover; `~docs.<bundle sha>` (ADR 0013 §6) adds the docs-content
-    // bundle only for `?include=docs`. A cell with neither observed input
-    // present keeps the exact byte-identical default ETag it always had
-    // (mesh.rs copies this verbatim into `context_digest`).
-    let etag = context_etag(&s, want_docs, None);
+    // representation of it (ADR 0013 §6, ADR 0017 §4) — every suffix below
+    // is either precomputed at startup or, for `~terms`/`~docs` under a
+    // filter, a bounded in-memory hash over data already resident in
+    // `AppState` (ADR 0017 §4) — never a filesystem, store, or DuckDB read.
+    let etag = context_etag(&s, want_docs, None, terms.as_deref());
     if matches_etag(&headers, &etag) {
         return not_modified(etag);
     }
     let mut doc = build_context_document(&s);
+    if terms.is_some() {
+        // The raw request tokens, not the resolved list: `narrow_terms` is
+        // what reports the unresolved ones in `missing_terms`.
+        let all_docs = doc.docs.clone();
+        doc.narrow_terms(&query.terms, &s.interface.definitions, &all_docs);
+    }
     if want_docs {
-        doc.inline_docs(&s.docs_pages);
+        // Whatever `doc.docs` holds at this point (the full list, or the
+        // `terms=`-selected subset) — inlining only ever adds `content` to
+        // entries already present, so this is correct under every
+        // composition (ADR 0017 §3's "only" rule for `docs[]` under terms).
+        let targets: HashSet<&str> = doc.docs.iter().map(|d| d.target.as_str()).collect();
+        let pages: Vec<&crate::config::docs::DocsPage> = s
+            .docs_pages
+            .iter()
+            .filter(|p| targets.contains(p.target.as_str()))
+            .collect();
+        doc.inline_docs(pages);
     }
     context_response(etag, doc)
 }
@@ -1340,11 +1429,12 @@ async fn context_export(
     if let Err(resp) = authorize(&s, &headers) {
         return resp;
     }
-    let sections = match validate_include(&pairs) {
-        Ok(s) => s,
+    let query = match validate_context_query(&pairs) {
+        Ok(q) => q,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let want_docs = sections.iter().any(|s| s == "docs");
+    let want_docs = query.include.iter().any(|s| s == "docs");
+    let terms = (!query.terms.is_empty()).then(|| resolve_terms(&s, &query.terms));
     if !s.routes.contains_key(&route) {
         let mut known: Vec<&str> = s.routes.keys().map(String::as_str).collect();
         known.sort_unstable();
@@ -1362,35 +1452,49 @@ async fn context_export(
         )
             .into_response();
     }
-    let etag = context_etag(&s, want_docs, Some(&route));
+    let etag = context_etag(&s, want_docs, Some(&route), terms.as_deref());
     if matches_etag(&headers, &etag) {
         return not_modified(etag);
     }
     let mut doc = build_context_document(&s);
+    // ADR 0017 §3: `terms=` resolves against the whole cell, not the
+    // route's scope — captured before `narrow_to` reduces `doc.docs`.
+    let all_docs = doc.docs.clone();
     doc.narrow_to(&route);
+    if terms.is_some() {
+        doc.narrow_terms(&query.terms, &s.interface.definitions, &all_docs);
+    }
     if want_docs {
+        let targets: HashSet<&str> = doc.docs.iter().map(|d| d.target.as_str()).collect();
         let pages: Vec<&crate::config::docs::DocsPage> = s
             .docs_pages
             .iter()
-            .filter(|p| p.target == "cell" || p.target == route)
+            .filter(|p| targets.contains(p.target.as_str()))
             .collect();
         doc.inline_docs(pages);
     }
     context_response(etag, doc)
 }
 
-/// The ETag for one representation of the context document (ADR 0013 §6).
-/// The interface digest names the interface; the ETag names a
-/// representation — the suffixes are precomputed at startup, never on the
-/// request path, and layer independently: `~observed.<hash>` (H3) folds in
-/// `source_check`/`source_descriptions` — startup-fixed facts that can newly
-/// appear across a rollout with `cell.yaml` byte-identical — and is present
-/// on every variant whenever there's an observed input; `~export.<route>`
-/// names a per-export narrowing; `~docs.<bundle sha>` adds the docs-content
-/// bundle for `?include=docs`. A cell with neither observed input present
-/// keeps the exact byte-identical default ETag it always had (mesh.rs copies
-/// this verbatim into `context_digest`).
-fn context_etag(s: &AppState, want_docs: bool, export: Option<&str>) -> String {
+/// The ETag for one representation of the context document (ADR 0013 §6,
+/// extended by ADR 0017 §4). The interface digest names the interface; the
+/// ETag names a representation — the suffixes layer independently:
+/// `~observed.<hash>` (H3) folds in `source_check`/`source_descriptions`;
+/// `~export.<route>` names a per-export narrowing; `~terms.<sha12>` (ADR
+/// 0017 §4) hashes the sorted canonical selected terms — present whenever
+/// `terms=` was given, even if every token missed (a subset yields a
+/// distinct tag by construction); `~docs.<sha12>` adds the docs-content
+/// bundle for `?include=docs`, computed over the *selected* pages' sha256s
+/// in declared order when `terms` narrows it, or `s.docs_bundle_sha12`
+/// (precomputed at startup) otherwise. A cell with neither observed input
+/// present and no `terms=` keeps the exact byte-identical default ETag it
+/// always had (mesh.rs copies this verbatim into `context_digest`).
+fn context_etag(
+    s: &AppState,
+    want_docs: bool,
+    export: Option<&str>,
+    terms: Option<&[String]>,
+) -> String {
     let mut etag = format!("\"{}", s.digest);
     if let Some(obs) = &s.observed_bundle_sha12 {
         etag.push_str(&format!("~observed.{obs}"));
@@ -1398,8 +1502,35 @@ fn context_etag(s: &AppState, want_docs: bool, export: Option<&str>) -> String {
     if let Some(route) = export {
         etag.push_str(&format!("~export.{route}"));
     }
-    if want_docs {
-        etag.push_str(&format!("~docs.{}", s.docs_bundle_sha12));
+    match terms {
+        Some(canonical) => {
+            let mut sorted = canonical.to_vec();
+            sorted.sort_unstable();
+            let sha12 = crate::context::sha256_hex(sorted.join(",").as_bytes())[..12].to_string();
+            etag.push_str(&format!("~terms.{sha12}"));
+            if want_docs {
+                // ADR 0017 §4: the first hashing on the request path — 2^N
+                // subsets of a bounded (≤64 tokens), in-memory list can't be
+                // precomputed. Declared order (`s.docs_pages`'), not sorted.
+                let selected: Vec<&str> = s
+                    .docs_pages
+                    .iter()
+                    .filter(|p| {
+                        p.target
+                            .strip_prefix("definition:")
+                            .is_some_and(|t| canonical.iter().any(|c| c == t))
+                    })
+                    .map(|p| p.sha256.as_str())
+                    .collect();
+                let docs_sha12 =
+                    crate::context::sha256_hex(selected.join(",").as_bytes())[..12].to_string();
+                etag.push_str(&format!("~docs.{docs_sha12}"));
+            }
+        }
+        None if want_docs => {
+            etag.push_str(&format!("~docs.{}", s.docs_bundle_sha12));
+        }
+        None => {}
     }
     etag.push('"');
     etag
@@ -3208,6 +3339,90 @@ mod smoke {
         app(state, DEFAULT_MAX_CONCURRENCY)
     }
 
+    // --- ADR 0017: definitions and `?terms=` --------------------------
+
+    /// A third scaffold: two terms — one cell-wide, one scoped to
+    /// `orders@1.revenue` with its own long-form page — beside the same
+    /// docs-bearing shape `built_cell_with_docs` uses.
+    fn built_cell_with_definitions() -> &'static Scaffold {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Scaffold> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "datamk-serve-smoke-definitions-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sql")).unwrap();
+            std::fs::create_dir_all(dir.join("profiles")).unwrap();
+            std::fs::create_dir_all(dir.join("docs")).unwrap();
+            std::fs::write(
+                dir.join("cell.yaml"),
+                "cell: definitions_demo\n\
+                 description: A demo cell with a glossary.\n\
+                 definitions:\n\
+                 \x20 - term: active_customer\n\
+                 \x20   description: A customer with an order in the last 90 days.\n\
+                 \x20 - term: net_revenue\n\
+                 \x20   aliases: [nr]\n\
+                 \x20   description: Invoiced revenue less credit memos.\n\
+                 \x20   docs: docs/net_revenue.md\n\
+                 \x20   applies_to: [orders@1.revenue]\n\
+                 transforms:\n\
+                 \x20 - sql/orders.sql\n\
+                 interface:\n\
+                 \x20 - name: orders\n\
+                 \x20   version: 1.0.0\n\
+                 \x20   description: One row per order.\n\
+                 \x20   grain: [order_id]\n\
+                 \x20   schema:\n\
+                 \x20     order_id: bigint\n\
+                 \x20     revenue: decimal\n\
+                 access:\n\
+                 \x20 shareable: true\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("sql/orders.sql"),
+                "SELECT * FROM (VALUES (CAST(1 AS BIGINT), 10.0), (CAST(2 AS BIGINT), 20.0)) \
+                 AS t(order_id, revenue)",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("docs/net_revenue.md"),
+                "# Net revenue\n\nInvoiced revenue less credit memos, explained at length.",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("profiles/local.yaml"),
+                "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+            )
+            .unwrap();
+            crate::engine::run(
+                &dir.join("cell.yaml"),
+                "local",
+                None,
+                crate::engine::RunOptions::default(),
+            )
+            .expect("build the definitions scaffold cell");
+            Scaffold { dir }
+        })
+    }
+
+    fn router_definitions(mutate: impl FnOnce(&mut engine::Cell)) -> Router {
+        let scaffold = built_cell_with_definitions();
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell =
+            engine::open(&cell_yaml, "local", true).expect("open definitions scaffold read-only");
+        mutate(&mut cell);
+        let (state, _store) =
+            build_state(cell, false, &cell_yaml, "local", "").expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
     async fn get_with_headers(
         router: &Router,
         uri: &str,
@@ -3458,6 +3673,201 @@ mod smoke {
             // A repeated identical token is accepted.
             let (status, body) = get(&router, "/context?include=docs&include=docs", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
+        });
+    }
+
+    /// ADR 0017 §3: the closed `terms=` grammar — an empty value, an empty
+    /// segment, an out-of-grammar token, and more than 64 tokens are all
+    /// 400s; an unknown but well-formed term is not (it's a 200 with a
+    /// `missing_terms` entry, exercised separately below).
+    #[test]
+    fn terms_query_param_validation_rejects_the_closed_set() {
+        let router = router_definitions(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?terms=", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("must name at least one term"), "{body}");
+
+            let (status, body) = get(&router, "/context?terms=net_revenue,", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("must name at least one term"), "{body}");
+
+            let (status, body) = get(&router, "/context?terms=bad%20term", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("characters outside"), "{body}");
+
+            let many = (0..65)
+                .map(|i| format!("t{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let (status, body) = get(&router, &format!("/context?terms={many}"), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("more than 64 tokens"), "{body}");
+        });
+    }
+
+    /// ADR 0017 §2/§3: `definitions[]` ships unconditionally; an unknown
+    /// term is a 200 naming the miss in `missing_terms`, never a 400/404.
+    #[test]
+    fn terms_narrows_definitions_and_reports_an_unknown_term_as_200() {
+        let router = router_definitions(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["definitions"].as_array().unwrap().len(), 2, "{body}");
+            assert_eq!(v["missing_terms"], serde_json::json!([]));
+            assert_eq!(
+                v["definitions_request"],
+                "context?terms=<term>[,<term>]&include=docs"
+            );
+
+            // Case-insensitive, alias-aware, plus one unresolved token.
+            let (status, body) = get(&router, "/context?terms=NR,nope", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let terms: Vec<&str> = v["definitions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["term"].as_str().unwrap())
+                .collect();
+            assert_eq!(terms, vec!["net_revenue"]);
+            assert_eq!(v["missing_terms"], serde_json::json!(["nope"]));
+        });
+    }
+
+    /// ADR 0017 §3: `terms=` + `include=docs` inlines only the selected
+    /// terms' pages — the cell page never appears, even though it exists.
+    #[test]
+    fn terms_with_include_docs_inlines_only_the_selected_pages() {
+        let router = router_definitions(|_| {});
+        rt().block_on(async {
+            let (status, body) =
+                get(&router, "/context?terms=net_revenue&include=docs", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let docs = v["docs"].as_array().unwrap();
+            assert_eq!(docs.len(), 1, "{body}");
+            assert_eq!(docs[0]["target"], "definition:net_revenue");
+            assert!(docs[0]["content"].as_str().unwrap().contains("Net revenue"));
+        });
+    }
+
+    /// ADR 0017 §3: composed with `/context/<route>`, `terms=` resolves
+    /// against the whole cell — `net_revenue`'s `applies_to` names
+    /// `orders@1`, so asking for it while narrowed to that same route
+    /// still resolves (the composition case that would otherwise conflate
+    /// "unknown" with "out of route scope").
+    #[test]
+    fn terms_composes_with_route_narrowing() {
+        let router = router_definitions(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context/orders@1?terms=net_revenue", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["exports"].as_array().unwrap().len(), 1);
+            assert_eq!(v["exports"][0]["route"], "orders@1");
+            let terms: Vec<&str> = v["definitions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["term"].as_str().unwrap())
+                .collect();
+            assert_eq!(terms, vec!["net_revenue"]);
+            assert_eq!(v["missing_terms"], serde_json::json!([]));
+        });
+    }
+
+    /// ADR 0017 §4: without `terms=`, `/context`'s `ETag` is byte-identical
+    /// to what it was before this ADR — a cell that declares `definitions:`
+    /// but is never asked for a subset must not see its default caching
+    /// change.
+    #[test]
+    fn etag_without_terms_is_unaffected_by_declaring_definitions() {
+        let with_defs = router_definitions(|_| {});
+        let without_defs = router_with(|_| {});
+        rt().block_on(async {
+            let (_, headers, _) = get_with_headers(&with_defs, "/context", &[]).await;
+            let etag_with_defs = headers.get(header::ETAG).unwrap().to_str().unwrap();
+            // Same shape, different digest input (different cell) — the
+            // point here is only that the suffix grammar is unchanged: no
+            // `~terms.` appears absent a `terms=` request.
+            assert!(!etag_with_defs.contains("~terms."), "{etag_with_defs}");
+
+            let (_, headers, _) = get_with_headers(&without_defs, "/context", &[]).await;
+            let etag_without_defs = headers.get(header::ETAG).unwrap().to_str().unwrap();
+            assert!(
+                !etag_without_defs.contains("~terms."),
+                "{etag_without_defs}"
+            );
+        });
+    }
+
+    /// ADR 0017 §4: `~terms.<sha12>` is present under `terms=` (even when
+    /// nothing resolved — a subset yields a distinct tag by construction),
+    /// distinct subsets get distinct tags, and each round-trips through
+    /// `If-None-Match` to a real 304 that never false-matches a different
+    /// variant.
+    #[test]
+    fn terms_etag_is_distinct_per_subset_and_round_trips_to_304() {
+        let router = router_definitions(|_| {});
+        rt().block_on(async {
+            let (_, plain_headers, _) = get_with_headers(&router, "/context", &[]).await;
+            let plain_etag = plain_headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            let (_, h1, _) = get_with_headers(&router, "/context?terms=net_revenue", &[]).await;
+            let etag1 = h1.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+            assert!(etag1.contains("~terms."), "{etag1}");
+            assert_ne!(etag1, plain_etag);
+
+            let (_, h2, _) = get_with_headers(&router, "/context?terms=active_customer", &[]).await;
+            let etag2 = h2.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+            assert_ne!(etag1, etag2, "distinct subsets must get distinct tags");
+
+            // A miss still gets its own distinct tag.
+            let (_, h3, _) = get_with_headers(&router, "/context?terms=nope", &[]).await;
+            let etag3 = h3.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+            assert_ne!(etag3, plain_etag);
+            assert_ne!(etag3, etag1);
+
+            // Round-trips to 304 for the exact variant it names.
+            let (status1, _, _) = get_with_headers(
+                &router,
+                "/context?terms=net_revenue",
+                &[("if-none-match", &etag1)],
+            )
+            .await;
+            assert_eq!(status1, StatusCode::NOT_MODIFIED);
+
+            // Never false-304s a different variant, including the plain one.
+            let (status_cross, _, _) = get_with_headers(
+                &router,
+                "/context?terms=active_customer",
+                &[("if-none-match", &etag1)],
+            )
+            .await;
+            assert_eq!(status_cross, StatusCode::OK);
+            let (status_plain, _, _) =
+                get_with_headers(&router, "/context", &[("if-none-match", &etag1)]).await;
+            assert_eq!(status_plain, StatusCode::OK);
+
+            // `terms=net_revenue&include=docs` gets its own tag distinct
+            // from the bare `terms=net_revenue` one (the `~docs.` suffix
+            // hashes the selected page, not the whole bundle).
+            let (_, h4, _) =
+                get_with_headers(&router, "/context?terms=net_revenue&include=docs", &[]).await;
+            let etag4 = h4.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+            assert!(
+                etag4.contains("~terms.") && etag4.contains("~docs."),
+                "{etag4}"
+            );
+            assert_ne!(etag4, etag1);
         });
     }
 

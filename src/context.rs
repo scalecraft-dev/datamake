@@ -93,6 +93,17 @@ pub struct ContextDocument {
     /// build has been observed, what was actually attached (issue #7). Never
     /// the upstream `table` (the upstream owner's to disclose — ADR 0012 §5).
     pub upstreams: Vec<UpstreamDoc>,
+    /// The glossary index (ADR 0017 §2) — always present, never gated
+    /// behind `include=`. Narrowed by `?terms=` (`narrow_terms`) and by
+    /// `/context/<route>` (`narrow_to`).
+    pub definitions: Vec<DefinitionDoc>,
+    /// `?terms=` tokens that resolved to no term or alias, echoed verbatim
+    /// — engine-emitted, always present (`[]` when nothing was asked or
+    /// everything resolved). An unknown term is not an error (ADR 0017 §3).
+    pub missing_terms: Vec<String>,
+    /// The affordance to fetch a subset of the glossary — a constant,
+    /// always present, beside `include_request`.
+    pub definitions_request: String,
     /// Docs pages (ADR 0013): identity always; fingerprint once released;
     /// `content` only when `included` names `docs`.
     pub docs: Vec<DocsDoc>,
@@ -159,6 +170,36 @@ pub enum Status {
 /// RFC 3986 §5 against the document's own URL and is correct unmounted or
 /// mounted with one string; the digest never sees the base path.
 const INCLUDE_DOCS_REQUEST: &str = "context?include=docs";
+
+/// `context?terms=<term>[,<term>]&include=docs` — the affordance naming how
+/// to ask for a subset of the glossary (ADR 0017 §2, §3). A constant, like
+/// `INCLUDE_DOCS_REQUEST` — not templated per-cell; the placeholder is for
+/// the reader, not resolved server-side.
+const DEFINITIONS_REQUEST: &str = "context?terms=<term>[,<term>]&include=docs";
+
+/// One glossary term (ADR 0017 §2) — the index an agent reads before it
+/// asks. Always present in full on the default document (never gated
+/// behind `include=`): an agent recovering from a `missing_terms` miss
+/// needs the vocabulary in the fetch it already made. `description` ships
+/// here (the term's short form, `export.description`'s analogue);
+/// `docs[]` under `target: "definition:<term>"` carries the long form.
+#[derive(Debug, Clone, Serialize)]
+pub struct DefinitionDoc {
+    pub term: String,
+    /// Always present (`[]` when none) — an agent iterating an alias list
+    /// must never meet `null`, and absence is reserved for "server
+    /// predates the field".
+    pub aliases: Vec<String>,
+    pub description: String,
+    /// `name@major` or `name@major.column`; empty (always present) means
+    /// cell-wide.
+    pub applies_to: Vec<String>,
+    /// Definitions are authored-only today (`{description: "cell.yaml"}`) —
+    /// the field exists so a future adapter supplying terms is additive,
+    /// not a re-meaning (ADR 0017 §2).
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub from: FromMap,
+}
 
 /// One docs page (ADR 0013): identity (`target`, `source_path`,
 /// `media_type`) is interface and always present; `sha256`/`bytes` are a
@@ -587,6 +628,11 @@ pub struct Interface {
     pub exports: Vec<ExportDoc>,
     /// Any `execution`/`data_as_of` present here is ignored by the digest.
     pub upstreams: Vec<UpstreamDoc>,
+    /// The whole-cell glossary (ADR 0017 §2), never narrowed — the source
+    /// `ContextDocument::narrow_terms` resolves `?terms=` against
+    /// regardless of any `/context/<route>` narrowing already applied.
+    pub definitions: Vec<DefinitionDoc>,
+    pub definitions_request: String,
     /// Any `sha256`/`bytes`/`content` present here is ignored by the digest.
     pub docs: Vec<DocsDoc>,
     pub include_request: String,
@@ -746,8 +792,24 @@ pub fn interface(
         discovered_from: def.discovered_from.clone(),
         exports,
         upstreams,
+        definitions: def.definitions.iter().map(definition_doc).collect(),
+        definitions_request: DEFINITIONS_REQUEST.to_string(),
         docs: docs_entries(def, routes),
         include_request: INCLUDE_DOCS_REQUEST.to_string(),
+    }
+}
+
+/// ADR 0017 §2: definitions are authored-only today — `from.description`
+/// is always `cell.yaml`.
+fn definition_doc(d: &crate::config::Definition) -> DefinitionDoc {
+    let mut from = FromMap::new();
+    from.insert("description".to_string(), Origin::CellYaml);
+    DefinitionDoc {
+        term: d.term.clone(),
+        aliases: d.aliases.clone(),
+        description: d.description.clone(),
+        applies_to: d.applies_to.clone(),
+        from,
     }
 }
 
@@ -770,11 +832,13 @@ fn binding_block(def: &CellDef, bind: &str) -> BindingBlock {
     }
 }
 
-/// Docs identity only (ADR 0013): the cell-level page (if declared) plus
-/// every **discoverable** export's page, in that order — no filesystem
-/// access, since identity needs only the declared path and its extension. A
-/// private export's docs entry never appears here, matching the same
-/// visibility filter `routes` was already built with (ADR 0012 §4).
+/// Docs identity only (ADR 0013, ADR 0017 §2): the cell-level page (if
+/// declared), every **discoverable** export's page, then every
+/// definition's page (`target: "definition:<term>"` — the third target
+/// form) — no filesystem access, since identity needs only the declared
+/// path and its extension. A private export's docs entry never appears
+/// here, matching the same visibility filter `routes` was already built
+/// with (ADR 0012 §4). Definitions are cell-wide, not visibility-filtered.
 fn docs_entries(def: &CellDef, routes: &[(String, Export)]) -> Vec<DocsDoc> {
     let entry = |target: String, path: &str| DocsDoc {
         target,
@@ -791,6 +855,11 @@ fn docs_entries(def: &CellDef, routes: &[(String, Export)]) -> Vec<DocsDoc> {
     for (route, e) in routes {
         if let Some(path) = &e.docs {
             entries.push(entry(route.clone(), path));
+        }
+    }
+    for d in &def.definitions {
+        if let Some(path) = &d.docs {
+            entries.push(entry(format!("definition:{}", d.term), path));
         }
     }
     entries
@@ -1036,6 +1105,9 @@ pub fn assemble(facts: Facts) -> ContextDocument {
         discovered_from: interface.discovered_from,
         exports,
         upstreams,
+        definitions: interface.definitions,
+        missing_terms: Vec::new(),
+        definitions_request: interface.definitions_request,
         docs,
         include_request: interface.include_request,
         build: provenance,
@@ -1070,9 +1142,87 @@ impl ContextDocument {
             return false;
         }
         self.exports.retain(|e| e.route == route);
-        self.docs
-            .retain(|d| d.target == "cell" || d.target == route);
+        // ADR 0017 §3: a definition survives route narrowing iff it is
+        // cell-wide (empty `applies_to`) or names this route or one of its
+        // columns; its page survives alongside it.
+        self.definitions.retain(|d| {
+            d.applies_to.is_empty() || d.applies_to.iter().any(|e| applies_to_route(e, route))
+        });
+        let kept_terms: std::collections::HashSet<&str> =
+            self.definitions.iter().map(|d| d.term.as_str()).collect();
+        self.docs.retain(|d| {
+            d.target == "cell"
+                || d.target == route
+                || d.target
+                    .strip_prefix("definition:")
+                    .is_some_and(|t| kept_terms.contains(t))
+        });
         true
+    }
+
+    /// `terms=` (ADR 0017 §3): case-insensitive lookup over `all_definitions`'
+    /// terms and aliases, deduplicated to canonical terms. Resolves against
+    /// the **whole cell** — `all_definitions`/`all_docs` must be the
+    /// unnarrowed lists (the caller captures them before calling
+    /// `narrow_to`), never `self.definitions`/`self.docs`, which
+    /// `/context/<route>` may already have reduced. Replaces
+    /// `self.definitions` with the matched subset (declared order) and
+    /// `self.docs` with exactly those terms' `definition:` pages (`sha256`/
+    /// `bytes` fingerprints carried over, since `all_docs` is `assemble`'s
+    /// output, not the fingerprint-less `Interface.docs`) — the cell page
+    /// and any export page are dropped, matching an `include=docs` fetch
+    /// under a filter never carrying every page again. Sets and returns
+    /// `missing_terms`: every token that resolved to no term or alias,
+    /// verbatim, in request order, deduplicated.
+    pub fn narrow_terms(
+        &mut self,
+        tokens: &[String],
+        all_definitions: &[DefinitionDoc],
+        all_docs: &[DocsDoc],
+    ) -> Vec<String> {
+        let mut index: IndexMap<String, &str> = IndexMap::new();
+        for d in all_definitions {
+            index
+                .entry(d.term.to_ascii_lowercase())
+                .or_insert(d.term.as_str());
+            for alias in &d.aliases {
+                index
+                    .entry(alias.to_ascii_lowercase())
+                    .or_insert(d.term.as_str());
+            }
+        }
+        let mut matched: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for tok in tokens {
+            match index.get(&tok.to_ascii_lowercase()) {
+                Some(term) => {
+                    if !matched.iter().any(|t| t == term) {
+                        matched.push(term.to_string());
+                    }
+                }
+                None => {
+                    if !missing.contains(tok) {
+                        missing.push(tok.clone());
+                    }
+                }
+            }
+        }
+        self.definitions = all_definitions
+            .iter()
+            .filter(|d| matched.iter().any(|t| t == &d.term))
+            .cloned()
+            .collect();
+        self.docs = all_docs
+            .iter()
+            .filter(|d| {
+                d.target
+                    .strip_prefix("definition:")
+                    .is_some_and(|t| matched.iter().any(|m| m == t))
+            })
+            .cloned()
+            .collect();
+        self.missing_terms = missing.clone();
+        missing
     }
 
     /// The interface this document carries — the same records, measurements
@@ -1088,6 +1238,8 @@ impl ContextDocument {
             discovered_from: self.discovered_from.clone(),
             exports: self.exports.clone(),
             upstreams: self.upstreams.clone(),
+            definitions: self.definitions.clone(),
+            definitions_request: self.definitions_request.clone(),
             docs: self.docs.clone(),
             include_request: self.include_request.clone(),
         }
@@ -1109,6 +1261,18 @@ impl ContextDocument {
             }
         }
     }
+}
+
+/// Whether an `applies_to` entry (`name@major` or `name@major.column`)
+/// names `route` itself or one of its columns (ADR 0017 §3, §5) — an exact
+/// match, or `route` followed by a `.`. `pub(crate)`: `release.rs`'s
+/// meaning-digest fan-out uses the identical rule to decide which
+/// definitions fold into a route's `description_digest`.
+pub(crate) fn applies_to_route(entry: &str, route: &str) -> bool {
+    entry == route
+        || entry
+            .strip_prefix(route)
+            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// Build a document straight from a definition. `served_here` is the data
@@ -1230,6 +1394,7 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
         description: &'a Option<String>,
         exports: Vec<ExportProjection<'a>>,
         upstreams: Vec<UpstreamProjection<'a>>,
+        definitions: Vec<DefinitionProjection<'a>>,
         docs: Vec<DocsProjection<'a>>,
         include_request: &'a str,
         data: &'a DataBlock,
@@ -1259,6 +1424,16 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
     struct UpstreamProjection<'a> {
         reference: &'a str,
         version: Option<u64>,
+    }
+    // ADR 0017 §4: term, aliases, applies_to — affordances. `description`
+    // stays out (a prose typo must not tell OpenAPI tooling the callable
+    // surface changed); a page's identity is already covered by the
+    // `docs` projection below (its `target` is `definition:<term>`).
+    #[derive(Serialize)]
+    struct DefinitionProjection<'a> {
+        term: &'a str,
+        aliases: &'a [String],
+        applies_to: &'a [String],
     }
     #[derive(Serialize)]
     struct DocsProjection<'a> {
@@ -1306,6 +1481,15 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
             .map(|u| UpstreamProjection {
                 reference: &u.reference,
                 version: u.version,
+            })
+            .collect(),
+        definitions: interface
+            .definitions
+            .iter()
+            .map(|d| DefinitionProjection {
+                term: &d.term,
+                aliases: &d.aliases,
+                applies_to: &d.applies_to,
             })
             .collect(),
         docs: interface
@@ -1369,17 +1553,22 @@ pub fn build_document(
     profile: &str,
     no_docs: bool,
 ) -> Result<ContextDocument> {
-    build_document_for(file, profile, no_docs, None)
+    build_document_for(file, profile, no_docs, None, None)
 }
 
 /// `build_document`, optionally narrowed to one export's route (`datamk
-/// context --export <route>`, the portable twin of `GET /context/<route>`).
-/// An unknown route is an error naming the ones that exist.
+/// context --export <route>`, the portable twin of `GET /context/<route>`)
+/// and/or to a `--terms` list (ADR 0017 §6, composing with `--export`
+/// exactly as `terms=` composes with `/context/<route>`). An unknown route
+/// is an error naming the ones that exist; an unknown term is an error
+/// naming the known ones — the deliberate CLI asymmetry with the served
+/// door (ADR 0013 §7): a file written by `--out` cannot be re-requested.
 pub fn build_document_for(
     file: &std::path::Path,
     profile: &str,
     no_docs: bool,
     export: Option<&str>,
+    terms: Option<&[String]>,
 ) -> Result<ContextDocument> {
     let loaded = crate::config::load(file, profile)?;
     let routes = discoverable_routes(&loaded.def)?;
@@ -1478,12 +1667,13 @@ pub fn build_document_for(
         ));
     }
 
-    // ADR 0013 §7: inline by default — a portable artifact with null content
-    // pointing at a path the reader doesn't have is a dangling pointer.
-    if !no_docs {
-        let pages = crate::config::docs::load_declared(&loaded.dir, &loaded.def, &routes)?;
-        doc.inline_docs(&pages);
-    }
+    // ADR 0017 §3/§6: captured before any narrowing — `--export` and
+    // `--terms` compose (route narrowing first, then terms, exactly as the
+    // served door does), and `terms=` resolves against the whole cell, not
+    // the route's scope, so `narrow_terms` must never see the route-reduced
+    // lists.
+    let all_definitions = doc.definitions.clone();
+    let all_docs = doc.docs.clone();
 
     if let Some(route) = export {
         if !doc.narrow_to(route) {
@@ -1500,6 +1690,37 @@ pub fn build_document_for(
                 }
             );
         }
+    }
+
+    if let Some(tokens) = terms {
+        let missing = doc.narrow_terms(tokens, &all_definitions, &all_docs);
+        if !missing.is_empty() {
+            let mut known: Vec<&str> = Vec::new();
+            for d in &all_definitions {
+                known.push(d.term.as_str());
+                known.extend(d.aliases.iter().map(String::as_str));
+            }
+            anyhow::bail!(
+                "unknown term(s): {} — known terms: {}",
+                missing.join(", "),
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            );
+        }
+    }
+
+    // ADR 0013 §7 / ADR 0017 §6: inline by default — a portable artifact
+    // with null content pointing at a path the reader doesn't have is a
+    // dangling pointer. `--no-docs` withholds page content only; a term's
+    // `description` ships regardless (it's the short form, never withheld
+    // for exports either). Runs after narrowing, so under `--terms` only
+    // the selected pages inline.
+    if !no_docs {
+        let pages = crate::config::docs::load_declared(&loaded.dir, &loaded.def, &routes)?;
+        doc.inline_docs(&pages);
     }
 
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
@@ -1519,10 +1740,11 @@ pub fn emit(
     out: Option<&std::path::Path>,
     no_docs: bool,
     export: Option<&str>,
+    terms: Option<&[String]>,
 ) -> Result<()> {
     use anyhow::Context as _;
 
-    let doc = build_document_for(file, profile, no_docs, export)?;
+    let doc = build_document_for(file, profile, no_docs, export, terms)?;
     let json = serde_json::to_string_pretty(&doc)?;
     match out {
         Some(path) => {
@@ -2409,6 +2631,7 @@ interface:
             Some(&default_out),
             false,
             None,
+            None,
         )
         .unwrap();
         let default_doc: serde_json::Value =
@@ -2429,6 +2652,7 @@ interface:
             "local",
             Some(&no_docs_out),
             true,
+            None,
             None,
         )
         .unwrap();
@@ -2498,7 +2722,7 @@ interface:
         );
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None).expect("emit the context document");
+        emit(&file, "local", Some(&out), false, None, None).expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(v["status"], "verified_at_source");
@@ -2591,7 +2815,7 @@ interface:
         crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None).expect("emit the context document");
+        emit(&file, "local", Some(&out), false, None, None).expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
 
@@ -2628,7 +2852,7 @@ interface:
         std::fs::write(&file, yaml).unwrap();
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None)
+        emit(&file, "local", Some(&out), false, None, None)
             .expect("emit must still succeed, just without the stale record");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -2854,5 +3078,202 @@ interface:
             false,
         );
         assert_eq!(digest_of(&bare), digest_of(&doc));
+    }
+
+    // --- ADR 0017: definitions in the context document ---------------------
+
+    fn definition(
+        term: &str,
+        aliases: &[&str],
+        description: &str,
+        applies_to: &[&str],
+    ) -> crate::config::Definition {
+        serde_yaml::from_str(&format!(
+            "term: {term}\naliases: [{}]\ndescription: {description}\napplies_to: [{}]\n",
+            aliases.join(","),
+            applies_to.join(","),
+        ))
+        .unwrap()
+    }
+
+    fn def_with_definitions() -> CellDef {
+        let mut def = sample_def();
+        def.definitions = vec![
+            // Cell-wide: no export names it.
+            definition(
+                "active_customer",
+                &[],
+                "A customer with an order in 90 days.",
+                &[],
+            ),
+            // Scoped to orders_daily@2's revenue column.
+            definition(
+                "net_revenue",
+                &["nr", "revenue_net"],
+                "Invoiced revenue less credit memos.",
+                &["orders_daily@2.revenue"],
+            ),
+            // Scoped to a route this cell doesn't have — never resolves.
+            definition("unrelated", &[], "Scoped elsewhere.", &["margins@2"]),
+        ];
+        def
+    }
+
+    #[test]
+    fn docs_entries_emits_a_definition_target_for_each_definitions_page() {
+        let mut def = def_with_definitions();
+        def.definitions[1].docs = Some("docs/net_revenue.md".to_string());
+        let routes = discoverable_routes(&def).unwrap();
+        let iface = interface(&def, &routes, &IndexMap::new());
+        let entry = iface
+            .docs
+            .iter()
+            .find(|d| d.target == "definition:net_revenue")
+            .expect("definition page must be a docs[] entry");
+        assert_eq!(entry.source_path, "docs/net_revenue.md");
+    }
+
+    #[test]
+    fn interface_gains_the_definitions_index_and_the_definitions_request_affordance() {
+        let def = def_with_definitions();
+        let routes = discoverable_routes(&def).unwrap();
+        let iface = interface(&def, &routes, &IndexMap::new());
+        let terms: Vec<&str> = iface.definitions.iter().map(|d| d.term.as_str()).collect();
+        assert_eq!(terms, vec!["active_customer", "net_revenue", "unrelated"]);
+        assert_eq!(
+            iface.definitions_request,
+            "context?terms=<term>[,<term>]&include=docs"
+        );
+        let nr = iface
+            .definitions
+            .iter()
+            .find(|d| d.term == "net_revenue")
+            .unwrap();
+        assert_eq!(nr.aliases, vec!["nr", "revenue_net"]);
+        assert_eq!(nr.applies_to, vec!["orders_daily@2.revenue"]);
+        assert_eq!(nr.from.get("description"), Some(&Origin::CellYaml));
+    }
+
+    /// ADR 0017 §4: a description-text edit must not move the digest (a
+    /// docs-class field); adding/renaming a term must (an interface change).
+    #[test]
+    fn interface_digest_ignores_definition_description_but_moves_on_term_rename() {
+        let mut def = def_with_definitions();
+        let routes = discoverable_routes(&def).unwrap();
+        let data = DataBlock {
+            served_here: true,
+            channels: vec![],
+        };
+        let base = interface_digest("orders", &interface(&def, &routes, &IndexMap::new()), &data);
+
+        def.definitions[1].description = "A completely different sentence.".to_string();
+        let same = interface_digest("orders", &interface(&def, &routes, &IndexMap::new()), &data);
+        assert_eq!(base, same, "a description edit must not move the digest");
+
+        def.definitions[1].term = "net_revenue_v2".to_string();
+        let moved = interface_digest("orders", &interface(&def, &routes, &IndexMap::new()), &data);
+        assert_ne!(base, moved, "renaming a term must move the digest");
+    }
+
+    /// ADR 0017 §3: `/context/<route>` keeps a definition iff `applies_to`
+    /// is empty (cell-wide) or names the route/one of its columns — and
+    /// keeps its page alongside the cell page and the export's.
+    #[test]
+    fn narrow_to_filters_definitions_by_applies_to() {
+        let mut def = def_with_definitions();
+        def.docs = Some("docs/cell.md".to_string());
+        def.definitions[1].docs = Some("docs/net_revenue.md".to_string());
+        let routes = discoverable_routes(&def).unwrap();
+        let mut doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+        );
+        assert!(doc.narrow_to("orders_daily@2"));
+        let terms: Vec<&str> = doc.definitions.iter().map(|d| d.term.as_str()).collect();
+        assert_eq!(
+            terms,
+            vec!["active_customer", "net_revenue"],
+            "cell-wide and route-matching definitions survive; the unrelated one doesn't"
+        );
+        // `orders_daily@2` itself declares no `docs:` in this fixture, so
+        // only the cell page and the surviving definition's page appear.
+        let doc_targets: Vec<&str> = doc.docs.iter().map(|d| d.target.as_str()).collect();
+        assert!(doc_targets.contains(&"cell"));
+        assert!(doc_targets.contains(&"definition:net_revenue"));
+        assert!(!doc_targets.contains(&"definition:unrelated"));
+    }
+
+    fn full_doc_with_definitions() -> (ContextDocument, Vec<DefinitionDoc>, Vec<DocsDoc>) {
+        let mut def = def_with_definitions();
+        def.definitions[1].docs = Some("docs/net_revenue.md".to_string());
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+        );
+        let all_definitions = doc.definitions.clone();
+        let all_docs = doc.docs.clone();
+        (doc, all_definitions, all_docs)
+    }
+
+    #[test]
+    fn narrow_terms_resolves_case_insensitively_by_term_or_alias_and_reports_missing() {
+        let (mut doc, all_definitions, all_docs) = full_doc_with_definitions();
+        let missing = doc.narrow_terms(
+            &["NET_REVENUE".to_string(), "nope".to_string()],
+            &all_definitions,
+            &all_docs,
+        );
+        assert_eq!(missing, vec!["nope".to_string()]);
+        assert_eq!(doc.missing_terms, vec!["nope".to_string()]);
+        assert_eq!(doc.definitions.len(), 1);
+        assert_eq!(doc.definitions[0].term, "net_revenue");
+        // docs[] holds only the selected term's page — cell/export pages dropped.
+        assert_eq!(doc.docs.len(), 1);
+        assert_eq!(doc.docs[0].target, "definition:net_revenue");
+
+        // Two tokens resolving to the same term (an alias and the term
+        // itself) yield one entry, not two.
+        let (mut doc2, all_definitions2, all_docs2) = full_doc_with_definitions();
+        doc2.narrow_terms(
+            &["nr".to_string(), "net_revenue".to_string()],
+            &all_definitions2,
+            &all_docs2,
+        );
+        assert_eq!(doc2.definitions.len(), 1);
+    }
+
+    /// ADR 0017 §3: composed with `/context/<route>`, `terms=` resolves
+    /// against the **whole cell**, not the route's scope — a term whose
+    /// `applies_to` names a different route must still resolve when asked
+    /// for explicitly, and its page must still be inlinable.
+    #[test]
+    fn narrow_terms_after_narrow_to_resolves_against_the_whole_cell_not_the_route() {
+        let (mut doc, all_definitions, all_docs) = full_doc_with_definitions();
+        assert!(doc.narrow_to("orders_daily@2"));
+        // `unrelated` applies_to `margins@2` — narrow_to alone would have
+        // dropped it, but an explicit ask for it must still resolve.
+        let missing = doc.narrow_terms(&["unrelated".to_string()], &all_definitions, &all_docs);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(doc.definitions.len(), 1);
+        assert_eq!(doc.definitions[0].term, "unrelated");
     }
 }

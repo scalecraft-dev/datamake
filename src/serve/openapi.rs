@@ -1,4 +1,4 @@
-use crate::config::Export;
+use crate::config::{Definition, Export};
 use serde_json::{json, Map, Value};
 
 /// Generate an OpenAPI 3.1 document from the shared visibility-filtered
@@ -25,26 +25,30 @@ pub fn generate(
     version: &str,
     base_path: &str,
 ) -> Value {
-    generate_with_all(cell, description, routes, routes, version, base_path)
+    generate_with_all(cell, description, routes, routes, &[], version, base_path)
 }
 
 /// `generate`, with the data routes (`routes`, what is mounted) and the
 /// discoverable routes (`all_routes`, every export `/context/{route}` can
-/// name — bound ones included) given separately.
+/// name — bound ones included) given separately. `definitions` is the
+/// cell's glossary (ADR 0017 §6) — `terms`'s documented `enum` is
+/// generated from it, term then alias, in declared order.
 pub fn generate_with_all(
     cell: &str,
     description: Option<&str>,
     routes: &[(String, Export)],
     all_routes: &[(String, Export)],
+    definitions: &[Definition],
     version: &str,
     base_path: &str,
 ) -> Value {
+    let terms_vocabulary = terms_vocabulary(definitions);
     let mut paths = Map::new();
     paths.insert("/".to_string(), health_path_item());
-    paths.insert("/context".to_string(), context_path_item());
+    paths.insert("/context".to_string(), context_path_item(&terms_vocabulary));
     paths.insert(
         "/context/{route}".to_string(),
-        context_export_path_item(all_routes),
+        context_export_path_item(all_routes, &terms_vocabulary),
     );
     paths.insert("/openapi.json".to_string(), openapi_path_item());
     for (route, export) in routes {
@@ -82,31 +86,64 @@ fn health_path_item() -> Value {
     })
 }
 
-/// `/context`'s `include` parameter is documented from `INCLUDE_SECTIONS`
-/// (`serve::INCLUDE_SECTIONS`) — the exact vocabulary `validate_include`
-/// enforces, so the two can never drift (ADR 0013 §8).
-fn context_path_item() -> Value {
+/// Term then alias, declared order (ADR 0017 §6) — the `route` parameter's
+/// enumeration precedent, generated from the same list the handler
+/// (`serve::resolve_terms`) matches against, so a change to the glossary is
+/// a compile-visible change here too.
+fn terms_vocabulary(definitions: &[Definition]) -> Vec<Value> {
+    let mut v = Vec::new();
+    for d in definitions {
+        v.push(json!(d.term));
+        for a in &d.aliases {
+            v.push(json!(a));
+        }
+    }
+    v
+}
+
+/// `/context`'s `include` and `terms` parameters, documented from
+/// `INCLUDE_SECTIONS` (`serve::INCLUDE_SECTIONS`) and the cell's own
+/// glossary respectively — the exact vocabularies `validate_context_query`/
+/// `resolve_terms` enforce, so neither can drift from what's generated here
+/// (ADR 0013 §8, ADR 0017 §6).
+fn context_path_item(terms_vocabulary: &[Value]) -> Value {
     let sections: Vec<Value> = super::INCLUDE_SECTIONS.iter().map(|s| json!(s)).collect();
     json!({
         "get": {
             "summary": "The cell's context document (ADR 0012)",
             "description": "The interface made machine-readable: declared schema/grain/meaning, \
                             the query grammar, and (once built) provenance and measurements.",
-            "parameters": [{
-                "name": "include",
-                "in": "query",
-                "required": false,
-                "style": "form",
-                "explode": false,
-                "description": "Comma-separated optional sections to inline. Omit for the \
-                                default document; `docs` inlines every declared docs page. \
-                                Each section named in the response's `included` array is \
-                                inlined ON THE RECORDS it belongs to — `include=docs` echoes \
-                                `\"included\": [\"docs\"]` and sets `content` on each \
-                                `docs[]` entry. `included` holds section names, never the \
-                                content itself.",
-                "schema": { "type": "array", "items": { "type": "string", "enum": sections } }
-            }],
+            "parameters": [
+                {
+                    "name": "include",
+                    "in": "query",
+                    "required": false,
+                    "style": "form",
+                    "explode": false,
+                    "description": "Comma-separated optional sections to inline. Omit for the \
+                                    default document; `docs` inlines every declared docs page. \
+                                    Each section named in the response's `included` array is \
+                                    inlined ON THE RECORDS it belongs to — `include=docs` echoes \
+                                    `\"included\": [\"docs\"]` and sets `content` on each \
+                                    `docs[]` entry. `included` holds section names, never the \
+                                    content itself.",
+                    "schema": { "type": "array", "items": { "type": "string", "enum": sections } }
+                },
+                {
+                    "name": "terms",
+                    "in": "query",
+                    "required": false,
+                    "style": "form",
+                    "explode": false,
+                    "description": "Comma-separated term/alias list (ADR 0017) that narrows \
+                                    `definitions[]` and, under `include=docs`, `docs[]` to \
+                                    those terms' `definition:<term>` pages only. Matching is \
+                                    case-insensitive; an unmatched token is echoed in \
+                                    `missing_terms`, never a 400 or 404.",
+                    "schema": { "type": "array", "items": { "type": "string",
+                                                              "enum": terms_vocabulary } }
+                }
+            ],
             "responses": {
                 "200": {
                     "description": "the context document",
@@ -114,8 +151,10 @@ fn context_path_item() -> Value {
                 },
                 "304": { "description": "not modified (If-None-Match matched the current ETag \
                                           for the requested variant)" },
-                "400": { "description": "unknown query parameter, or an unrecognized/empty \
-                                          `include` section" },
+                "400": { "description": "unknown query parameter; an unrecognized/empty \
+                                          `include` section; or a `terms` token that's empty, \
+                                          has characters outside [A-Za-z0-9_.-], or exceeds \
+                                          the token cap" },
                 "401": { "description": "missing or unknown bearer token (cell has access.roles)" },
                 "403": { "description": "cell is not shareable, or the token's roles do not \
                                           include an allowed role" }
@@ -133,7 +172,8 @@ fn context_schema() -> Value {
     json!({
         "type": "object",
         "required": ["datamk_context", "cell", "status", "grain_verified", "exports",
-                     "upstreams", "docs", "include_request", "data", "notes", "included"],
+                     "upstreams", "definitions", "missing_terms", "definitions_request", "docs",
+                     "include_request", "data", "notes", "included"],
         "description": "One level, no regions. A fact is a CLAIM iff its record carries \
                         `from` (who said it); a fact is a MEASUREMENT iff it sits in a \
                         block with a timestamp (`build`, `source_check`, `freshness`, an \
@@ -179,11 +219,32 @@ fn context_schema() -> Value {
                         "description": "What the Builder actually attached — a measurement." },
                     "data_as_of": { "type": "string", "format": "date-time" }
                 }}},
+            "definitions": { "type": "array",
+                "description": "The glossary index (ADR 0017) — always present, never gated \
+                                behind `include=`. Narrowed by `?terms=` and by \
+                                `/context/{route}`.",
+                "items": { "type": "object",
+                "required": ["term", "description", "from"],
+                "properties": {
+                    "term": { "type": "string" },
+                    "aliases": { "type": "array", "items": { "type": "string" } },
+                    "description": { "type": "string" },
+                    "applies_to": { "type": "array", "items": { "type": "string" },
+                        "description": "`name@major` or `name@major.column`; empty means \
+                                        cell-wide." },
+                    "from": from_schema("description")
+                }}},
+            "missing_terms": { "type": "array", "items": { "type": "string" },
+                "description": "`?terms=` tokens that resolved to no term or alias, echoed \
+                                verbatim. An unknown term is not an error — 200 with the hits, \
+                                this array names the misses." },
+            "definitions_request": { "type": "string" },
             "docs": { "type": "array", "items": { "type": "object",
                 "required": ["target", "source_path", "media_type"],
                 "properties": {
                     "target": { "type": "string",
-                                "description": "`cell`, or an export's route key." },
+                                "description": "`cell`, an export's route key, or \
+                                                `definition:<term>` (ADR 0017)." },
                     "source_path": { "type": "string",
                         "description": "The author's cell.yaml-relative file path. \
                                         NOT a URL and not fetchable — there is no \
@@ -340,7 +401,7 @@ fn export_schema() -> Value {
 /// narrowed to one export — the same schema, `exports[]` of length one and
 /// `docs[]` reduced to the cell page and that export's. `route` is
 /// enumerated from the discoverable exports, bound ones included.
-fn context_export_path_item(all_routes: &[(String, Export)]) -> Value {
+fn context_export_path_item(all_routes: &[(String, Export)], terms_vocabulary: &[Value]) -> Value {
     let sections: Vec<Value> = super::INCLUDE_SECTIONS.iter().map(|s| json!(s)).collect();
     let routes: Vec<Value> = all_routes.iter().map(|(r, _)| json!(r)).collect();
     json!({
@@ -366,8 +427,20 @@ fn context_export_path_item(all_routes: &[(String, Export)]) -> Value {
                     "style": "form",
                     "explode": false,
                     "description": "As on /context: `docs` inlines the cell page and this \
-                                    export's page.",
+                                    export's page — or, composed with `terms`, only the \
+                                    selected terms' pages (ADR 0017 §3).",
                     "schema": { "type": "array", "items": { "type": "string", "enum": sections } }
+                },
+                {
+                    "name": "terms",
+                    "in": "query",
+                    "required": false,
+                    "style": "form",
+                    "explode": false,
+                    "description": "As on /context: resolves against the whole cell, not this \
+                                    route's scope (ADR 0017 §3).",
+                    "schema": { "type": "array", "items": { "type": "string",
+                                                              "enum": terms_vocabulary } }
                 }
             ],
             "responses": {
@@ -376,7 +449,8 @@ fn context_export_path_item(all_routes: &[(String, Export)]) -> Value {
                     "content": { "application/json": { "schema": context_schema() } }
                 },
                 "304": { "description": "not modified" },
-                "400": { "description": "unknown query parameter or `include` section" },
+                "400": { "description": "unknown query parameter; `include` section; or \
+                                          `terms` token (see /context)" },
                 "401": { "description": "missing or unknown bearer token (cell has access.roles)" },
                 "403": { "description": "cell is not shareable, or the token's roles do not \
                                           include an allowed role" },
@@ -549,6 +623,9 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            definitions_source: None,
+            definitions: Vec::new(),
+            definitions_file: None,
         };
         // The same shared route list `serve` and `/context` read (ADR 0012 §4).
         let routes = crate::context::discoverable_routes(&def).unwrap();
@@ -620,6 +697,9 @@ mod tests {
             "discovered_from",
             "exports",
             "upstreams",
+            "definitions",
+            "missing_terms",
+            "definitions_request",
             "docs",
             "include_request",
             "build",
@@ -649,6 +729,10 @@ mod tests {
             "the include=docs landing spot"
         );
         assert!(docs_entry.get("source_path").is_some());
+        let definitions_entry = &props["definitions"]["items"]["properties"];
+        assert!(definitions_entry.get("term").is_some());
+        assert!(definitions_entry.get("aliases").is_some());
+        assert!(definitions_entry.get("applies_to").is_some());
         assert!(
             docs_entry.get("path").is_none(),
             "the v1 name must not linger in the spec"
@@ -677,6 +761,9 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            definitions_source: None,
+            definitions: Vec::new(),
+            definitions_file: None,
         };
         let routes = crate::context::discoverable_routes(&def).unwrap();
         let doc = generate(&def.cell, None, &routes, "digest123", "");
@@ -724,7 +811,7 @@ mod tests {
         let params = doc["paths"]["/context"]["get"]["parameters"]
             .as_array()
             .unwrap();
-        assert_eq!(params.len(), 1);
+        assert_eq!(params.len(), 2, "{params:?}");
         let include = &params[0];
         assert_eq!(include["name"], "include");
         assert_eq!(include["style"], "form");
@@ -741,6 +828,60 @@ mod tests {
         for code in ["200", "304", "400", "401", "403"] {
             assert!(responses.get(code).is_some(), "missing response {code}");
         }
+    }
+
+    /// ADR 0017 §6: `terms`'s `enum` is generated from the cell's own
+    /// definitions — term then alias, declared order — the same
+    /// vocabulary `serve::resolve_terms` matches against.
+    #[test]
+    fn context_terms_param_is_generated_from_the_cells_definitions_in_declared_order() {
+        let def = CellDef {
+            cell: "orders".to_string(),
+            description: None,
+            docs: None,
+            sources: IndexMap::new(),
+            transforms: vec![],
+            interface: vec![],
+            access: Default::default(),
+            discover: None,
+            discovered_from: None,
+            definitions_source: None,
+            definitions: vec![
+                serde_yaml::from_str(
+                    "term: net_revenue\naliases: [nr, revenue_net]\ndescription: d\n",
+                )
+                .unwrap(),
+                serde_yaml::from_str("term: active_customer\ndescription: d\n").unwrap(),
+            ],
+            definitions_file: None,
+        };
+        let doc = generate_with_all(&def.cell, None, &[], &[], &def.definitions, "digest123", "");
+        let params = doc["paths"]["/context"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let terms = params.iter().find(|p| p["name"] == "terms").unwrap();
+        assert_eq!(terms["style"], "form");
+        assert_eq!(terms["explode"], false);
+        let enumerated: Vec<&str> = terms["schema"]["items"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            enumerated,
+            vec!["net_revenue", "nr", "revenue_net", "active_customer"]
+        );
+
+        // /context/{route} carries the identical parameter.
+        let route_params = doc["paths"]["/context/{route}"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let route_terms = route_params.iter().find(|p| p["name"] == "terms").unwrap();
+        assert_eq!(
+            route_terms["schema"]["items"]["enum"],
+            terms["schema"]["items"]["enum"]
+        );
     }
 
     /// A non-empty `base_path` adds `servers` and leaves path keys alone

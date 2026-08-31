@@ -667,6 +667,9 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            definitions_source: None,
+            definitions: Vec::new(),
+            definitions_file: None,
         }
     }
 
@@ -1497,6 +1500,9 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            definitions_source: None,
+            definitions: Vec::new(),
+            definitions_file: None,
         };
         let b = Bindings {
             channels: vec![],
@@ -1536,6 +1542,9 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            definitions_source: None,
+            definitions: Vec::new(),
+            definitions_file: None,
         };
         let b = Bindings {
             channels: vec![],

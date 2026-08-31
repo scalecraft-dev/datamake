@@ -320,6 +320,62 @@ draws the "changed meaning without a version bump" warning. See
 path-resolution security story (the profile Secret mounts *inside* the
 cell directory, so "resolves under the cell dir" alone isn't a safe check).
 
+## Definitions
+
+The meaning fields above are per-column and per-export. Some things aren't:
+"net revenue" is `invoice_amount` on one export less `credit_memo` on
+another, or a concept tied to no column at all. Those belong in a small
+cell-level glossary, looked up by term:
+
+```yaml
+definitions:
+  - term: net_revenue                   # ^[a-z0-9][a-z0-9_.-]*$, ≤64 chars
+    aliases: [nr, revenue_net]          # optional, ≤5, same grammar
+    description: Invoiced revenue less credit memos. Excludes accruals.
+    docs: docs/terms/net_revenue.md     # optional long-form page (ADR 0013)
+    applies_to:                         # optional; omit for a cell-wide concept
+      - flight_spend@1.invoice_amount   #   route.column
+      - margins@2                       #   whole route
+```
+
+`definitions:` also takes one relative path to a file carrying the
+identical list, for a glossary too large to sit inline in `cell.yaml`
+(`definitions: definitions.yaml`) — never a list of files.
+
+`definitions[]` ships on every document, unconditionally — it's the index
+an agent reads before it asks, so gating it behind `include=` would hide
+the very thing a caller needs to recover from a miss. Fetch one or a few by
+term or alias, case-insensitively:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://orders.data.internal/context?terms=net_revenue,active_customer&include=docs"
+datamk context -f cell.yaml --terms net_revenue,active_customer
+```
+
+An unknown term is **not** an error on the served door — the response is
+still 200, with whatever resolved, and every unmatched token echoed
+verbatim in `missing_terms` (`[]` when nothing was asked or everything hit).
+The default document already carries the whole index, so recovery is one
+retry, not a fresh round trip. `datamk context --terms`, the portable door,
+is the deliberate asymmetry: a file written by `--out` can't be
+re-requested, so an unknown term there exits non-zero, naming the known
+ones.
+
+`terms=` narrows `definitions[]` to the selected terms and `docs[]` to
+those terms' `definition:<term>` pages only — the cell page and export
+pages drop out, or `include=docs` under a filter would carry every page
+again. Everything else (`exports[]`, `description`, and so on) stays whole.
+Composed with `/context/<route>`, the terms list still resolves against the
+**whole cell**, not the route's scope — `missing_terms` would otherwise
+have to mean two different things. Without `terms=`, `/context/<route>`
+keeps a definition (and its page) iff `applies_to` is empty (cell-wide) or
+names that route or one of its columns.
+
+No fuzzy or substring matching, and no `/context/definitions/<term>`
+route — `aliases:` is the whole recall mechanism: authored, collision-
+checked, cacheable. See `docs/adr/0017-definitions.md` for the full design.
+
 ## Point an agent at it
 
 The document is designed to be an agent's first fetch. Three ways in:
