@@ -320,3 +320,25 @@ these is a violation of ADR 0012 §3, not an extension of this ADR.
    → `applies_to` becomes a request selector.
 3. A term needs different meanings per export → it belongs on the export's
    schema record, not the cell glossary.
+
+## Amendment (2026-08-31): stale discovery
+
+The first run against a real SQLMesh estate (datamake-ape, a 12-export
+discovered cell, 49 terms through the file form) validated §1–§6 as written
+and surfaced one state this ADR had not ruled on: on a discovered cell whose
+sync record is stale, `applies_to` validation — deferred until the interface
+materializes (§1) — has never run, yet the document emitted every definition
+with its `applies_to` claims intact, beside an `exports[]` that said nothing
+exists.
+
+The call: **definitions stay in the document** — they are authored prose,
+and dropping authored content on staleness would lie by omission in the
+other direction — **but the document says what state they are in.** The ADR
+0016 §5 stale note gains a second sentence naming `definitions[].applies_to`
+as unvalidated until `datamk sync` re-runs, and `datamk context` now warns
+on stderr in that state (the served door already refuses to start on a
+stale record — the portable door was the only silent one). The CLI still
+exits 0: the emission is truthful about its own state. Falsified if
+operators keep misreading a stale emission as validated — that argues for a
+non-zero exit, which is a behavior change this amendment deliberately does
+not take.

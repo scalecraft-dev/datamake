@@ -550,6 +550,50 @@ mod tests {
         \x20     description: Authored, so it wins.\n\
         \x20     docs: docs/documented.md\n";
 
+    /// ADR 0017 amendment: a stale sync record defers `applies_to`
+    /// validation forever (it runs only when the interface materializes), so
+    /// the portable document must say the claims are unvalidated — while
+    /// still listing the authored definitions themselves.
+    #[test]
+    fn stale_discovery_emits_definitions_with_an_unvalidated_note() {
+        let cell = "cell: example\n\
+            description: The fixture project's gold models.\n\
+            definitions:\n\
+            \x20 - term: net_revenue\n\
+            \x20   description: Invoiced revenue less credit memos.\n\
+            \x20   applies_to: [documented@2.id]\n\
+            \x20 - term: fiscal_year\n\
+            \x20   description: Starts Feb 1.\n\
+            discover:\n\
+            \x20 from: sqlmesh\n\
+            \x20 state: state\n\
+            \x20 warehouse: wh\n\
+            \x20 select:\n\
+            \x20   schemas: [sqlmesh_example]\n";
+        let dir = scaffold("stale-defs", cell);
+        // No sync ran: the record is missing, discovery is stale.
+        let doc =
+            crate::context::build_document_for(&dir.join("cell.yaml"), "local", true, None, None)
+                .expect("the portable door still emits on a stale record");
+        assert!(doc.exports.is_empty());
+        let terms: Vec<&str> = doc.definitions.iter().map(|d| d.term.as_str()).collect();
+        assert_eq!(terms, vec!["net_revenue", "fiscal_year"]);
+        assert!(
+            doc.notes
+                .iter()
+                .any(|n| n.contains("No exports are listed")),
+            "{:?}",
+            doc.notes
+        );
+        assert!(
+            doc.notes
+                .iter()
+                .any(|n| n.contains("applies_to") && n.contains("not been validated")),
+            "{:?}",
+            doc.notes
+        );
+    }
+
     #[test]
     fn sync_then_load_then_context_then_verify_end_to_end() {
         let dir = scaffold("e2e", CELL);

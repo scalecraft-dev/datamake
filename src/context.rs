@@ -1662,9 +1662,27 @@ pub fn build_document_for(
     // to describe — say so, rather than emit an empty export list that reads
     // as "this cell has no exports".
     if let Some(crate::config::Discovery::Stale(why)) = &loaded.discovery {
+        // The served door refuses to start on a stale record
+        // (`refuse_stale_discovery`); this portable door emits, so it must
+        // be loud in both channels — the document's own notes, and stderr
+        // for the operator who never reads `notes[]` (ADR 0017 amendment).
+        tracing::warn!(
+            "discovered interface unavailable ({why}) — emitting a document with no exports;              re-run `datamk sync`"
+        );
         doc.notes.push(format!(
             "This cell discovers its interface, but {why}. No exports are listed until it is."
         ));
+        // ADR 0017 amendment: `applies_to` validation is deferred until the
+        // discovered interface exists, so on a stale record it never ran.
+        // Definitions stay listed — they are authored prose, and dropping
+        // them would lie by omission in the other direction — but the
+        // document says what state they are in.
+        if doc.definitions.iter().any(|d| !d.applies_to.is_empty()) {
+            doc.notes.push(
+                "definitions[] is authored prose and still listed, but its applies_to                  references have not been validated against any interface — re-run `datamk                  sync` before trusting them."
+                    .to_string(),
+            );
+        }
     }
 
     // ADR 0017 §3/§6: captured before any narrowing — `--export` and
