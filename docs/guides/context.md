@@ -86,6 +86,19 @@ where it came from. Two rules cover the whole shape:
 An agent can never mistake a claim for a measurement. Absent facts are
 omitted or `null` — never fabricated, never zeros.
 
+One claim deserves a warning label because it has no measurement anywhere
+to answer it. Each export's **`freshness`** (`freshness: daily` in
+`cell.yaml`) is the author's intended cadence, verbatim, and nothing else:
+`verify` does not check it, the Server does not compare it against the age
+of the rows, and nothing in the document will ever contradict it, however
+stale the data actually is. Treat it as **advisory**. For what is measured,
+read `build.data_as_of` (when the rows last moved) and `build.finished_at`
+(when the served execution completed), and decide for yourself whether that
+is fresh enough. Don't confuse it with the document's top-level `freshness`
+block, which shares the name and nothing else: that is Server poll
+telemetry — has this Server noticed the newest execution, and when did it
+last successfully look — not data age.
+
 ```json
 {
   "datamk_context": 4,

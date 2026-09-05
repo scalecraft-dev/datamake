@@ -6,6 +6,17 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Changed — `freshness` documented as advisory (issue #11)
+
+An export's `freshness:` is the author's intended cadence and nothing
+checks it: not `verify`, not the Server, and nothing in the context
+document contradicts it when the data is stale. The field's doc comment,
+the context guide, and `/openapi.json` now say so, and point at
+`build.data_as_of` for what is measured. The document's top-level
+`freshness` block is unrelated Server poll telemetry, also now labeled as
+such. Observed freshness (comparing the claim against data age) is split
+out as its own issue.
+
 ### Added — `null_rows` on `exports[].check` and `exports[].probe` (issue #10, ADR 0012 amendment 2026-09-05)
 
 `verify` now counts, per grain column, the rows with a NULL there, in the

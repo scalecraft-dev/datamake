@@ -418,6 +418,15 @@ pub struct Export {
     /// parses as-is) or a mapping `{type, unit, description}` (ADR 0012 §3).
     #[serde(default)]
     pub schema: IndexMap<String, ColumnSpec>,
+    /// How often the author intends this export's rows to move (`daily`,
+    /// `annual`, …) — free text. **Advisory and unverified** (issue #11):
+    /// nothing on the run, verify, or serve path checks it against build or
+    /// data age, and no observed counterpart contradicts it when the data
+    /// is stale. It ships in the context document as a claim (`exports[].
+    /// freshness`) so consumers can see the intent, not as a measurement.
+    /// Not the same thing as the document's top-level `freshness` block,
+    /// which is Server poll telemetry (has the Server seen a newer
+    /// execution), not data age.
     #[serde(default)]
     pub freshness: Option<String>,
     #[serde(default)]

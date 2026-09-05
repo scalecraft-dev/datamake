@@ -282,7 +282,11 @@ fn context_schema() -> Value {
                     "datamk_version": { "type": "string" }
                 }
             },
-            "freshness": { "type": "object" },
+            "freshness": { "type": "object",
+                "description": "Server poll telemetry (hosted, published mode only): the \
+                                execution being served, the newest seen, and the age of the \
+                                last successful poll. Not data age (see `build.data_as_of`), \
+                                and unrelated to each export's declared `freshness`." },
             "data": {
                 "type": "object",
                 "required": ["served_here", "channels"],
@@ -331,7 +335,12 @@ fn export_schema() -> Value {
                                 non-null; a bound export has no path." },
             "contract": { "type": "string", "enum": ["experimental", "supported"] },
             "description": { "type": "string" },
-            "freshness": { "type": "string" },
+            "freshness": { "type": "string",
+                "description": "The author's intended cadence (`daily`, `annual`, …), verbatim \
+                                from cell.yaml. Advisory and unverified: nothing checks it \
+                                against build or data age, and nothing in this document \
+                                contradicts it when the data is stale. Read `build.data_as_of` \
+                                and `build.finished_at` for what is measured." },
             "grain": { "type": "array", "items": { "type": "string" } },
             "from": from_schema("description, grain"),
             "schema": { "type": "object", "additionalProperties": { "type": "object",
