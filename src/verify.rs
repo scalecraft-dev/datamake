@@ -513,7 +513,12 @@ pub fn check(
         }
 
         if !export.grain.is_empty() {
-            let (total, distinct) = grain_counts(conn, source, &export.grain)?;
+            let GrainCounts {
+                total,
+                distinct,
+                null_rows,
+            } = grain_counts(conn, source, &export.grain)?;
+            let nulls = describe_null_rows(&export.grain, &null_rows);
             if total != distinct {
                 // ADR 0005 §2 item 5: in a cell with incremental sources, a
                 // grain violation is most often a non-replay-safe transform
@@ -525,10 +530,43 @@ pub fn check(
                 } else {
                     ""
                 };
+                // Issue #10: a NULL grain value is reported as a measured
+                // fact, appended — never as the cause, and never with the
+                // coalesce advice. `SELECT DISTINCT` already treats NULLs as
+                // equal, so coalescing them to one sentinel changes neither
+                // count: rows sharing a grain tuple with a NULL in it are
+                // genuine duplicates, and the fix is the same as for any
+                // other duplicate — aggregate at the declared grain, or
+                // widen it.
+                let null_hint = match &nulls {
+                    Some(nulls) => format!(
+                        " — grain columns contain NULLs: {nulls}. Rows sharing a grain \
+                         tuple with a NULL in it are duplicates like any other; coalescing \
+                         the NULLs to one sentinel does not make them unique — aggregate \
+                         at the declared grain or widen it"
+                    ),
+                    None => String::new(),
+                };
                 bail!(
-                    "export '{}': grain {:?} is not unique ({total} rows, {distinct} distinct){hint}",
+                    "export '{}': grain {:?} is not unique ({total} rows, {distinct} distinct){hint}{null_hint}",
                     export.name,
                     export.grain
+                );
+            }
+            // Issue #10: unique, but some grain value is NULL. The served
+            // query grammar is equality-only with no NULL literal, so these
+            // rows come back in an unfiltered read and are unreachable by
+            // any grain filter. Not a failure — the contract is met — but a
+            // fact the author should hear and `/context` should carry.
+            if let Some(nulls) = &nulls {
+                tracing::warn!(
+                    export = %export.name,
+                    "grain columns contain NULLs: {nulls} — the grain is unique, but the served \
+                     query grammar is equality-only and has no NULL literal, so these rows are \
+                     returned by an unfiltered read and unreachable by any grain filter (there \
+                     is no `?column=NULL`). Recorded as `check.null_rows`. Coalesce to a \
+                     sentinel of the column's own type in the transform if callers need to \
+                     reach them (see docs/guides/serving.md)"
                 );
             }
             measurements.insert(
@@ -538,6 +576,7 @@ pub fn check(
                     grain: export.grain.clone(),
                     rows: total,
                     distinct_grain: distinct,
+                    null_rows,
                 },
             );
         }
@@ -826,14 +865,59 @@ pub(crate) fn describe(conn: &Connection, source: &str) -> Result<Vec<(String, S
     Ok(out)
 }
 
-fn grain_counts(conn: &Connection, source: &str, grain: &[String]) -> Result<(i64, i64)> {
+/// What `grain_counts` measured: the two numbers the uniqueness check
+/// compares, and (issue #10) the NULL count per grain column, zeros
+/// included — a full map, so that an absent map on a persisted record means
+/// "written before this was measured" and never "measured zero".
+struct GrainCounts {
+    total: i64,
+    distinct: i64,
+    null_rows: BTreeMap<String, i64>,
+}
+
+/// One statement, two scans: the row count and the per-column NULL counts
+/// ride a single aggregate over the source; the DISTINCT count is the
+/// second. Result columns are read positionally — no alias is built from a
+/// column name, so a grain column called `total` or containing a quote
+/// cannot collide with or break the query.
+fn grain_counts(conn: &Connection, source: &str, grain: &[String]) -> Result<GrainCounts> {
     let cols = grain.join(", ");
+    let null_exprs = grain
+        .iter()
+        .map(|g| format!(", count(*) - count({g})"))
+        .collect::<String>();
     let mut stmt = conn.prepare(&format!(
-        "SELECT (SELECT count(*) FROM {source}) AS total,
-                (SELECT count(*) FROM (SELECT DISTINCT {cols} FROM {source})) AS distinct_grain"
+        "SELECT count(*), \
+                (SELECT count(*) FROM (SELECT DISTINCT {cols} FROM {source})){null_exprs} \
+         FROM {source}"
     ))?;
-    let row = stmt.query_row([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let row = stmt.query_row([], |r| {
+        let total = r.get::<_, i64>(0)?;
+        let distinct = r.get::<_, i64>(1)?;
+        let mut null_rows = BTreeMap::new();
+        for (i, g) in grain.iter().enumerate() {
+            null_rows.insert(g.clone(), r.get::<_, i64>(2 + i)?);
+        }
+        Ok(GrainCounts {
+            total,
+            distinct,
+            null_rows,
+        })
+    })?;
     Ok(row)
+}
+
+/// `col (N rows), other (M rows)` for the columns with at least one NULL,
+/// in grain declaration order; `None` when no grain column has any.
+fn describe_null_rows(grain: &[String], null_rows: &BTreeMap<String, i64>) -> Option<String> {
+    let parts: Vec<String> = grain
+        .iter()
+        .filter_map(|col| {
+            let n = *null_rows.get(col)?;
+            (n > 0).then(|| format!("{col} ({n} rows)"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Whether a declared column's type matches its actual type, and which type
@@ -1310,6 +1394,133 @@ interface:
             .to_string();
         assert!(err.contains("is not unique"), "got: {err}");
         assert!(!err.contains("replay-safe"), "got: {err}");
+        // No NULLs in the grain: no NULL clause is invented.
+        assert!(!err.contains("NULL"), "got: {err}");
+    }
+
+    // --- issue #10: NULLs in grain columns ---------------------------------
+
+    /// A two-column-grain cell over `t`, with or without an incremental
+    /// source (the replay-safety hint's trigger).
+    fn null_grain_cell(incremental: bool) -> CellDef {
+        let inc = if incremental {
+            "\n    incremental:\n      cursor: updated_at"
+        } else {
+            ""
+        };
+        serde_yaml::from_str(&format!(
+            r#"
+cell: c
+sources:
+  events:
+    connection: crm
+    table: analytics.events{inc}
+interface:
+  - name: t
+    version: 1.0.0
+    grain: [month, campaign]
+"#
+        ))
+        .unwrap()
+    }
+
+    /// Two rows share `(2026-01, NULL)`: `SELECT DISTINCT` treats NULLs as
+    /// equal, so the uniqueness check trips. The message appends the NULL
+    /// count as a measured fact and keeps the replay-safety hint (NULL
+    /// presence does not prove NULL causation); it must NOT prescribe
+    /// coalescing, which leaves both counts unchanged.
+    #[test]
+    fn grain_violation_with_nulls_appends_the_null_count_and_keeps_the_replay_hint() {
+        let (conn, _dir) = attach_lake("null-grain-dup");
+        conn.execute_batch(
+            "CREATE TABLE t AS SELECT * FROM (VALUES ('2026-01', 'a'), ('2026-01', NULL), \
+             ('2026-01', NULL), ('2026-02', NULL)) v(month, campaign);",
+        )
+        .unwrap();
+        let err = check(&conn, &null_grain_cell(true), &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is not unique (4 rows, 3 distinct)"),
+            "got: {err}"
+        );
+        assert!(err.contains("not replay-safe"), "got: {err}");
+        assert!(
+            err.contains("grain columns contain NULLs: campaign (3 rows)"),
+            "got: {err}"
+        );
+        assert!(
+            !err.contains("month ("),
+            "a zero-NULL column is not named: {err}"
+        );
+        assert!(
+            err.contains("does not make them unique") && !err.contains("coalesce to"),
+            "the failure path must never prescribe the sentinel fix: {err}"
+        );
+    }
+
+    /// Unique grain, one NULL: the contract is met, so `check` passes; the
+    /// measurement carries the full per-column map, zeros included.
+    #[test]
+    fn unique_grain_with_nulls_passes_and_records_the_null_rows() {
+        let (conn, _dir) = attach_lake("null-grain-unique");
+        conn.execute_batch(
+            "CREATE TABLE t AS SELECT * FROM (VALUES ('2026-01', 'a'), ('2026-01', NULL), \
+             ('2026-02', NULL)) v(month, campaign);",
+        )
+        .unwrap();
+        let m = check(&conn, &null_grain_cell(false), &HashMap::new())
+            .expect("a NULL grain value alone never fails verify");
+        let m = &m["t@1"];
+        assert_eq!((m.rows, m.distinct_grain), (3, 3));
+        assert_eq!(
+            m.null_rows,
+            BTreeMap::from([("campaign".to_string(), 2), ("month".to_string(), 0)])
+        );
+    }
+
+    /// A measured zero is an explicit `0` on the wire, and a record written
+    /// before the field existed still parses — as empty, never as zero.
+    #[test]
+    fn null_rows_round_trips_and_defaults_for_old_records() {
+        let (conn, _dir) = attach_lake("null-grain-zero");
+        conn.execute_batch(
+            "CREATE TABLE t AS SELECT * FROM (VALUES ('2026-01', 'a'), ('2026-01', 'b')) \
+             v(month, campaign);",
+        )
+        .unwrap();
+        let m = check(&conn, &null_grain_cell(false), &HashMap::new()).unwrap();
+        let json = serde_json::to_value(&m["t@1"]).unwrap();
+        assert_eq!(
+            json["null_rows"],
+            serde_json::json!({ "campaign": 0, "month": 0 })
+        );
+
+        let old: crate::manifest::GrainMeasurement = serde_json::from_value(serde_json::json!({
+            "check": "grain_unique", "grain": ["month"], "rows": 2, "distinct_grain": 2
+        }))
+        .expect("a pre-#10 record must still load");
+        assert!(old.null_rows.is_empty());
+    }
+
+    #[test]
+    fn describe_null_rows_follows_grain_order_and_skips_zeros() {
+        let grain = vec![
+            "month".to_string(),
+            "campaign".to_string(),
+            "channel".to_string(),
+        ];
+        let counts = BTreeMap::from([
+            ("campaign".to_string(), 3),
+            ("channel".to_string(), 1),
+            ("month".to_string(), 0),
+        ]);
+        assert_eq!(
+            describe_null_rows(&grain, &counts).as_deref(),
+            Some("campaign (3 rows), channel (1 rows)")
+        );
+        let none = BTreeMap::from([("month".to_string(), 0)]);
+        assert_eq!(describe_null_rows(&grain, &none), None);
     }
 
     // ADR 0012 §3 ratchet check 4: supported => non-empty description; the

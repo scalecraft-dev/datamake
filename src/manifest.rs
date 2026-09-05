@@ -113,6 +113,13 @@ pub struct GrainMeasurement {
     pub grain: Vec<String>,
     pub rows: i64,
     pub distinct_grain: i64,
+    /// Issue #10: rows with a NULL in each grain column, keyed by column,
+    /// every grain column present (zeros included). `#[serde(default)]` so
+    /// records written before this was measured still parse — as empty,
+    /// which is what "not measured" looks like on the wire; a measured zero
+    /// is an explicit `0`, never an absence.
+    #[serde(default)]
+    pub null_rows: BTreeMap<String, i64>,
 }
 
 impl SourceCheckRecord {

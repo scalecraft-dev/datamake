@@ -122,6 +122,7 @@ omitted or `null` — never fabricated, never zeros.
       "coverage": { "order_date": { "min": "2026-06-01", "max": "2026-06-02" } },
       "values":   { "region": { "values": ["eu-west", "us-east", "us-west"],
                                 "complete": true } },
+      "null_rows": { "order_date": 0, "region": 0 },
       "example_request": "orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
     }
   }],
@@ -159,7 +160,12 @@ A few parts earn special attention:
   into the interface digest. The `coverage` and
   `values` measurements turn the worst agent failure — an empty result read
   as a legitimate zero — into a diagnosable miss ("June is outside the data's
-  range" instead of "revenue was zero").
+  range" instead of "revenue was zero"). **`null_rows`** counts, per grain
+  column, the rows with a NULL there. The grammar is equality-only with no
+  NULL literal, so those rows come back in an unfiltered read but no grain
+  filter can reach them; `values[col].complete` speaks only for the
+  non-NULL value set, and this is the count it leaves out. Every grain
+  column is listed, zeros included — a measured zero is never an absence.
 - **`status`** is weakest to strongest — `draft` | `verified_at_source` |
   `verified` — never a single verified/not-verified flag, because the
   strength of the claim behind the document differs by *how* it was
@@ -550,7 +556,8 @@ as of the moment it ran, which may since have changed. An agent that reads
       "check": "grain_unique",
       "grain": ["id"],
       "rows": 722,
-      "distinct_grain": 722
+      "distinct_grain": 722,
+      "null_rows": { "id": 0 }
     }
   }],
   "source_check": {
@@ -563,7 +570,13 @@ as of the moment it ran, which may since have changed. An agent that reads
 
 Each export's `check` carries what the check actually measured for it, so a
 reader sees what passed and not merely that it did — its `at` is the
-pass's `checked_at`, one pass, one time. An export with no declared grain
+pass's `checked_at`, one pass, one time. `null_rows` is the same per-column
+NULL count the probe reports, as `verify` saw it: a NULL grain value never
+fails the check (the grain can still be unique), but `verify` warns about
+it because no grain filter can reach the row, and the count rides here so
+the document says so too. A `check` written by a datamk older than this
+measurement lacks the field entirely — absence means "not measured", never
+zero. An export with no declared grain
 carries no `check`: nothing ran on it, and an empty measurement is never
 invented to fill the gap. There is no `build` block on such a cell — no
 execution stands behind it, and its absence says so.

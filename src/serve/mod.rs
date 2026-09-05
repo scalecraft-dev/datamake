@@ -825,7 +825,8 @@ fn observed_bundle_sha12(
 /// The swap-time probe (ADR 0012 §5): per export, the row count, min/max of
 /// date/timestamp-typed grain columns, distinct values of string grain
 /// columns (`LIMIT 51` — ≤50 listed as complete, more omitted as
-/// incomplete), and one real row's grain values joined into
+/// incomplete), NULLs per grain column (issue #10 — the rows no grain
+/// filter can reach), and one real row's grain values joined into
 /// `example_request`. Runs on the freshly opened connection at open and at
 /// swap — never the request path — against the same rows each route serves
 /// (the pinned snapshot for supported routes). Every piece is best-effort:
@@ -907,6 +908,34 @@ fn probe_exports(
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Issue #10: NULLs per grain column, one aggregate over the served
+        // rows, read positionally (no alias built from a column name). A
+        // count, not a value — so it ships under `--no-data` too, like
+        // `rows` and `coverage`.
+        if !export.grain.is_empty() {
+            let null_exprs = export
+                .grain
+                .iter()
+                .map(|g| format!("count(*) - count({g})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let counts: Option<Vec<i64>> = conn
+                .prepare(&format!("SELECT {null_exprs} FROM {source}{at}"))
+                .and_then(|mut s| {
+                    s.query_row([], |r| {
+                        (0..export.grain.len())
+                            .map(|i| r.get::<_, i64>(i))
+                            .collect()
+                    })
+                })
+                .ok();
+            if let Some(counts) = counts {
+                for (g, n) in export.grain.iter().zip(counts) {
+                    probe.null_rows.insert(g.clone(), n);
+                }
             }
         }
 
@@ -1931,7 +1960,7 @@ mod tests {
     use crate::config::Visibility;
     use indexmap::IndexMap;
 
-    fn export() -> Export {
+    pub(super) fn export() -> Export {
         let mut schema = IndexMap::new();
         schema.insert(
             "order_date".to_string(),
@@ -2848,6 +2877,11 @@ mod smoke {
                 probe["values"]["region"]["values"],
                 serde_json::json!(["eu-west", "us-east", "us-west"])
             );
+            // Issue #10: a measured zero is an explicit 0, never an absence.
+            assert_eq!(
+                probe["null_rows"],
+                serde_json::json!({ "order_date": 0, "region": 0 })
+            );
             // Drawn jointly from the first row in grain order — a combination
             // that actually co-occurs. Pasting it must return exactly one row.
             let example = probe["example_request"].as_str().unwrap();
@@ -2863,6 +2897,89 @@ mod smoke {
             let rows: Vec<serde_json::Value> = serde_json::from_str(&rows).unwrap();
             assert_eq!(rows.len(), 1, "the example request must hit a real row");
         });
+    }
+
+    /// Issue #10: `check.null_rows` enters the observed-bundle ETag variant by
+    /// construction (`sc.exports` is serialized wholesale) — pinned here so
+    /// that landing the field on the manifest struct alone can never become
+    /// a silent no-op on the wire.
+    #[test]
+    fn null_rows_move_the_observed_bundle_etag() {
+        fn record(null_rows: BTreeMap<String, i64>) -> crate::manifest::SourceCheckRecord {
+            crate::manifest::SourceCheckRecord {
+                outcome: "passed".to_string(),
+                checked_at: "2026-08-07T10:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: "0.0.28".to_string(),
+                cell_yaml_digest: "abc".to_string(),
+                profile: "local".to_string(),
+                exports: BTreeMap::from([(
+                    "orders_daily@2".to_string(),
+                    crate::manifest::GrainMeasurement {
+                        check: "grain_unique".to_string(),
+                        grain: vec!["order_date".to_string(), "region".to_string()],
+                        rows: 4,
+                        distinct_grain: 4,
+                        null_rows,
+                    },
+                )]),
+            }
+        }
+        let routes = [("orders_daily@2".to_string(), super::tests::export())];
+        let check =
+            |null_rows| crate::context::SourceCheck::from_record(&record(null_rows), &routes);
+        let none = indexmap::IndexMap::new();
+        let zero = check(BTreeMap::from([
+            ("order_date".to_string(), 0),
+            ("region".to_string(), 0),
+        ]));
+        let one = check(BTreeMap::from([
+            ("order_date".to_string(), 0),
+            ("region".to_string(), 1),
+        ]));
+        assert_ne!(
+            observed_bundle_sha12(Some(&zero), &none),
+            observed_bundle_sha12(Some(&one), &none),
+            "a changed NULL count must not share an ETag"
+        );
+    }
+
+    /// Issue #10: the probe counts NULLs per grain column against the rows
+    /// it serves — the served-side truth beside `values`, whose `complete`
+    /// speaks only for the non-NULL set. A NULL grain row is still counted
+    /// in `rows` and still excluded from `values` and `example_request`.
+    #[test]
+    fn probe_counts_null_grain_rows_beside_the_values_it_cannot_list() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE orders_daily AS SELECT * FROM (VALUES \
+               (DATE '2026-06-01', 'us-east', 10.0), \
+               (DATE '2026-06-01', NULL, 5.0), \
+               (DATE '2026-06-02', NULL, 7.0)) v(order_date, region, revenue);",
+        )
+        .unwrap();
+        let probes = probe_exports(
+            &conn,
+            &[("orders_daily@2".to_string(), super::tests::export())],
+            &BTreeMap::new(),
+            true,
+        );
+        let p = serde_json::to_value(&probes["orders_daily@2"]).unwrap();
+        assert_eq!(p["rows"], 3);
+        assert_eq!(
+            p["null_rows"],
+            serde_json::json!({ "order_date": 0, "region": 2 })
+        );
+        assert_eq!(
+            p["values"]["region"]["values"],
+            serde_json::json!(["us-east"])
+        );
+        assert_eq!(p["values"]["region"]["complete"], true);
+        // The one row with every grain value present is still the example.
+        assert_eq!(
+            p["example_request"],
+            "orders_daily@2?order_date=2026-06-01&region=us-east&limit=10"
+        );
     }
 
     /// ADR 0012 §4: --no-data serves the map and withholds the rows — 404
