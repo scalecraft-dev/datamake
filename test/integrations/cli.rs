@@ -596,12 +596,67 @@ fn deploy_dry_run_without_serve_renders_no_server_and_skips_server_preflight() {
     assert!(stderr.contains("preflight  ok"), "stderr: {stderr}");
     assert!(stderr.contains("builder  "), "stderr: {stderr}");
     assert!(!stderr.contains("server   "), "stderr: {stderr}");
-    assert!(stderr.contains("this cell is built, not served"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("this cell is built, not served"),
+        "stderr: {stderr}"
+    );
     assert!(stdout.contains("kind: ConfigMap"), "stdout: {stdout}");
     assert!(stdout.contains("kind: Job"), "stdout: {stdout}");
     assert!(stdout.contains("kind: CronJob"), "stdout: {stdout}");
     assert!(!stdout.contains("kind: Deployment"), "stdout: {stdout}");
     assert!(!stdout.contains("kind: Service"), "stdout: {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #14: `serviceAccounts:` renders one ServiceAccount per identity,
+/// ahead of every pod-bearing object, and the Server pod mounts the reduced
+/// `<cell>-<profile>-server` Secret while Builder pods mount `<cell>-<profile>`.
+#[test]
+fn deploy_dry_run_renders_service_accounts_and_the_split_profile_secrets() {
+    let dir = fixture("orders", "deploysa");
+    std::fs::write(
+        dir.join("deploy/prod.yaml"),
+        "target: kubernetes\nallow_anonymous: true\nschedule: \"0 * * * *\"\nserve: {}\n\
+         serviceAccounts:\n  builder: orders-builder\n  server: orders-server\n",
+    )
+    .unwrap();
+    let out = run(
+        &dir,
+        &["deploy", "-f", "cell.yaml", "-p", "prod", "--dry-run"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("rendered   ServiceAccount orders-builder"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("rendered   ServiceAccount orders-server"),
+        "stderr: {stderr}"
+    );
+    let first_kind = stdout.find("kind: ServiceAccount").unwrap();
+    let first_pod_bearer = stdout.find("kind: Job").unwrap();
+    assert!(
+        first_kind < first_pod_bearer,
+        "accounts must precede pods: {stdout}"
+    );
+    assert!(
+        stdout.contains("serviceAccountName: orders-builder"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("serviceAccountName: orders-server"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("secretName: orders-prod-server"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("secretName: orders-prod\n"),
+        "stdout: {stdout}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -620,7 +675,10 @@ fn deploy_refuses_an_overlay_with_neither_serve_nor_schedule() {
     );
     assert!(!out.status.success(), "must be refused");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("neither `serve:` nor `schedule:`"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("neither `serve:` nor `schedule:`"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("serve: {}"), "stderr: {stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -760,13 +818,18 @@ fn run_help_documents_full_refresh_and_verify_replay() {
 
 /// A `connection` source with an `incremental:` block still goes through the
 /// same profile-resolution path as a plain connection source: if the profile
-/// has no matching `connections.<name>` entry, resolution must fail with the
+/// has no matching `connections.<name>` entry, `run` must fail with the
 /// existing missing-connection error — `incremental:` must not mask or
-/// change that error, and no BigQuery/network access is required to prove it
-/// (resolution fails in `config::resolve`, before any DB is opened).
+/// change that error, and no BigQuery/network access is required to prove it.
+/// Since issue #14 the error is raised by `connectors::prepare` (first thing
+/// `bind_sources` does, still before `BEGIN`) rather than `config::resolve`,
+/// so the fixture carries a materializing transform — otherwise `run`'s
+/// all-bound refusal fires first and never reaches binding.
 #[test]
 fn incremental_source_with_missing_connection_fails_with_the_existing_error() {
     let dir = scratch_dir("incremental_missing_conn");
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(dir.join("sql/stg_events.sql"), "SELECT 1 AS id\n").unwrap();
     std::fs::write(
         dir.join("cell.yaml"),
         "cell: incremental_missing_conn\n\
@@ -778,7 +841,8 @@ fn incremental_source_with_missing_connection_fails_with_the_existing_error() {
         \x20   incremental:\n\
         \x20     cursor: updated_at\n\
          \n\
-         transforms: []\n",
+         transforms:\n\
+        \x20 - sql/stg_events.sql\n",
     )
     .unwrap();
     std::fs::write(

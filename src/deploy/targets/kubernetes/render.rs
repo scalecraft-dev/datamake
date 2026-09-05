@@ -14,7 +14,7 @@ use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplat
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, HTTPGetAction, KeyToPath,
     LocalObjectReference, PodSpec, PodTemplateSpec, Probe, SecretVolumeSource, Service,
-    ServicePort, ServiceSpec, Volume, VolumeMount,
+    ServiceAccount, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -25,8 +25,23 @@ use crate::deploy::target::RenderedDoc;
 
 /// Cell content mount (ConfigMap: `cell.yaml` + `sql/*`, ADR 0002 §4).
 const CELL_MOUNT: &str = "/cell";
-/// Profile mount (Secret — carries the catalog DSN + S3 creds, ADR 0002 §5).
+/// Profile mount (Secret, ADR 0002 §5). The same path in every pod, but a
+/// different Secret per role (issue #14): Builder pods mount the full profile
+/// (`profile_secret_name`, storage + connections); the Server mounts the
+/// reduced one (`server_profile_secret_name`, storage + principals, no
+/// `connections:`), so no warehouse coordinates reach the HTTP pod.
 const PROFILE_MOUNT: &str = "/cell/profiles";
+
+/// Which identity a pod runs as (issue #14, ADR 0002 §5 amendment). The
+/// Builder is the init Job and the CronJob — same binary, same args, one
+/// account, one (full) profile Secret. The Server is the Deployment — its own
+/// account, the reduced profile Secret, and the only pod that mounts
+/// principals (`serve` is their only reader).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PodRole {
+    Builder,
+    Server,
+}
 /// Principals mount dir (Secret, ADR 0002 §5). `serve`'s `principals:` path
 /// points here — no `src/serve/` change needed.
 const PRINCIPALS_MOUNT_DIR: &str = "/etc/datamk";
@@ -82,6 +97,13 @@ pub(crate) struct RenderInput<'a> {
 /// which would reopen the "field rename is silently wrong" gap `render.rs`'s
 /// module doc exists to close.
 pub(crate) struct Manifests {
+    /// Opt-in (issue #14): rendered only when the overlay names an account
+    /// for that role. Applied *first* — the ServiceAccount admission plugin
+    /// refuses to create a pod whose account doesn't exist yet, so an init
+    /// Job applied before its account would sit podless until
+    /// `--init-timeout`.
+    pub(crate) builder_service_account: Option<ServiceAccount>,
+    pub(crate) server_service_account: Option<ServiceAccount>,
     pub(crate) configmap: ConfigMap,
     /// The one-shot Builder run (`datamk run`) apply waits on before the Server
     /// is ever applied — it initializes the DuckLake catalog so `serve`'s
@@ -113,7 +135,18 @@ pub(crate) struct Manifests {
 /// content-addressed, secret-free `CellArtifact` and the overlay's own
 /// (secret-free, ADR 0002 §3) `KubernetesConfig` feed the render.
 pub(crate) fn manifests(input: &RenderInput) -> Result<Manifests> {
+    let sa = &input.k8s.service_accounts;
     Ok(Manifests {
+        builder_service_account: sa
+            .builder
+            .as_deref()
+            .filter(|_| !input.all_bound)
+            .map(|name| render_service_account(input, name)),
+        server_service_account: sa
+            .server
+            .as_deref()
+            .filter(|_| input.k8s.serves())
+            .map(|name| render_service_account(input, name)),
         configmap: render_configmap(input)?,
         init_job: render_init_job(input),
         service: input.k8s.serves().then(|| render_service(input)),
@@ -130,7 +163,13 @@ impl Manifests {
     /// incidentally also alphabetical-ish, so no unit test needs to change for
     /// this refactor.
     pub(crate) fn docs(&self) -> Result<Vec<RenderedDoc>> {
-        let mut docs = Vec::with_capacity(5);
+        let mut docs = Vec::with_capacity(7);
+        for sa in [&self.builder_service_account, &self.server_service_account]
+            .into_iter()
+            .flatten()
+        {
+            docs.push(rendered_doc("ServiceAccount", &sa.metadata, sa)?);
+        }
         docs.push(rendered_doc(
             "ConfigMap",
             &self.configmap.metadata,
@@ -217,9 +256,36 @@ pub(crate) fn principals_secret_name(cell: &str) -> String {
     format!("{cell}-principals")
 }
 
-/// See `principals_secret_name` — same naming-can't-drift rationale.
+/// See `principals_secret_name` — same naming-can't-drift rationale. The
+/// **Builder's** profile Secret: the full `profiles/<profile>.yaml`.
 pub(crate) fn profile_secret_name(cell: &str, profile: &str) -> String {
     format!("{cell}-{profile}")
+}
+
+/// The **Server's** profile Secret (issue #14): the same `<profile>.yaml` key
+/// and mount path, but a reduced document — storage (+ s3/gcs) and
+/// `principals:`, no `connections:`. Operator-created like the Builder's; the
+/// pre-flight parses it and refuses a `connections:` block.
+pub(crate) fn server_profile_secret_name(cell: &str, profile: &str) -> String {
+    format!("{cell}-{profile}-server")
+}
+
+/// Name/namespace/labels **only** (issue #14). Never annotations: the
+/// operator's Workload Identity binding (`iam.gke.io/gcp-service-account`,
+/// `eks.amazonaws.com/role-arn`) lives there, and `apply_one`'s forced
+/// server-side apply would prune any field datamk claimed ownership of —
+/// a "helpful default" annotation here would silently break the IAM binding
+/// on every deploy. `service_accounts_carry_no_annotations` pins this.
+fn render_service_account(input: &RenderInput, name: &str) -> ServiceAccount {
+    ServiceAccount {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(input.k8s.namespace().to_string()),
+            labels: Some(app_label(input.cell)),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn app_label(cell: &str) -> BTreeMap<String, String> {
@@ -367,7 +433,7 @@ fn render_init_job(input: &RenderInput) -> Option<Job> {
         image: Some(input.k8s.image_ref()),
         command: Some(vec!["datamk".to_string()]),
         args: Some(builder_args(input)),
-        volume_mounts: Some(volume_mounts(input)),
+        volume_mounts: Some(volume_mounts(input, PodRole::Builder)),
         ..Default::default()
     };
 
@@ -394,9 +460,10 @@ fn render_init_job(input: &RenderInput) -> Option<Job> {
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
-                    volumes: Some(volumes(input)),
+                    volumes: Some(volumes(input, PodRole::Builder)),
                     restart_policy: Some("Never".to_string()),
                     image_pull_secrets: image_pull_secrets(input),
+                    service_account_name: service_account_name(input, PodRole::Builder),
                     ..Default::default()
                 }),
             },
@@ -462,11 +529,15 @@ fn cell_volume(input: &RenderInput) -> Volume {
     }
 }
 
-fn profile_volume(input: &RenderInput) -> Volume {
+fn profile_volume(input: &RenderInput, role: PodRole) -> Volume {
+    let secret_name = match role {
+        PodRole::Builder => profile_secret_name(input.cell, input.profile),
+        PodRole::Server => server_profile_secret_name(input.cell, input.profile),
+    };
     Volume {
         name: "profile".to_string(),
         secret: Some(SecretVolumeSource {
-            secret_name: Some(profile_secret_name(input.cell, input.profile)),
+            secret_name: Some(secret_name),
             default_mode: Some(0o400),
             ..Default::default()
         }),
@@ -486,28 +557,44 @@ fn principals_volume(input: &RenderInput) -> Volume {
     }
 }
 
-/// `cell` + `profile` + `scratch` always; `principals` only when
-/// `access.roles` is set (ADR 0002 §5) — an open cell has no token->roles
-/// secret to mount. `scratch` is the emptyDir behind `/tmp`, where downloaded
-/// catalog artifacts land (ADR 0004 §6) — explicit so the pods stay correct
-/// under a future `readOnlyRootFilesystem` hardening.
-fn volumes(input: &RenderInput) -> Vec<Volume> {
+/// `cell` + `profile` + `scratch` always; `principals` only on the Server
+/// and only when `access.roles` is set (ADR 0002 §5, issue #14) — an open
+/// cell has no token->roles secret to mount, and a Builder never reads one
+/// (`serve::load_principals` is its only reader). `profile` is a different
+/// Secret per role — see `PROFILE_MOUNT`. `scratch` is the emptyDir behind
+/// `/tmp`, where downloaded catalog artifacts land (ADR 0004 §6) — explicit
+/// so the pods stay correct under a future `readOnlyRootFilesystem`
+/// hardening.
+fn volumes(input: &RenderInput, role: PodRole) -> Vec<Volume> {
     let mut v = vec![
         cell_volume(input),
-        profile_volume(input),
+        profile_volume(input, role),
         Volume {
             name: "scratch".to_string(),
             empty_dir: Some(Default::default()),
             ..Default::default()
         },
     ];
-    if input.has_roles {
+    if mounts_principals(input, role) {
         v.push(principals_volume(input));
     }
     v
 }
 
-fn volume_mounts(input: &RenderInput) -> Vec<VolumeMount> {
+fn mounts_principals(input: &RenderInput, role: PodRole) -> bool {
+    input.has_roles && role == PodRole::Server
+}
+
+/// Opt-in per role (issue #14): `None` ⇒ the field is omitted and the pod
+/// runs as the namespace default, exactly as before.
+fn service_account_name(input: &RenderInput, role: PodRole) -> Option<String> {
+    match role {
+        PodRole::Builder => input.k8s.service_accounts.builder.clone(),
+        PodRole::Server => input.k8s.service_accounts.server.clone(),
+    }
+}
+
+fn volume_mounts(input: &RenderInput, role: PodRole) -> Vec<VolumeMount> {
     let mut m = vec![
         VolumeMount {
             name: "cell".to_string(),
@@ -527,7 +614,7 @@ fn volume_mounts(input: &RenderInput) -> Vec<VolumeMount> {
             ..Default::default()
         },
     ];
-    if input.has_roles {
+    if mounts_principals(input, role) {
         m.push(VolumeMount {
             name: "principals".to_string(),
             mount_path: PRINCIPALS_MOUNT_DIR.to_string(),
@@ -611,7 +698,7 @@ fn render_deployment(input: &RenderInput) -> Deployment {
             container_port: input.k8s.port().into(),
             ..Default::default()
         }]),
-        volume_mounts: Some(volume_mounts(input)),
+        volume_mounts: Some(volume_mounts(input, PodRole::Server)),
         readiness_probe: Some(http_probe(input.k8s.port())),
         liveness_probe: Some(http_probe(input.k8s.port())),
         ..Default::default()
@@ -638,8 +725,9 @@ fn render_deployment(input: &RenderInput) -> Deployment {
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
-                    volumes: Some(volumes(input)),
+                    volumes: Some(volumes(input, PodRole::Server)),
                     image_pull_secrets: image_pull_secrets(input),
+                    service_account_name: service_account_name(input, PodRole::Server),
                     ..Default::default()
                 }),
             },
@@ -669,7 +757,7 @@ fn render_cronjob(input: &RenderInput) -> Option<CronJob> {
         image: Some(input.k8s.image_ref()),
         command: Some(vec!["datamk".to_string()]),
         args: Some(builder_args(input)),
-        volume_mounts: Some(volume_mounts(input)),
+        volume_mounts: Some(volume_mounts(input, PodRole::Builder)),
         ..Default::default()
     };
 
@@ -696,9 +784,10 @@ fn render_cronjob(input: &RenderInput) -> Option<CronJob> {
                         }),
                         spec: Some(PodSpec {
                             containers: vec![container],
-                            volumes: Some(volumes(input)),
+                            volumes: Some(volumes(input, PodRole::Builder)),
                             restart_policy: Some("OnFailure".to_string()),
                             image_pull_secrets: image_pull_secrets(input),
+                            service_account_name: service_account_name(input, PodRole::Builder),
                             ..Default::default()
                         }),
                     },
@@ -1356,6 +1445,244 @@ mod tests {
             vec!["ConfigMap", "Service", "Deployment"],
             "no Job doc must be rendered for an all-bound cell"
         );
+    }
+
+    // --- issue #14: Builder/Server identity split ---------------------------
+
+    fn pod_spec_of_job(job: Job) -> PodSpec {
+        job.spec.unwrap().template.spec.unwrap()
+    }
+    fn pod_spec_of_deployment(dep: Deployment) -> PodSpec {
+        dep.spec.unwrap().template.spec.unwrap()
+    }
+    fn pod_spec_of_cronjob(cj: CronJob) -> PodSpec {
+        cj.spec
+            .unwrap()
+            .job_template
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+    }
+    fn profile_secret_of(spec: &PodSpec) -> String {
+        spec.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "profile")
+            .expect("profile volume")
+            .secret
+            .as_ref()
+            .unwrap()
+            .secret_name
+            .clone()
+            .unwrap()
+    }
+    fn has_principals(spec: &PodSpec) -> bool {
+        let vol = spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|v| v.name == "principals");
+        let mount = spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.name == "principals");
+        assert_eq!(vol, mount, "volume and mount must agree");
+        vol
+    }
+
+    /// The render half of "no connector DSN reaches the Server pod": Builder
+    /// pods mount the full profile Secret, the Server mounts the reduced one.
+    /// Same volume name and mount path — `--profile <name>` resolves the same
+    /// file in every pod; only the Secret behind it differs.
+    #[test]
+    fn builder_pods_mount_the_full_profile_and_the_server_mounts_the_reduced_one() {
+        let art = orders_artifact();
+        let k8s: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"\nserve: {}").unwrap();
+        let i = input(&k8s, &art);
+
+        let init = pod_spec_of_job(render_init_job(&i).unwrap());
+        let cron = pod_spec_of_cronjob(render_cronjob(&i).unwrap());
+        let server = pod_spec_of_deployment(render_deployment(&i));
+
+        assert_eq!(
+            profile_secret_of(&init),
+            profile_secret_name("orders", "prod")
+        );
+        assert_eq!(
+            profile_secret_of(&cron),
+            profile_secret_name("orders", "prod")
+        );
+        assert_eq!(
+            profile_secret_of(&server),
+            server_profile_secret_name("orders", "prod")
+        );
+        assert_eq!(
+            server_profile_secret_name("orders", "prod"),
+            "orders-prod-server"
+        );
+        for spec in [&init, &cron, &server] {
+            let mount = spec.containers[0]
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|m| m.name == "profile")
+                .unwrap();
+            assert_eq!(mount.mount_path, PROFILE_MOUNT);
+        }
+    }
+
+    /// `serve::load_principals` is the only reader of principals; a Builder
+    /// carrying the token→roles map was surface for nothing.
+    #[test]
+    fn principals_mount_only_on_the_server_even_with_roles() {
+        let art = orders_artifact();
+        let k8s: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"\nserve: {}").unwrap();
+        let mut i = input(&k8s, &art);
+        i.has_roles = true;
+
+        assert!(has_principals(&pod_spec_of_deployment(render_deployment(
+            &i
+        ))));
+        assert!(!has_principals(&pod_spec_of_job(
+            render_init_job(&i).unwrap()
+        )));
+        assert!(!has_principals(&pod_spec_of_cronjob(
+            render_cronjob(&i).unwrap()
+        )));
+    }
+
+    /// Opt-in: with no `serviceAccounts:`, no field is set (namespace
+    /// default, exactly as before) and no ServiceAccount object is rendered.
+    #[test]
+    fn service_account_name_absent_by_default() {
+        let art = orders_artifact();
+        let k8s: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"\nserve: {}").unwrap();
+        let i = input(&k8s, &art);
+        assert!(pod_spec_of_job(render_init_job(&i).unwrap())
+            .service_account_name
+            .is_none());
+        assert!(pod_spec_of_cronjob(render_cronjob(&i).unwrap())
+            .service_account_name
+            .is_none());
+        assert!(pod_spec_of_deployment(render_deployment(&i))
+            .service_account_name
+            .is_none());
+        let m = manifests(&i).unwrap();
+        assert!(m.builder_service_account.is_none());
+        assert!(m.server_service_account.is_none());
+        let kinds: Vec<_> = m.docs().unwrap().iter().map(|d| d.kind.clone()).collect();
+        assert!(!kinds.iter().any(|k| k == "ServiceAccount"), "{kinds:?}");
+    }
+
+    #[test]
+    fn service_accounts_reach_their_own_pods_and_render_first() {
+        let art = orders_artifact();
+        let k8s: KubernetesConfig = serde_yaml::from_str(
+            "schedule: \"0 * * * *\"\nserve: {}\nnamespace: data\n\
+             serviceAccounts:\n  builder: orders-builder\n  server: orders-server\n",
+        )
+        .unwrap();
+        let i = input(&k8s, &art);
+
+        assert_eq!(
+            pod_spec_of_job(render_init_job(&i).unwrap())
+                .service_account_name
+                .as_deref(),
+            Some("orders-builder")
+        );
+        assert_eq!(
+            pod_spec_of_cronjob(render_cronjob(&i).unwrap())
+                .service_account_name
+                .as_deref(),
+            Some("orders-builder")
+        );
+        assert_eq!(
+            pod_spec_of_deployment(render_deployment(&i))
+                .service_account_name
+                .as_deref(),
+            Some("orders-server")
+        );
+
+        let m = manifests(&i).unwrap();
+        let builder = m.builder_service_account.as_ref().unwrap();
+        assert_eq!(builder.metadata.name.as_deref(), Some("orders-builder"));
+        assert_eq!(builder.metadata.namespace.as_deref(), Some("data"));
+        assert_eq!(
+            m.server_service_account
+                .as_ref()
+                .unwrap()
+                .metadata
+                .name
+                .as_deref(),
+            Some("orders-server")
+        );
+        // Accounts precede every pod-bearing object: the admission plugin
+        // refuses a pod whose account doesn't exist yet.
+        let kinds: Vec<_> = m.docs().unwrap().iter().map(|d| d.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "ServiceAccount",
+                "ServiceAccount",
+                "ConfigMap",
+                "Job",
+                "Service",
+                "Deployment",
+                "CronJob"
+            ]
+        );
+    }
+
+    /// Only the role's own account is rendered: a Builder account on an
+    /// all-bound cell (no Builder pods) renders nothing, and a Server
+    /// account without `serve:` renders nothing — both are also refused
+    /// earlier (pre-flight / `validate`), this pins the render's own guard.
+    #[test]
+    fn service_accounts_render_only_for_workloads_that_exist() {
+        let art = orders_artifact();
+        let k8s: KubernetesConfig =
+            serde_yaml::from_str("serve: {}\nserviceAccounts:\n  builder: b\n  server: s\n")
+                .unwrap();
+        let mut i = input(&k8s, &art);
+        i.all_bound = true;
+        let m = manifests(&i).unwrap();
+        assert!(m.builder_service_account.is_none());
+        assert!(m.server_service_account.is_some());
+
+        let builder_only: KubernetesConfig = serde_yaml::from_str(
+            "schedule: \"0 * * * *\"\nserviceAccounts:\n  builder: b\n  server: s\n",
+        )
+        .unwrap();
+        let m = manifests(&input(&builder_only, &art)).unwrap();
+        assert!(m.builder_service_account.is_some());
+        assert!(m.server_service_account.is_none());
+    }
+
+    /// The operator's Workload Identity binding is an *annotation* on the
+    /// account. `apply_one` force-applies with datamk as field manager, so
+    /// any annotation datamk emitted here would claim ownership of that
+    /// field and prune the operator's on every deploy. Never emit one.
+    #[test]
+    fn service_accounts_carry_no_annotations() {
+        let art = orders_artifact();
+        let k8s: KubernetesConfig =
+            serde_yaml::from_str("serve: {}\nserviceAccounts:\n  server: s\n").unwrap();
+        let m = manifests(&input(&k8s, &art)).unwrap();
+        let sa = m.server_service_account.unwrap();
+        assert!(sa.metadata.annotations.is_none());
+        assert!(sa.automount_service_account_token.is_none());
+        assert!(sa.secrets.is_none());
+        assert!(sa.image_pull_secrets.is_none());
     }
 
     #[test]

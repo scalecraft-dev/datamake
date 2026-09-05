@@ -38,6 +38,10 @@ pub fn check(i: &PreflightInput) -> Result<()> {
     check_remote_storage(i)?;
     check_no_catalog(i)?;
     check_no_all_never(i)?;
+    // Issue #14: resolve defers a missing `connections.<name>` entry so the
+    // Server can load a connections-free profile; the Builder that would
+    // read it is refused here, on the deploy host, not inside its pod.
+    crate::config::check_connections_bound(&i.bindings.sources)?;
     check_no_interactive_connections(i)?;
     if i.serves {
         check_servable(i)?;
@@ -407,7 +411,13 @@ mod tests {
         // …but a local store is still refused — `serves` only gates the
         // Server-specific checks.
         let local = loaded("local");
-        let mut i = input(&local.def, &local.bindings, &local.transforms, "local", false);
+        let mut i = input(
+            &local.def,
+            &local.bindings,
+            &local.transforms,
+            "local",
+            false,
+        );
         i.serves = false;
         let err = check(&i).unwrap_err().to_string();
         assert!(err.contains("is local"), "got: {err}");

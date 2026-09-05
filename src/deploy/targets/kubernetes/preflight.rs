@@ -16,14 +16,19 @@ use kube::Api;
 
 use super::render;
 use super::schema::KubernetesConfig;
-use crate::config::ResolvedBindings;
+use crate::config::{Bindings, ResolvedBindings};
 use crate::deploy::target::DeployContext;
 
 /// Run every cluster-side check. Returns the principals Secret's
-/// `resourceVersion` — `Some` only when `has_roles` (an open cell mounts no
-/// principals Secret to version), `None` otherwise — so the caller can stamp
-/// it as the Deployment's `checksum/secret` pod-template annotation: rotating
-/// the Secret then rolls the Server (ADR 0002 §5).
+/// `resourceVersion` — `Some` only when the Server is rendered *and*
+/// `has_roles` (an open cell mounts no principals Secret to version; a
+/// Builder-only deploy mounts none at all), `None` otherwise — so the caller
+/// can stamp it as the Deployment's `checksum/secret` pod-template
+/// annotation: rotating the Secret then rolls the Server (ADR 0002 §5).
+///
+/// Every Secret is required only where a rendered pod actually mounts it
+/// (issue #14): the Builder profile when a Builder exists (not all-bound),
+/// the Server profile + principals only when `serve:` is present.
 pub(crate) async fn check(
     client: &kube::Client,
     namespace: &str,
@@ -31,24 +36,41 @@ pub(crate) async fn check(
     k8s: &KubernetesConfig,
     has_roles: bool,
 ) -> Result<Option<String>> {
-    check_principals_mount_path(ctx.bindings, has_roles)?;
+    let server_has_roles = has_roles && k8s.serves();
+    check_principals_mount_path(ctx.bindings, server_has_roles)?;
 
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
 
-    let profile_name = render::profile_secret_name(&ctx.def.cell, ctx.profile);
-    require_secret(
-        &secrets,
-        namespace,
-        &profile_name,
-        "the profile Secret (catalog DSN + S3 creds every workload mounts)",
-    )
-    .await?;
+    if !ctx.all_bound {
+        let profile_name = render::profile_secret_name(&ctx.def.cell, ctx.profile);
+        require_secret(
+            &secrets,
+            namespace,
+            &profile_name,
+            "the Builder's profile Secret (the full profile — storage creds + warehouse \
+             connections; mounted only into Builder pods)",
+        )
+        .await?;
+    }
+
+    if k8s.serves() {
+        let server_profile_name = render::server_profile_secret_name(&ctx.def.cell, ctx.profile);
+        let secret = require_secret(
+            &secrets,
+            namespace,
+            &server_profile_name,
+            "the Server's profile Secret (the reduced profile — storage creds + `principals:`, \
+             NO `connections:`; the only profile the Server pod mounts)",
+        )
+        .await?;
+        check_server_profile_secret(&secret, namespace, &server_profile_name, ctx.profile)?;
+    }
 
     if let Some(pull_secret) = &k8s.image_pull_secret {
         require_secret(&secrets, namespace, pull_secret, "the `imagePullSecret`").await?;
     }
 
-    if !has_roles {
+    if !server_has_roles {
         return Ok(None);
     }
 
@@ -136,6 +158,29 @@ pub(super) fn check_all_bound_cell_has_a_server(
     Ok(())
 }
 
+/// Issue #14 × issue #6/#11: `serviceAccounts.builder` on an all-bound cell
+/// names an account no pod would ever run as — no init Job, no CronJob
+/// (`render_init_job`/`render_cronjob` are both `None`). The Server-side
+/// mismatch is refused in `KubernetesConfig::validate` (it only needs
+/// `serve:`); this one needs `all_bound`, so it lives here beside
+/// `check_no_schedule_for_an_all_bound_cell`.
+pub(super) fn check_builder_service_account_for_an_all_bound_cell(
+    cell: &str,
+    all_bound: bool,
+    k8s: &KubernetesConfig,
+) -> Result<()> {
+    if let (true, Some(name)) = (all_bound, &k8s.service_accounts.builder) {
+        bail!(
+            "cell '{cell}' has no materializing transforms (every export is bound), so no \
+             Builder workload is rendered — `serviceAccounts.builder: {name}` would never be \
+             assigned to anything.\n\
+             Remove `serviceAccounts.builder` from this deploy overlay; only the Server has an \
+             identity to assign for this cell."
+        );
+    }
+    Ok(())
+}
+
 /// When `access.roles` is set, the profile's `principals:` must equal the path
 /// the principals Secret is actually mounted at in-cluster (ADR 0002 §5) — the
 /// only place that Secret's data lands. Any other value means `serve` starts
@@ -181,6 +226,58 @@ async fn require_secret(
                  '{namespace}' before re-running deploy."
             )
         })
+}
+
+/// Issue #14: the invariant the Secret split exists for — **no connector
+/// DSN reaches the Server pod** — is only half provable from the render (the
+/// Deployment mounts `<cell>-<profile>-server`, pinned by a render test).
+/// The other half is operator-authored content, and this is the only place
+/// it can be checked before a pod exists: the Server Secret's
+/// `<profile>.yaml` must parse as a profile and carry no `connections:`.
+/// Parsed with the same `Bindings` shape `config::load` uses, so a typo'd
+/// key fails here with serde's message rather than in a crash-looping pod.
+fn check_server_profile_secret(
+    secret: &Secret,
+    namespace: &str,
+    name: &str,
+    profile: &str,
+) -> Result<()> {
+    let key = format!("{profile}.yaml");
+    let data = secret.data.as_ref().ok_or_else(|| {
+        anyhow!(
+            "Secret '{name}' in namespace '{namespace}' has no `data` at all; expected a \
+             `{key}` key (ADR 0002 §5)."
+        )
+    })?;
+    let bytes = data.get(&key).ok_or_else(|| {
+        anyhow!(
+            "Secret '{name}' in namespace '{namespace}' has no `{key}` key in `data` — that's \
+             the key both the in-cluster mount and `serve --profile {profile}` expect."
+        )
+    })?;
+    let raw = std::str::from_utf8(&bytes.0).with_context(|| {
+        format!("Secret '{name}' key `{key}` in namespace '{namespace}' is not valid UTF-8")
+    })?;
+    let bindings: Bindings = serde_yaml::from_str(raw).with_context(|| {
+        format!(
+            "Secret '{name}' key `{key}` in namespace '{namespace}' failed to parse as a \
+             profile (profiles/{profile}.yaml shape)"
+        )
+    })?;
+    if !bindings.connections.is_empty() {
+        let names: Vec<_> = bindings.connections.keys().cloned().collect();
+        bail!(
+            "Secret '{name}' key `{key}` in namespace '{namespace}' carries `connections:` \
+             ({}) — the Server never reads a warehouse connection, and this Secret is the one \
+             the Server pod mounts, so warehouse coordinates must not be in it.\n\
+             Create '{name}' from a copy of profiles/{profile}.yaml with the `connections:` \
+             block removed; the full profile belongs only in the Builder's Secret \
+             ('{builder}').",
+            names.join(", "),
+            builder = name.trim_end_matches("-server"),
+        );
+    }
+    Ok(())
 }
 
 /// Validate the principals Secret's shape (ADR 0002 §6): it must carry the
@@ -285,6 +382,81 @@ mod tests {
         let builder_only: KubernetesConfig =
             serde_yaml::from_str("schedule: \"0 * * * *\"").unwrap();
         check_all_bound_cell_has_a_server("t", false, &builder_only).unwrap();
+    }
+
+    /// Issue #14: a Builder account on a cell that renders no Builder.
+    #[test]
+    fn builder_service_account_on_an_all_bound_cell_is_refused() {
+        let k8s: KubernetesConfig =
+            serde_yaml::from_str("serve: {}\nserviceAccounts:\n  builder: orders-builder\n")
+                .unwrap();
+        let err = check_builder_service_account_for_an_all_bound_cell("t", true, &k8s)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cell 't'"), "got: {err}");
+        assert!(
+            err.contains("serviceAccounts.builder: orders-builder"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("Remove `serviceAccounts.builder`"),
+            "got: {err}"
+        );
+
+        check_builder_service_account_for_an_all_bound_cell("t", false, &k8s).unwrap();
+        let no_sa: KubernetesConfig = serde_yaml::from_str("serve: {}").unwrap();
+        check_builder_service_account_for_an_all_bound_cell("t", true, &no_sa).unwrap();
+    }
+
+    fn secret_with(profile: &str, yaml: &str) -> Secret {
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(
+            format!("{profile}.yaml"),
+            k8s_openapi::ByteString(yaml.as_bytes().to_vec()),
+        );
+        Secret {
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    /// Issue #14: the content half of "no connector DSN reaches the Server".
+    #[test]
+    fn server_profile_secret_with_connections_is_refused() {
+        let secret = secret_with(
+            "prod",
+            "storage: s3://b/cells/orders\nconnections:\n  wh:\n    type: postgres\n    host: db.internal\n    database: crm\n    user: u\n    password: ${PW}\n",
+        );
+        let err = check_server_profile_secret(&secret, "data", "orders-prod-server", "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("carries `connections:` (wh)"), "got: {err}");
+        assert!(err.contains("'orders-prod'"), "got: {err}");
+        assert!(err.contains("Server pod mounts"), "got: {err}");
+    }
+
+    #[test]
+    fn server_profile_secret_without_connections_passes() {
+        let secret = secret_with(
+            "prod",
+            "storage: s3://b/cells/orders\ns3:\n  region: us-east-1\nprincipals: /etc/datamk/principals.json\n",
+        );
+        check_server_profile_secret(&secret, "data", "orders-prod-server", "prod").unwrap();
+    }
+
+    #[test]
+    fn server_profile_secret_wrong_key_or_shape_is_refused() {
+        let wrong_key = secret_with("staging", "storage: s3://b\n");
+        let err = check_server_profile_secret(&wrong_key, "data", "orders-prod-server", "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no `prod.yaml` key"), "got: {err}");
+
+        let typo = secret_with("prod", "storage: s3://b\nconection: {}\n");
+        let err = check_server_profile_secret(&typo, "data", "orders-prod-server", "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to parse as a profile"), "got: {err}");
     }
 
     #[test]

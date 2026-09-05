@@ -95,6 +95,9 @@ serve:                      # omit ⇒ no Deployment, no Service (issue #8); `se
   replicas: 2
 # image:                    # omit ⇒ default to this binary's version (ADR 0001 §5)
 # imagePullSecret: regcred  # a k8s Secret *name*, never the secret itself
+# serviceAccounts:          # opt-in, one identity per role (issue #14, §5); omit ⇒
+#   builder: orders-builder #   pods run as the namespace default
+#   server: orders-server
 ```
 
 `image` is an `Option<String>` (omitted ⇒ default), not an empty-string sentinel.
@@ -123,11 +126,14 @@ The **profile does not go in the ConfigMap** — it can carry secrets. See §5.
 A content-addressed artifact or git-ref pulled by an init container is the durable
 alternative (immutable, auditable record of what's deployed); deferred past v1.
 
-### 5. Secret wiring (profile + principals)
+### 5. Secret wiring (profile + principals) and identities
 
 `serve`/`run` need the profile (`profiles/<name>.yaml`), which can carry the
 catalog DSN and S3 creds, and `serve` needs the principals file. Both are
-secret-grade and are delivered as Kubernetes **Secrets**, never ConfigMaps:
+secret-grade and are delivered as Kubernetes **Secrets**, never ConfigMaps.
+Amended by issue #14 (2026-09): the pods are **two identities** — the
+**Builder** (init Job + CronJob) and the **Server** (Deployment) — and the
+wiring below is per identity, not per pod. See §8 for the amendment.
 
 - **Principals** → a Secret (key `principals.json`) mounted as a `secret` volume,
   `defaultMode: 0400`, read-only, at a fixed path (e.g. `/etc/datamk/principals.json`).
@@ -157,7 +163,12 @@ Realizes ADR 0001 §7–§8 against the cluster, as **hard failures that block a
 - `access.shareable: true` with empty `roles` ⇒ refuse unless top-level
   `allow_anonymous: true` is set in the overlay. (Enforced by the agnostic pre-flight,
   ADR 0001 §8 — the Kubernetes target does not re-check it.)
-- `imagePullSecret` / referenced Secrets must exist before apply.
+- `imagePullSecret` / referenced Secrets must exist before apply — each only
+  where a rendered pod mounts it (§8): the Builder profile when a Builder is
+  rendered, the Server profile (and principals) only when `serve:` is present.
+- The Server profile Secret must parse as a profile and carry no `connections:`.
+- `serviceAccounts.server` without `serve:`, or `serviceAccounts.builder` on an
+  all-bound cell, is refused: an account nothing runs as is worse than none.
 
 ### 7. Service exposure
 
@@ -165,6 +176,61 @@ Realizes ADR 0001 §7–§8 against the cluster, as **hard failures that block a
 LoadBalancer or Ingress — least of all for an anonymous endpoint. Public exposure
 (ingress/host field) is a deliberate follow-up, not a default. The `DeployReport`
 must therefore describe the route as in-cluster only and not imply a curl-able URL.
+
+### 8. Amendment (2026-09, issues #8 and #14): Server optional, identities split
+
+**Server optional (#8).** §1 is amended: the Deployment + Service render iff
+`serve:` is present, exactly as the CronJob renders iff `schedule:` is. A cell
+that exists only to be composed has no HTTP consumer (composition is build-time
+against published artifacts) and should not pay for an idle Server. Neither
+block ⇒ refused at schema validation; an all-bound cell without `serve:` is
+refused by the target pre-flight with `serve: {}` named as the only fix. The
+agnostic Server-only pre-flight (servable, auth) keys on `DeployTarget::serves`
+— "this deploy renders a Server" — not on the target's capability, and is
+unchanged whenever a Server is rendered. Explicitly *not* adopted: a gateway
+Deployment serving the mesh off the `mesh emit` manifest — `serve` never serves
+a hosted index of cells (no-control-plane is the thesis).
+
+**Two identities (#14).** The Server's *code* never touches a warehouse
+(`connectors::prepare` is reached only from `run`/`verify`/`interface`), but
+under Workload Identity its *ambient identity* was the Builder's, so an RCE in
+`serve` inherited warehouse reach it never needed. Two changes:
+
+- **Profile Secret split, unconditional.** Builder pods mount `<cell>-<profile>`
+  (the full profile). The Server mounts `<cell>-<profile>-server`: the same
+  `<profile>.yaml` key at the same path, but a reduced document — storage,
+  `s3`/`gcs`, `principals`; **no `connections:`**. Two operator-created Secrets
+  rather than one Secret with two keys: a profile is one YAML value under one
+  key, volume `items:` projects keys not fields, and `deploy` never sees profile
+  plaintext (§5 reference-not-create) so it cannot derive the reduced document
+  itself. One Secret with a second key was rejected because an ESO/sealed-secret
+  sync owning the object would silently overwrite it. The invariant — **no
+  connector DSN reaches the Server pod** — is pinned twice: a render test (the
+  Deployment mounts only the `-server` Secret; Builder pods only the full one)
+  and a live pre-flight that parses the Server Secret and refuses `connections:`.
+  Principals are now mounted into the Server only; `serve` is their sole reader.
+  Honest scope: connection configs carry no literal secrets by design (a
+  `password:` must be a `${VAR}`), so the split removes warehouse *coordinates*
+  (host, database, user, key path — recon and targeting). The control that
+  removes *reach* is the account split below.
+- **Service accounts, opt-in.** `serviceAccounts: {builder, server}` in the
+  overlay. When a name is set, `deploy` renders a ServiceAccount (name,
+  namespace, labels — **never annotations**: the operator's IAM binding lives
+  there, and a forced server-side apply would prune any field datamk claimed)
+  and sets `serviceAccountName` on that role's pods; accounts are applied before
+  any pod-bearing object because the admission plugin refuses a pod whose
+  account is missing. When absent, pods run as the namespace default as before,
+  so laptop/`kind` clusters need nothing. Under Workload Identity the operator
+  binds cloud IAM to each account — one extra binding over the single-identity
+  setup, not a new step.
+
+**Loader consequence.** `config::load` used to refuse a `connection` source whose
+connection is absent from the profile. The Server's reduced profile is exactly
+that shape, so a missing connection now resolves to
+`ResolvedSource::MissingConnection` and the same error is raised at first use —
+`connectors::prepare` (every warehouse reader) and the agnostic deploy
+pre-flight (so a Builder is refused on the deploy host, not in its pod). `run`
+still fails before `BEGIN`; `serve` never reads a connection and starts.
 
 ## Consequences
 

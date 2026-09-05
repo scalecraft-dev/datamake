@@ -68,6 +68,13 @@ impl Kubernetes {
         // `datamk run` on a cell with nothing to build, which would
         // crash-loop on every scheduled tick.
         preflight::check_no_schedule_for_an_all_bound_cell(&ctx.def.cell, ctx.all_bound, &k8s)?;
+        // Issue #14: same reasoning — an account for a workload this cell
+        // doesn't render. (The Server-side twin lives in `validate()`.)
+        preflight::check_builder_service_account_for_an_all_bound_cell(
+            &ctx.def.cell,
+            ctx.all_bound,
+            &k8s,
+        )?;
 
         // Reconcile workloads: the Server only when `serve:` is present
         // (issue #8 — the cell is servable, the agnostic pre-flight
@@ -87,8 +94,7 @@ impl Kubernetes {
         // Printed as `note:` on both branches. Without a Service the ClusterIP
         // line would describe an object that was never rendered.
         let notes = vec![if k8s.serves() {
-            "service is ClusterIP — reachable in-cluster only (ADR §7); no external URL"
-                .to_string()
+            "service is ClusterIP — reachable in-cluster only (ADR §7); no external URL".to_string()
         } else {
             "no `serve:` in the deploy overlay — no Deployment and no Service; this cell \
              is built, not served"

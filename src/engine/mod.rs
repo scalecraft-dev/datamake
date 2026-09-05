@@ -1873,6 +1873,12 @@ fn bind_source(
                 data_as_of,
             }
         }
+        // Unreachable in practice — `bind_sources` runs `connectors::prepare`
+        // first, which refuses this — but the match is exhaustive and the
+        // error must be the same one either way.
+        ResolvedSource::MissingConnection { connection } => {
+            return Err(crate::config::missing_connection_error(name, connection));
+        }
         ResolvedSource::Connection {
             connection,
             config,

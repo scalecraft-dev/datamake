@@ -870,6 +870,10 @@ impl ResolvedConnection {
 /// identity). Fails loud on a missing file — a deployed pod with an absent
 /// secret mount should crash with this error, not limp into an auth failure.
 pub fn prepare(sources: &IndexMap<String, ResolvedSource>, dir: &Path) -> Result<()> {
+    // Issue #14: a connection absent from the profile is deferred at resolve
+    // time (so `serve`, which never reads one, can load a connections-free
+    // profile) and refused here, the first thing any warehouse reader does.
+    crate::config::check_connections_bound(sources)?;
     let mut want: Option<(&str, String, &ResolvedConnection)> = None;
     for (name, src) in sources {
         let ResolvedSource::Connection { config, .. } = src else {

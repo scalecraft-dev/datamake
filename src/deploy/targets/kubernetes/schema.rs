@@ -30,6 +30,25 @@ pub(crate) struct KubernetesConfig {
     pub(crate) image: Option<String>,
     #[serde(default, rename = "imagePullSecret")]
     pub(crate) image_pull_secret: Option<String>,
+    /// Opt-in Kubernetes ServiceAccounts per identity (issue #14): the
+    /// Builder (init Job + CronJob — same binary, same args, one account) and
+    /// the Server (Deployment). When a name is set, the render emits the
+    /// ServiceAccount object (name/namespace/labels only — never the cloud
+    /// IAM annotation, which the operator owns) and stamps
+    /// `serviceAccountName` on that role's pods; when absent, the pods run as
+    /// the namespace default exactly as before, so a laptop/kind cluster
+    /// needs nothing here. camelCase like `imagePullSecret`: the values are
+    /// verbatim Kubernetes object names.
+    #[serde(default, rename = "serviceAccounts")]
+    pub(crate) service_accounts: ServiceAccounts,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ServiceAccounts {
+    #[serde(default)]
+    pub(crate) builder: Option<String>,
+    #[serde(default)]
+    pub(crate) server: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,7 +84,10 @@ impl KubernetesConfig {
 
     /// Mirrors `serve`'s own CLI default (`cli.rs`).
     pub(crate) fn poll_interval(&self) -> u64 {
-        self.serve.as_ref().and_then(|s| s.poll_interval).unwrap_or(15)
+        self.serve
+            .as_ref()
+            .and_then(|s| s.poll_interval)
+            .unwrap_or(15)
     }
 
     /// Whether this overlay deploys a Server at all (issue #8): `serve:` is
@@ -150,6 +172,36 @@ impl KubernetesConfig {
                 bail!(
                     "kubernetes overlay `imagePullSecret: {secret}` is not a valid Kubernetes \
                      object name (lowercase alphanumeric, '.', '-', at most 253 characters)"
+                );
+            }
+        }
+
+        for (key, name) in [
+            ("builder", &self.service_accounts.builder),
+            ("server", &self.service_accounts.server),
+        ] {
+            if let Some(name) = name {
+                if !is_dns_subdomain(name) {
+                    bail!(
+                        "kubernetes overlay `serviceAccounts.{key}: {name}` is not a valid \
+                         Kubernetes object name (lowercase alphanumeric, '.', '-', at most 253 \
+                         characters)"
+                    );
+                }
+            }
+        }
+
+        // Issue #14 × #8: an account nothing is assigned to is worse than
+        // useless — the operator binds cloud IAM to it and believes the
+        // Server is isolated. (The Builder-side mismatch, an all-bound cell,
+        // needs `all_bound` and lives in the target's pure pre-flight.)
+        if let Some(name) = &self.service_accounts.server {
+            if !self.serves() {
+                bail!(
+                    "kubernetes overlay sets `serviceAccounts.server: {name}` but has no \
+                     `serve:` block, so no Server Deployment is rendered — the account would \
+                     never be assigned to anything.\n\
+                     Add `serve:` to deploy the Server, or remove `serviceAccounts.server`."
                 );
             }
         }
@@ -254,7 +306,10 @@ imagePullSecret: regcred
     fn neither_serve_nor_schedule_is_rejected() {
         for yaml in ["target: kubernetes\n", "serve:\n", "namespace: data\n"] {
             let err = parse(yaml).validate().unwrap_err().to_string();
-            assert!(err.contains("neither `serve:` nor `schedule:`"), "{yaml:?} -> {err}");
+            assert!(
+                err.contains("neither `serve:` nor `schedule:`"),
+                "{yaml:?} -> {err}"
+            );
             assert!(err.contains("serve: {}"), "{yaml:?} -> {err}");
             assert!(err.contains("schedule:"), "{yaml:?} -> {err}");
         }
@@ -313,6 +368,66 @@ serve: {}
         };
         let err = k8s.validate().unwrap_err().to_string();
         assert!(err.contains("non-zero"), "got: {err}");
+    }
+
+    /// Issue #14: both accounts are opt-in and independently optional.
+    #[test]
+    fn service_accounts_parse_and_default_to_absent() {
+        let none = parse("serve: {}\n");
+        none.validate().unwrap();
+        assert!(none.service_accounts.builder.is_none());
+        assert!(none.service_accounts.server.is_none());
+
+        let empty_block = parse("serve: {}\nserviceAccounts: {}\n");
+        empty_block.validate().unwrap();
+        assert!(empty_block.service_accounts.server.is_none());
+
+        let both = parse(
+            "serve: {}\nschedule: \"0 * * * *\"\nserviceAccounts:\n  builder: orders-builder\n  server: orders-server\n",
+        );
+        both.validate().unwrap();
+        assert_eq!(
+            both.service_accounts.builder.as_deref(),
+            Some("orders-builder")
+        );
+        assert_eq!(
+            both.service_accounts.server.as_deref(),
+            Some("orders-server")
+        );
+
+        let builder_only = parse("schedule: \"0 * * * *\"\nserviceAccounts:\n  builder: b\n");
+        builder_only.validate().unwrap();
+    }
+
+    #[test]
+    fn bad_service_account_names_are_rejected() {
+        for bad in ["Builder", "has_underscore", &"a".repeat(254)] {
+            for key in ["builder", "server"] {
+                let k8s = parse(&format!("serve: {{}}\nserviceAccounts:\n  {key}: {bad}\n"));
+                let err = k8s.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("serviceAccounts.{key}"))
+                        && err.contains("not a valid Kubernetes object name"),
+                    "'{bad}' -> {err}"
+                );
+            }
+        }
+    }
+
+    /// Issue #14 × #8: a Server account with no Server to assign it to.
+    #[test]
+    fn server_service_account_without_serve_is_rejected() {
+        let k8s = parse("schedule: \"0 * * * *\"\nserviceAccounts:\n  server: orders-server\n");
+        let err = k8s.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("serviceAccounts.server: orders-server"),
+            "got: {err}"
+        );
+        assert!(err.contains("no `serve:` block"), "got: {err}");
+        assert!(
+            err.contains("remove `serviceAccounts.server`"),
+            "got: {err}"
+        );
     }
 
     #[test]
