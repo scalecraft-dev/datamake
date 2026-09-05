@@ -258,6 +258,9 @@ pub struct ExportDoc {
     /// supported` (the `verify` lint).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The author's intended cadence, verbatim from `cell.yaml`. A claim
+    /// with no measurement behind it (issue #11): nothing checks it, and
+    /// nothing in the document contradicts it when the data is stale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
     pub grain: Vec<String>,
@@ -617,6 +620,12 @@ impl SourceCheck {
     }
 }
 
+/// Server poll telemetry (hosted, published mode only): has the Server
+/// picked up the newest execution, and how long since it last managed to
+/// look. Despite the name it says nothing about the age of the *data* —
+/// that is `build.data_as_of` — and nothing about the author's declared
+/// `exports[].freshness`, which it neither checks nor contradicts
+/// (issue #11).
 #[derive(Debug, Clone, Serialize)]
 pub struct FreshnessBlock {
     pub serving_execution: u64,
