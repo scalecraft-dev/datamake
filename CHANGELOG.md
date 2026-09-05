@@ -6,6 +6,20 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added — `datamk mcp` (issue #32, ADR 0012 amendment 2026-09-05)
+
+The served interface as an MCP server over stdio. Three tools, whatever
+the export count — `list_exports`, `describe_export(route)`,
+`query_export(route, filters, limit, offset)` — one per REST route shape,
+plus the context document, its per-export slices, and docs pages as
+`datamk://<mount>/…` resources. Every tool is a skin over the exact
+functions the REST routes call, on the same serving state `serve` builds:
+an unknown filter fails with `serve`'s own 400 sentence, supported routes
+serve their released snapshot, `--no-data` withholds rows the same way.
+Projects mount every listed cell with routes qualified by mount. JSON-RPC
+is hand-rolled (no new dependency); no SQL tool, no sessions, no HTTP
+transport yet. See `docs/guides/mcp.md`.
+
 ### Changed — `freshness` documented as advisory (issue #11)
 
 An export's `freshness:` is the author's intended cadence and nothing

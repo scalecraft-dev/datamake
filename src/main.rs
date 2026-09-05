@@ -126,6 +126,19 @@ async fn dispatch(command: Command) -> Result<()> {
                 .await
             }
         }
+        Command::Mcp(a) => {
+            let file = match &a.file {
+                Some(f) => f.clone(),
+                None => project::discover()?,
+            };
+            if project::is_project_file(&file)? {
+                let project = project::load(&file, a.profile.as_deref())?;
+                serve::mcp::run_project(&project, a.poll_interval, a.no_data).await
+            } else {
+                let profile = a.profile.as_deref().unwrap_or("local");
+                serve::mcp::run(&file, profile, a.poll_interval, a.no_data).await
+            }
+        }
         Command::Status(a) => ops::status(&a.file, &a.profile),
         Command::Attach(a) => ops::attach(&a.file, &a.profile, a.execution, a.download),
         Command::Context(a) => context::emit(

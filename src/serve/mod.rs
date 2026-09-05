@@ -1,3 +1,4 @@
+pub(crate) mod mcp;
 mod openapi;
 
 use anyhow::{bail, Context, Result};
@@ -233,6 +234,23 @@ pub async fn run(
     no_data: bool,
     drain_timeout: u64,
 ) -> Result<()> {
+    let (state, row) = mount_single(file, profile, poll_interval, no_data)?;
+    print_banner(port, &[row], /* project */ false);
+    let app = app(state, max_concurrency);
+    bind_and_serve(app, port, drain_timeout).await
+}
+
+/// Open one cell at the root mount and stand up its serving state, poller
+/// included. Shared by `serve` (REST) and `mcp` (stdio): the two transports
+/// must serve the *same* `AppState` — one poller, one catalog, one
+/// visibility-filtered route map — so a door can never disagree with the
+/// other about what is mounted. Prints nothing: `mcp` owns stdout.
+fn mount_single(
+    file: &Path,
+    profile: &str,
+    poll_interval: u64,
+    no_data: bool,
+) -> Result<(Arc<AppState>, BannerRow)> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
     refuse_stale_discovery(&cell)?;
     let cell_name = cell.def.cell.clone();
@@ -240,17 +258,6 @@ pub async fn run(
     // every deployed URL, every Kubernetes probe path, and every `mesh emit`
     // url.
     let (state, store) = build_state(cell, no_data, file, profile, /* base_path */ "")?;
-
-    print_banner(
-        port,
-        &[BannerRow {
-            mount: "/".to_string(),
-            cell: cell_name,
-            profile: profile.to_string(),
-            no_data,
-        }],
-        /* project */ false,
-    );
 
     // Initial run-summary fetch (ADR 0012 §5): serve startup already talks to
     // the store (`engine::open` downloaded the artifact), so one more GET here
@@ -272,8 +279,13 @@ pub async fn run(
         );
     }
 
-    let app = app(state, max_concurrency);
-    bind_and_serve(app, port, drain_timeout).await
+    let row = BannerRow {
+        mount: "/".to_string(),
+        cell: cell_name,
+        profile: profile.to_string(),
+        no_data,
+    };
+    Ok((state, row))
 }
 
 /// Serve N cells from one process, each mounted at its own prefix
@@ -294,6 +306,24 @@ pub async fn run_project(
     no_data: bool,
     drain_timeout: u64,
 ) -> Result<()> {
+    let (mounted, rows) = mount_project(project, poll_interval, no_data)?;
+    print_banner(port, &rows, /* project */ true);
+    bind_and_serve(
+        project_router(mounted, max_concurrency),
+        port,
+        drain_timeout,
+    )
+    .await
+}
+
+/// Open every cell a project file lists and stand up each one's serving
+/// state at its mount, pollers included. Shared by `serve` and `mcp` for the
+/// same reason as `mount_single`. Prints nothing.
+fn mount_project(
+    project: &crate::project::Project,
+    poll_interval: u64,
+    no_data: bool,
+) -> Result<(MountedCells, Vec<BannerRow>)> {
     let n = project.cells.len();
     let budget = project_budget(n)?;
 
@@ -374,14 +404,7 @@ pub async fn run_project(
         );
     }
 
-    print_banner(port, &rows, /* project */ true);
-
-    bind_and_serve(
-        project_router(mounted, max_concurrency),
-        port,
-        drain_timeout,
-    )
-    .await
+    Ok((mounted, rows))
 }
 
 /// Assemble the project's router: `/` (outside every cell's throttle, so no
@@ -1465,21 +1488,7 @@ async fn context_export(
     let want_docs = query.include.iter().any(|s| s == "docs");
     let terms = (!query.terms.is_empty()).then(|| resolve_terms(&s, &query.terms));
     if !s.routes.contains_key(&route) {
-        let mut known: Vec<&str> = s.routes.keys().map(String::as_str).collect();
-        known.sort_unstable();
-        return (
-            StatusCode::NOT_FOUND,
-            format!(
-                "no export '{route}' — discoverable exports: {}. See GET {}/context.",
-                if known.is_empty() {
-                    "none".to_string()
-                } else {
-                    known.join(", ")
-                },
-                s.base_path
-            ),
-        )
-            .into_response();
+        return (StatusCode::NOT_FOUND, unknown_route_message(&s, &route)).into_response();
     }
     let etag = context_etag(&s, want_docs, Some(&route), terms.as_deref());
     if matches_etag(&headers, &etag) {
@@ -1503,6 +1512,23 @@ async fn context_export(
         doc.inline_docs(pages);
     }
     context_response(etag, doc)
+}
+
+/// The per-export door's 404 body: names the routes that exist, so a wrong
+/// guess is one hop from a right one. Shared with `mcp`'s `describe_export`
+/// — one vocabulary, two doors.
+fn unknown_route_message(s: &AppState, route: &str) -> String {
+    let mut known: Vec<&str> = s.routes.keys().map(String::as_str).collect();
+    known.sort_unstable();
+    format!(
+        "no export '{route}' — discoverable exports: {}. See GET {}/context.",
+        if known.is_empty() {
+            "none".to_string()
+        } else {
+            known.join(", ")
+        },
+        s.base_path
+    )
 }
 
 /// The ETag for one representation of the context document (ADR 0013 §6,
@@ -1765,14 +1791,63 @@ async fn serve_export(
     with_context_headers(&s, serve_export_inner(&s, route, params).await)
 }
 
+/// The REST mapping of `execute_export_read`: outcome -> status + body. The
+/// policy (bound check, grammar, pin, lock) lives in the shared function;
+/// this is only the HTTP skin.
 async fn serve_export_inner(
     s: &Arc<AppState>,
     route: String,
     params: HashMap<String, String>,
 ) -> Response {
-    let export = match s.routes.get(&route) {
+    match execute_export_read(s, &route, &params).await {
+        ReadOutcome::Rows { rows, .. } => (
+            [(header::CONTENT_TYPE, "application/json")],
+            format!("[{}]", rows.join(",")),
+        )
+            .into_response(),
+        ReadOutcome::NotFound(msg) | ReadOutcome::Bound(msg) => {
+            (StatusCode::NOT_FOUND, msg).into_response()
+        }
+        ReadOutcome::BadParams(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        ReadOutcome::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+/// What one read of an export produced — transport-neutral, so REST
+/// (`serve_export_inner`) and MCP (`mcp::query_export`) map the *same*
+/// outcomes to their own error vocabularies instead of re-deciding policy.
+pub(crate) enum ReadOutcome {
+    /// One JSON object per row, plus the effective page so a caller can
+    /// disclose the cap it was served under.
+    Rows {
+        rows: Vec<String>,
+        limit: usize,
+        offset: usize,
+    },
+    /// No such export (REST: 404).
+    NotFound(String),
+    /// Declared but bound — no lake table backs it (REST: 404, issue #6).
+    Bound(String),
+    /// Outside the closed query grammar (REST: 400, ADR 0012 §7).
+    BadParams(String),
+    /// The query itself failed (REST: 500).
+    Internal(String),
+}
+
+/// The one read path for an export, shared by every transport: bound check
+/// -> closed grammar -> snapshot pin -> query under the cell lock. The caller
+/// has already handled `--no-data` and authorization (both are door
+/// policies, decided before a read is attempted). Anything that reads rows
+/// goes through here — a second path would eventually forget the pin at
+/// `Contract::Supported` and serve latest where REST serves the release.
+async fn execute_export_read(
+    s: &Arc<AppState>,
+    route: &str,
+    params: &HashMap<String, String>,
+) -> ReadOutcome {
+    let export = match s.routes.get(route) {
         Some(e) => e.clone(),
-        None => return (StatusCode::NOT_FOUND, format!("no export '{route}'")).into_response(),
+        None => return ReadOutcome::NotFound(format!("no export '{route}'")),
     };
 
     // issue #6: this export exists and is declared (it's in `s.routes`), but
@@ -1781,25 +1856,21 @@ async fn serve_export_inner(
     // of this function already checked): a pre-auth 404 here, unlike the
     // cell-wide --no-data check above, would let an unauthenticated caller
     // enumerate which exports are virtual one route at a time.
-    if s.bound_routes.contains(&route) {
-        return (
-            StatusCode::NOT_FOUND,
-            crate::context::note_bound_export(&route),
-        )
-            .into_response();
+    if s.bound_routes.contains(route) {
+        return ReadOutcome::Bound(crate::context::note_bound_export(route));
     }
 
     // ADR 0012 §7: unknown or invalid query params are a 400, never silently
     // dropped — an ignored `?revenue=999` returns unfiltered rows the caller
     // will confidently read as a filtered subset.
-    let read = match validate_params(&export, &params) {
+    let read = match validate_params(&export, params) {
         Ok(r) => r,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        Err(msg) => return ReadOutcome::BadParams(msg),
     };
 
     // Supported contracts serve a pinned snapshot; experimental tracks latest.
     let snapshot = if export.contract == Contract::Supported {
-        s.published.get(&route).copied()
+        s.published.get(route).copied()
     } else {
         None
     };
@@ -1816,13 +1887,13 @@ async fn serve_export_inner(
     .await;
 
     match rows {
-        Ok(Ok(rows)) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            format!("[{}]", rows.join(",")),
-        )
-            .into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(Ok(rows)) => ReadOutcome::Rows {
+            rows,
+            limit: read.limit,
+            offset: read.offset,
+        },
+        Ok(Err(e)) => ReadOutcome::Internal(e.to_string()),
+        Err(e) => ReadOutcome::Internal(e.to_string()),
     }
 }
 
@@ -2264,7 +2335,7 @@ mod tests {
 /// socket, no port. Engine work happens on the test thread (the engine is
 /// sync); only the request dispatch needs a runtime.
 #[cfg(test)]
-mod smoke {
+pub(in crate::serve) mod smoke {
     use super::*;
 
     /// The export record for `route` in a v4 document (ADR 0015).
@@ -2290,8 +2361,8 @@ mod smoke {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    struct Scaffold {
-        dir: std::path::PathBuf,
+    pub(in crate::serve) struct Scaffold {
+        pub(in crate::serve) dir: std::path::PathBuf,
     }
 
     impl Drop for Scaffold {
@@ -2301,7 +2372,7 @@ mod smoke {
     }
 
     /// Scaffold + build the init cell once per test binary run.
-    fn built_cell() -> &'static Scaffold {
+    pub(in crate::serve) fn built_cell() -> &'static Scaffold {
         use std::sync::OnceLock;
         static CELL: OnceLock<Scaffold> = OnceLock::new();
         CELL.get_or_init(|| {
@@ -4214,14 +4285,14 @@ mod smoke {
     /// `run_project`'s router (ADR 0014): N cells nested under `/<mount>`,
     /// driven through `project_router` directly — same `oneshot`, no-socket
     /// idiom as the rest of this suite.
-    mod project_mode {
+    pub(in crate::serve) mod project_mode {
         use super::*;
 
         /// `test/integrations/orders`, copied to scratch and built fresh —
         /// a second real cell, independent of `built_cell()`'s init
         /// scaffold, so multi-cell tests never depend on committed `.cell`
         /// state.
-        fn built_orders_cell() -> &'static Scaffold {
+        pub(in crate::serve) fn built_orders_cell() -> &'static Scaffold {
             use std::sync::OnceLock;
             static CELL: OnceLock<Scaffold> = OnceLock::new();
             CELL.get_or_init(|| {
@@ -4266,7 +4337,7 @@ mod smoke {
 
         /// Open `scaffold` read-only, mutate the parsed definition, and
         /// build the mounted `(mount, state)` pair `project_router` takes.
-        fn mounted(
+        pub(in crate::serve) fn mounted(
             scaffold: &Scaffold,
             mount: &str,
             no_data: bool,

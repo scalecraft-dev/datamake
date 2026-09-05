@@ -1541,3 +1541,81 @@ fn serve_exits_zero_promptly_on_sigterm() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `datamk mcp` (issue #32): JSON-RPC over stdio against a real built cell.
+/// The property the protocol depends on — stdout carries nothing but one
+/// JSON message per line — is asserted on every byte the process writes.
+#[test]
+fn mcp_speaks_json_rpc_over_stdio_and_keeps_stdout_clean() {
+    use std::io::{BufRead, Write};
+
+    let target = std::env::temp_dir().join(format!("datamk_it_mcp_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&target);
+    let out = Command::new(bin())
+        .args(["init", "mcpcell", "-p"])
+        .arg(&target)
+        .output()
+        .expect("spawning datamk init");
+    assert!(out.status.success());
+    run_ok(&target, &["run", "-f", "cell.yaml"]);
+
+    let mut child = Command::new(bin())
+        .current_dir(&target)
+        .args(["mcp", "-f", "cell.yaml"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawning datamk mcp");
+
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_export","arguments":{"route":"orders_daily@2","filters":{"revenue":1}}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query_export","arguments":{"route":"orders_daily@2","limit":1}}}"#,
+    ];
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for r in requests {
+            writeln!(stdin, "{r}").unwrap();
+        }
+        // Dropping stdin is the client's goodbye: the server drains and exits.
+    }
+    let status = child.wait().expect("waiting for datamk mcp");
+    assert!(status.success(), "mcp exited {status}");
+
+    let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut by_id: std::collections::HashMap<u64, serde_json::Value> = Default::default();
+    for line in stdout.lines() {
+        let line = line.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("non-JSON on stdout ({e}): {line:?}"));
+        assert_eq!(v["jsonrpc"], "2.0", "{line}");
+        by_id.insert(v["id"].as_u64().expect("every reply carries its id"), v);
+    }
+    assert_eq!(
+        by_id.len(),
+        4,
+        "one reply per request, none for the notification"
+    );
+
+    assert_eq!(by_id[&1]["result"]["serverInfo"]["name"], "datamk");
+    assert_eq!(by_id[&2]["result"]["tools"].as_array().unwrap().len(), 3);
+
+    let bad = &by_id[&3]["result"];
+    assert_eq!(bad["isError"], true);
+    assert!(
+        bad["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown query parameter 'revenue'"),
+        "{bad}"
+    );
+
+    let page = &by_id[&4]["result"]["structuredContent"];
+    assert_eq!(page["row_count"], 1);
+    assert_eq!(page["truncated"], true);
+    assert_eq!(page["next"]["offset"], 1);
+    let _ = std::fs::remove_dir_all(&target);
+}

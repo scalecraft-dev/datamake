@@ -413,6 +413,10 @@ The document is designed to be an agent's first fetch. Three ways in:
 - **A fleet of cells**: emit a mesh manifest (below) so the agent can find
   *which* cell answers its question before making a single authenticated
   call.
+- **MCP**: `datamk mcp -f cell.yaml` serves the same document and the same
+  closed grammar to an MCP client over stdio, as three tools
+  (`list_exports`, `describe_export`, `query_export`) plus the document as
+  resources. See [the MCP guide](mcp.md).
 
 Note what the endpoint deliberately does **not** offer: datamk never accepts
 a query from a caller — no filter expressions, no projections, no
