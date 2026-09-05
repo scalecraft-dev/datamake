@@ -437,6 +437,8 @@ before or with the endpoint:
 - **MCP server per cell** — 40 cells would hand an agent 40 servers, which is
   the problem restated. MCP belongs to the future client-side aggregator;
   the per-cell surface stays the dumbest fetchable document that works.
+  *Amended 2026-09-05, below: the document stays the surface; `datamk mcp`
+  is a transport over it, not a second surface.*
 - **Standalone definitions product** — a catalog without verification; the
   moat is that a build stands behind the document. For pure
   design-first dictionaries with no pipeline, a YAML file in git serves that
@@ -803,3 +805,39 @@ declared nullable-grain acknowledgment in the interface, not a magic
 value — its own ADR if a consumer needs it. Also noted, not fixed here:
 `?col=` (empty) filters on the empty string and returns `200 []`, which a
 caller reaching for the NULL bucket reads as "no such rows".
+
+## Amendment (2026-09-05): `datamk mcp` — a transport, not a surface (issue #32)
+
+The "MCP server per cell" refusal above rested on two premises: that MCP
+would be a *second* surface with its own shape to keep in sync, and that
+"40 cells, 40 servers" was the only multi-cell story. ADR 0014 falsified
+the second (one process, N cells, from `datamk.yaml`). The first is
+falsified by construction: `datamk mcp` exposes exactly the REST surface —
+three route shapes, three tools — over the same `AppState` `serve` builds,
+calling the same functions (`build_context_document`, the shared export
+read path). There is no shape to drift.
+
+- **Tools:** `list_exports` ← `GET /context`; `describe_export(route)` ←
+  `GET /context/{route}?include=docs`; `query_export(route, filters,
+  limit, offset)` ← `GET /{route}?…`. Fixed count. One tool per export was
+  rejected: it copies the document into `tools/list` and makes the agent's
+  context cost scale with the export count, which is the "40 servers"
+  problem in a new coat.
+- **Resources:** `datamk://<mount>/context`, `/context/<route>`,
+  `/docs/<target>` — the document, its slices, and pages, at their existing
+  targets. §4's "no `/docs/:target` route" stands for HTTP; a resource URI
+  is not a route.
+- **Grammar:** `filters` flattens to the query-string map and goes through
+  the same validator. §7's rule — unknown params fail, never dropped —
+  holds by sharing the function, not by re-implementing it.
+- **Trust:** stdio runs as the user with the profile's grants, the same as
+  `datamk context -p`. `authorize()` is a socket guard and there is no
+  socket. `private` stays invisible; `--no-data` withholds rows.
+- **Not an aggregator:** project mode reads `datamk.yaml` (ADR 0014), never
+  the mesh manifest. §6's deferral of the client-side aggregator stands.
+
+Premises: MCP clients are where agent demand lands; the closed grammar is
+reused, not reimplemented. What would reverse it: a design partner needing
+MCP against a hosted cell they cannot run locally (then `POST /mcp` on
+`serve`, same module, inheriting bearer auth); agents demonstrably unable
+to compose `describe_export` → `query_export` in two hops.

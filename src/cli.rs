@@ -67,6 +67,11 @@ pub enum Command {
     Deploy(DeployArgs),
     /// Serve the declared interface as REST + OpenAPI (the Server workload)
     Serve(ServeArgs),
+    /// Serve the declared interface to an MCP client over stdio — the same
+    /// exports, closed query grammar, and caps as `serve`, as three tools
+    /// (list_exports, describe_export, query_export) plus the context
+    /// document as resources. No new query capability; no SQL tool.
+    Mcp(McpArgs),
     /// Show the published executions and the LATEST pointer (published-artifact profiles)
     Status(FileArgs),
     /// Print ready-to-run SQL that attaches the cell's catalog in DuckDB
@@ -412,4 +417,29 @@ pub struct ServeArgs {
     /// warning. Keep it under the orchestrator's termination grace period.
     #[arg(long, default_value_t = 10, value_name = "SECONDS")]
     pub drain_timeout: u64,
+}
+
+#[derive(Args)]
+pub struct McpArgs {
+    /// Path to the cell definition, or to a project file (top-level `datamk:`)
+    /// that mounts several cells behind one server. With no flag: datamk.yaml
+    /// in the current directory, else cell.yaml.
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
+    /// Binding profile to use (reads profiles/<name>.yaml) [default: local].
+    /// The server runs as you, with whatever this profile grants — the same
+    /// trust as `datamk context -p <profile>`. Serving a project, this
+    /// overrides the project's `profile:` and every per-cell `profile:`.
+    #[arg(short, long)]
+    pub profile: Option<String>,
+    /// Seconds between LATEST-pointer checks in published-artifact mode (see
+    /// `serve --poll-interval`). Ignored in direct-attach (local catalog) mode.
+    #[arg(long, default_value_t = 15)]
+    pub poll_interval: u64,
+    /// Expose the context document without the data: `list_exports` and
+    /// `describe_export` work, `query_export` reports that rows are not
+    /// served here and where they live (the profile's `channels:`). Serving
+    /// a project, applies to every mounted cell.
+    #[arg(long)]
+    pub no_data: bool,
 }

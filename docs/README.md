@@ -4,6 +4,7 @@
   exists. Start with [Why composable data products?](concepts/composable-data-products.md)
 - **[Guides](guides/)** — how-to:
   [the context document (agents)](guides/context.md),
+  [MCP server (`datamk mcp`)](guides/mcp.md),
   [discovered cells (SQLMesh)](guides/discover.md),
   [serving](guides/serving.md),
   [incremental loading](guides/incremental.md),

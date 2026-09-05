@@ -130,6 +130,7 @@ Connector setup and per-warehouse behavior live in the guides:
 | `datamk release` | Pin the current snapshot as the supported contract. |
 | `datamk serve` | Serve the interface as REST + OpenAPI + `/context`. |
 | `datamk context` | Emit the cell's context document — the interface made machine-readable for agents. |
+| `datamk mcp` | Serve the interface to an MCP client over stdio: three tools over the same closed grammar as `serve`. |
 | `datamk mesh emit` | Emit the static manifest that tells an agent which cells exist. |
 | `datamk deploy` | Run the cell as managed workloads on an orchestrator. |
 | `datamk attach` | Print SQL that attaches the cell's catalog in DuckDB, read-only. |
