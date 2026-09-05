@@ -377,9 +377,22 @@ fn export_schema() -> Value {
             "probe": {
                 "type": "object",
                 "description": "Swap-time measurement against the rows this route serves \
-                                (rows, coverage, values, example_request). Absent until measured.",
+                                (rows, coverage, values, null_rows, example_request). Absent \
+                                until measured.",
                 "required": ["at"],
-                "properties": { "at": { "type": "string", "format": "date-time" } }
+                "properties": {
+                    "at": { "type": "string", "format": "date-time" },
+                    "null_rows": {
+                        "type": "object",
+                        "description": "Rows with a NULL in each grain column, keyed by column, \
+                                        every grain column present (zeros included). Such rows \
+                                        are returned by an unfiltered read but unreachable by \
+                                        any grain filter: the grammar is equality-only and has \
+                                        no NULL literal. `values[col].complete` speaks only for \
+                                        the non-NULL value set. Present for exports with a grain.",
+                        "additionalProperties": { "type": "integer" }
+                    }
+                }
             },
             "check": {
                 "type": "object",
@@ -390,7 +403,17 @@ fn export_schema() -> Value {
                     "check": { "type": "string", "enum": ["grain_unique"] },
                     "grain": { "type": "array", "items": { "type": "string" } },
                     "rows": { "type": "integer" },
-                    "distinct_grain": { "type": "integer" }
+                    "distinct_grain": { "type": "integer" },
+                    "null_rows": {
+                        "type": "object",
+                        "description": "Rows with a NULL in each grain column as `verify` saw \
+                                        them, keyed by column, every grain column present \
+                                        (zeros included). Absent only when the check predates \
+                                        this measurement — never to mean zero. A NULL grain \
+                                        value never fails the check; it is reported because no \
+                                        grain filter can reach the row.",
+                        "additionalProperties": { "type": "integer" }
+                    }
                 }
             }
         }
@@ -719,6 +742,15 @@ mod tests {
         let export = &props["exports"]["items"]["properties"];
         assert!(export.get("binding").is_some());
         assert!(export.get("probe").is_some() && export.get("check").is_some());
+        // Issue #10: the NULL-grain measurement is documented on both
+        // blocks, and required on neither (a pre-measurement check record
+        // legitimately lacks it).
+        assert!(export["probe"]["properties"].get("null_rows").is_some());
+        assert!(export["check"]["properties"].get("null_rows").is_some());
+        assert!(!export["check"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("null_rows")));
         assert!(
             export.get("from").is_some(),
             "per-field provenance is documented"

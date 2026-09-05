@@ -757,3 +757,49 @@ rides `docs[].content` under `?include=docs` on the narrowed document,
 which is one shape for consumers rather than two. Reopen if a consumer
 needs the raw page without JSON.
 
+## Amendment (2026-09-05): `null_rows` — the grain rows no filter can reach (issue #10)
+
+A design partner declared a grain of `[cohort_month, utm_campaign]` with
+`utm_campaign` NULL for every organic signup. Two facts, one of them a
+misdiagnosis in the issue as filed:
+
+- A NULL grain value is unaddressable through the served grammar (§7:
+  equality filters only, no NULL literal). The row is in `rows`, in an
+  unfiltered page, and behind no filter. The probe's `values` already
+  excluded NULLs (`WHERE col IS NOT NULL`) and said `complete: true` — a
+  complete list of the values that exist, silently minus the rows that
+  have none.
+- A NULL grain value does **not** cause a uniqueness failure that
+  coalescing would fix. `SELECT DISTINCT` treats NULLs as equal, and so
+  does `coalesce(col, 'sentinel')`: both counts are unchanged. Rows sharing
+  a grain tuple with a NULL in it are duplicates like any other; the fix is
+  aggregating at the declared grain, not a sentinel.
+
+Decision: **report, don't reject.**
+
+- `exports[].check.null_rows` (additive): per grain column, the rows with a
+  NULL there as `verify` measured them, in the same pass as
+  `rows`/`distinct_grain`. Every grain column is present, zeros included —
+  a full map, so that absence on a record persisted by an older datamk
+  means "not measured" and never "zero" (the record survives upgrades:
+  `fresh_for` gates on digest and profile, not version). `check` stays
+  `"grain_unique"`; the closed vocabulary is untouched, the NULL count is
+  an operand of the same check.
+- `exports[].probe.null_rows` (additive): the same count against the rows
+  the route serves (the pinned snapshot for a `supported` route), one
+  aggregate at open and at swap. This is the served-side truth; `check`'s
+  is what `verify` saw. `values[col].complete` keeps its meaning — the
+  non-NULL value set is complete — and `null_rows` names what it omits. A
+  count, not a value, so it ships under `--no-data`.
+- `verify` warns on a unique grain with NULLs (naming the column, the count,
+  and the sentinel fix for reachability) and appends the NULL count to a
+  uniqueness failure as a fact — the replay-safety hint (ADR 0005 §2 item
+  5) stays, because NULL presence does not prove NULL causation. No new
+  failure mode.
+
+Declined: a NULL sentinel in the query grammar (`?col=NULL`). That is a
+change to the query surface (§7), and the shape that would pass is a
+declared nullable-grain acknowledgment in the interface, not a magic
+value — its own ADR if a consumer needs it. Also noted, not fixed here:
+`?col=` (empty) filters on the empty string and returns `200 []`, which a
+caller reaching for the NULL bucket reads as "no such rows".

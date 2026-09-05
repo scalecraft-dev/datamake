@@ -6,6 +6,19 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added — `null_rows` on `exports[].check` and `exports[].probe` (issue #10, ADR 0012 amendment 2026-09-05)
+
+`verify` now counts, per grain column, the rows with a NULL there, in the
+same pass as the uniqueness check; the probe measures the same against the
+rows each route serves. A NULL grain value never fails `verify` — the grain
+can still be unique — but no equality filter can reach the row, so `verify`
+warns, naming the column and the coalesce fix, and the count is published
+on both blocks in `/context` (every grain column, zeros included; absent
+only on a check record written by an older datamk). A uniqueness failure
+whose grain has NULLs now states the NULL count as a fact beside the
+existing replay-safety hint, and says plainly that a sentinel will not
+make those rows unique.
+
 ### Added — `GET /context/{route}` and `datamk context --export` (ADR 0012 amendment 2026-08-27)
 
 One export's slice of the context document: same schema, `exports[]` of

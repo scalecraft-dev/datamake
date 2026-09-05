@@ -17,6 +17,7 @@ use anyhow::Result;
 use indexmap::IndexMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use crate::config::{CellDef, ColumnSpec, Contract, Export, Source, Visibility};
 pub use crate::config::{FromMap, Origin};
@@ -466,6 +467,16 @@ pub struct ExportProbe {
     /// (shipping them would exfiltrate a projection of the withheld rows).
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub values: IndexMap<String, ColumnValues>,
+    /// Issue #10: rows with a NULL in each grain column, keyed by column,
+    /// every grain column present (zeros included) — measured against the
+    /// same rows the route serves, so this is the served-side truth where
+    /// `check.null_rows` is what `verify` saw. Such a row is returned by an
+    /// unfiltered read but is unreachable by any grain filter: the grammar
+    /// is equality-only, with no NULL literal. `values[col].complete`
+    /// speaks only for the non-NULL value set; this is the count it leaves
+    /// out. Present only for exports with a declared grain.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub null_rows: IndexMap<String, i64>,
     /// The grain-filtered sibling of `sample_request` — relative to the
     /// document's own URL for the same reason, drawn jointly from ONE real
     /// row, never composed from the per-column values independently (which
@@ -485,6 +496,7 @@ impl ExportProbe {
             rows: None,
             coverage: IndexMap::new(),
             values: IndexMap::new(),
+            null_rows: IndexMap::new(),
             example_request: None,
         }
     }
@@ -560,6 +572,13 @@ pub struct ExportCheck {
     pub grain: Vec<String>,
     pub rows: i64,
     pub distinct_grain: i64,
+    /// Issue #10: rows with a NULL in each grain column, keyed by column,
+    /// every grain column present. Omitted only when the record predates
+    /// the measurement — never to mean zero. These rows are returned by an
+    /// unfiltered read but unreachable by any grain filter (the grammar is
+    /// equality-only, with no NULL literal).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub null_rows: BTreeMap<String, i64>,
 }
 
 impl SourceCheck {
@@ -582,6 +601,7 @@ impl SourceCheck {
                             grain: m.grain.clone(),
                             rows: m.rows,
                             distinct_grain: m.distinct_grain,
+                            null_rows: m.null_rows.clone(),
                         },
                     )
                 })
@@ -3052,6 +3072,10 @@ interface:
                 grain: vec!["order_date".to_string(), "region".to_string()],
                 rows: 4,
                 distinct_grain: 4,
+                null_rows: BTreeMap::from([
+                    ("order_date".to_string(), 0),
+                    ("region".to_string(), 1),
+                ]),
             },
         );
         let doc = assemble(Facts {
@@ -3080,6 +3104,11 @@ interface:
         assert_eq!(v["exports"][0]["probe"]["rows"], 4);
         assert_eq!(v["exports"][0]["check"]["at"], "2026-08-07T09:00:00Z");
         assert_eq!(v["exports"][0]["check"]["distinct_grain"], 4);
+        // Issue #10: the full per-column map rides along, zeros included.
+        assert_eq!(
+            v["exports"][0]["check"]["null_rows"],
+            serde_json::json!({ "order_date": 0, "region": 1 })
+        );
         assert_eq!(v["source_check"]["checked_at"], "2026-08-07T09:00:00Z");
         // Neither measurement moves the digest.
         let bare = build(

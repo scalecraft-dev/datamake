@@ -116,6 +116,16 @@ A data route (`GET /<name>@<major>`) accepts exactly:
 - **`offset`** — rows to skip. Requests beyond the maximum (1,000,000) are
   rejected; filter by grain columns instead of paginating that deep.
 
+There is no NULL literal: a grain column that is NULL for some rows leaves
+those rows reachable only by an unfiltered read. `datamk verify` warns when
+it measures such rows and the count is published per column as
+`null_rows` on both the export's `check` and its `probe` in `/context`. If
+callers need to reach them, coalesce the column to a sentinel of its own
+type in the transform (`coalesce(utm_campaign, 'none')`); a sentinel is not
+a fix for a grain that is *not unique* — `DISTINCT` already treats NULLs as
+equal, so rows sharing a grain tuple with a NULL in it are duplicates like
+any other.
+
 Anything else — an unknown parameter name, a non-grain column, a
 non-integer `limit`/`offset` — is rejected with **400**, never silently
 ignored. A silently ignored filter would return unfiltered rows the caller
