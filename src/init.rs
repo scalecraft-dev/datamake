@@ -312,14 +312,17 @@ target: kubernetes              # the orchestrator (only `kubernetes` implemente
                                 # unauthenticated endpoint (cell shareable, no roles).
 
 # Target-specific topology is defined by the target's ADR — see ADR 0002 for the
-# Kubernetes schema. Sketch:
-#   namespace: data
-#   schedule: "0 * * * *"       # Builder cron — each run publishes an execution (ADR 0004)
-#   retention_days: 30          # compaction window; also the rollback horizon (ADR 0004 §10)
-#   serve:
-#     replicas: 2               # each replica holds its own catalog copy (ADR 0004)
-#     poll_interval: 15         # seconds between LATEST checks = staleness bound
-#   image: ghcr.io/scalecraft-dev/datamk   # tag defaults to the running datamk version
+# Kubernetes schema. `serve:` and `schedule:` are each presence-based: a Server
+# (`datamk serve`) deploys iff `serve:` is present, a Builder CronJob
+# (`datamk run`) iff `schedule:` is. At least one is required; a cell that only
+# exists to be composed by other cells needs no Server — omit `serve:`.
+serve:
+  replicas: 1                   # each replica holds its own catalog copy (ADR 0004)
+#   poll_interval: 15           # seconds between LATEST checks = staleness bound
+# namespace: data
+# schedule: "0 * * * *"         # Builder cron — each run publishes an execution (ADR 0004)
+# retention_days: 30            # compaction window; also the rollback horizon (ADR 0004 §10)
+# image: ghcr.io/scalecraft-dev/datamk   # tag defaults to the running datamk version
 "#;
 
 const STG_ORDERS_SQL: &str = r#"-- One language for transforms (ADR 0008): SELECT-only — no CREATE, no

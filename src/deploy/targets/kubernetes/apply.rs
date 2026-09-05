@@ -54,8 +54,18 @@ pub(crate) async fn apply_all(
     skip_init: bool,
     init_timeout_secs: u64,
 ) -> Result<Vec<AppliedObject>> {
-    let mut applied = Vec::with_capacity(5);
+    let mut applied = Vec::with_capacity(7);
 
+    // Issue #14: accounts first. The ServiceAccount admission plugin rejects
+    // a pod whose account doesn't exist, so an init Job applied before its
+    // account would never get a pod and `apply_and_wait_init` would spin to
+    // `--init-timeout` with "(no pods found for job …)".
+    for sa in [&m.builder_service_account, &m.server_service_account]
+        .into_iter()
+        .flatten()
+    {
+        applied.push(apply_one(client, namespace, "ServiceAccount", sa).await?);
+    }
     applied.push(apply_one(client, namespace, "ConfigMap", &m.configmap).await?);
     match &m.init_job {
         None => {
@@ -72,8 +82,14 @@ pub(crate) async fn apply_all(
             );
         }
     }
-    applied.push(apply_one(client, namespace, "Service", &m.service).await?);
-    applied.push(apply_one(client, namespace, "Deployment", &m.deployment).await?);
+    // Issue #8: Service + Deployment only when the overlay has `serve:` —
+    // same shape as the CronJob branch below.
+    if let Some(svc) = &m.service {
+        applied.push(apply_one(client, namespace, "Service", svc).await?);
+    }
+    if let Some(dep) = &m.deployment {
+        applied.push(apply_one(client, namespace, "Deployment", dep).await?);
+    }
     if let Some(cj) = &m.cronjob {
         applied.push(apply_one(client, namespace, "CronJob", cj).await?);
     }

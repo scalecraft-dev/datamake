@@ -13,9 +13,9 @@ use anyhow::{Context as _, Result};
 use std::path::{Path, PathBuf};
 
 pub use bindings::{
-    direct_attach, is_gcs, is_metadata_db_catalog, is_remote, is_s3, resolve, ConnectionTarget,
-    ResolvedBindings, ResolvedConnection, ResolvedGcs, ResolvedIncremental, ResolvedS3,
-    ResolvedSource, SnowflakeAuth,
+    check_connections_bound, direct_attach, is_gcs, is_metadata_db_catalog, is_remote, is_s3,
+    missing_connection_error, resolve, ConnectionTarget, ResolvedBindings, ResolvedConnection,
+    ResolvedGcs, ResolvedIncremental, ResolvedS3, ResolvedSource, SnowflakeAuth,
 };
 // Part of `SnowflakeAuth`'s public shape; constructed outside `config` only
 // by connector tests, which is what the non-test build would otherwise warn

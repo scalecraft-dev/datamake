@@ -5,9 +5,11 @@ target: kubernetes
 # reviewed acknowledgement the open-endpoint pre-flight (§8f) requires.
 allow_anonymous: true
 
-# Target-specific topology (Kubernetes schema -> ADR 0002). Sketch:
+# Target-specific topology (Kubernetes schema -> ADR 0002). `serve:` and
+# `schedule:` are each presence-based (issue #8): a Server deploys iff `serve:`
+# is present, a Builder CronJob iff `schedule:` is. At least one is required.
+serve:
+  replicas: 1
 # namespace: data
 # schedule: "0 * * * *"
-# serve:
-#   replicas: 1
 # image: ghcr.io/scalecraft-dev/datamk

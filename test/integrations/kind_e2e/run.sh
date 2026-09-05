@@ -30,6 +30,10 @@ BUCKET="${BUCKET:-datamk-e2e}"
 # The profile Secret name deploy renders/checks for is `<cell>-<profile>`
 # (render::profile_secret_name) -- the cell here is named "orders" (cell.yaml).
 PROFILE_SECRET="orders-${PROFILE}"
+# Issue #14: the Server mounts its own reduced profile Secret (no
+# `connections:`). The e2e profile has no connections at all, so the same file
+# serves both roles here; a real deploy strips the block for this one.
+SERVER_PROFILE_SECRET="orders-${PROFILE}-server"
 LOCAL_PORT="${LOCAL_PORT:-18080}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -190,6 +194,10 @@ phase_secrets() {
   # be exactly "<profile>.yaml" -- that's the file `config::load` looks for
   # once `--profile e2e` resolves inside the container.
   kubectl --context "$KCTX" -n "$NAMESPACE" create secret generic "$PROFILE_SECRET" \
+    --from-file="${PROFILE}.yaml=$CELL_DIR/profiles/${PROFILE}.yaml" \
+    --dry-run=client -o yaml | k apply -f -
+  log "secrets: creating/refreshing Secret '$SERVER_PROFILE_SECRET' (the Server's reduced profile)"
+  kubectl --context "$KCTX" -n "$NAMESPACE" create secret generic "$SERVER_PROFILE_SECRET" \
     --from-file="${PROFILE}.yaml=$CELL_DIR/profiles/${PROFILE}.yaml" \
     --dry-run=client -o yaml | k apply -f -
   log "secrets OK"

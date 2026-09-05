@@ -11,6 +11,13 @@ pub struct PreflightInput<'a> {
     pub def: &'a CellDef,
     pub bindings: &'a ResolvedBindings,
     pub supports: Workloads,
+    /// Whether this deploy renders a Server (issue #8): `supports.long_lived()
+    /// && target.serves(cfg)`, computed once in `deploy::run`. Gates
+    /// `check_servable`/`check_auth`. A target that can host a Server but
+    /// whose overlay omits it (Kubernetes without `serve:`) deploys no HTTP
+    /// surface, so refusing it for `shareable: false` or a missing
+    /// `allow_anonymous` would protect a door that doesn't exist.
+    pub serves: bool,
     pub allow_anonymous: bool,
     pub profile: &'a str,
     /// `config::builds_no_snapshot(&transforms)` — see `DeployContext::
@@ -25,13 +32,18 @@ pub struct PreflightInput<'a> {
 
 /// Validate the deploy invariants every backend shares (§7/§8) and refuse with an
 /// actionable error before anything is applied. Server-specific checks are gated
-/// on the target hosting the long-lived workload.
+/// on this deploy actually rendering the long-lived workload (`serves`, issue
+/// #8) — unchanged in strictness whenever a Server *is* rendered.
 pub fn check(i: &PreflightInput) -> Result<()> {
     check_remote_storage(i)?;
     check_no_catalog(i)?;
     check_no_all_never(i)?;
+    // Issue #14: resolve defers a missing `connections.<name>` entry so the
+    // Server can load a connections-free profile; the Builder that would
+    // read it is refused here, on the deploy host, not inside its pod.
+    crate::config::check_connections_bound(&i.bindings.sources)?;
     check_no_interactive_connections(i)?;
-    if i.supports.long_lived() {
+    if i.serves {
         check_servable(i)?;
         check_auth(i)?;
     }
@@ -237,6 +249,10 @@ mod tests {
             def,
             bindings,
             supports,
+            // Mirrors `deploy::run`: a Server is rendered iff the target can
+            // host one and the overlay asks for it; every existing test here
+            // models a serving overlay.
+            serves: supports.long_lived(),
             allow_anonymous,
             profile,
             all_bound: crate::config::builds_no_snapshot(transforms),
@@ -375,6 +391,36 @@ mod tests {
             },
         );
         check(&input(&l.def, &bindings, &l.transforms, "prod", true)).unwrap();
+    }
+
+    /// Issue #8: a Builder-only deploy (Kubernetes overlay with `schedule:`
+    /// and no `serve:`) renders no HTTP surface, so the servable/auth checks
+    /// don't apply — `shareable: false` and a missing `allow_anonymous` are
+    /// both fine. Everything else in the agnostic pre-flight still runs.
+    #[test]
+    fn builder_only_deploy_skips_the_servable_and_auth_checks() {
+        let l = loaded("prod");
+        let mut def = l.def.clone();
+        def.access.shareable = false;
+        let mut i = input(&def, &l.bindings, &l.transforms, "prod", false);
+        // Sanity: with a Server this is refused twice over.
+        assert!(check(&i).is_err());
+        i.serves = false;
+        check(&i).unwrap();
+
+        // …but a local store is still refused — `serves` only gates the
+        // Server-specific checks.
+        let local = loaded("local");
+        let mut i = input(
+            &local.def,
+            &local.bindings,
+            &local.transforms,
+            "local",
+            false,
+        );
+        i.serves = false;
+        let err = check(&i).unwrap_err().to_string();
+        assert!(err.contains("is local"), "got: {err}");
     }
 
     #[test]

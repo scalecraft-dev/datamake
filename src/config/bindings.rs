@@ -49,6 +49,41 @@ pub enum ResolvedSource {
         /// 0007 §3).
         incremental: Option<ResolvedIncremental>,
     },
+    /// A `connection` source whose named connection is absent from the
+    /// profile. Recorded rather than refused at resolve time (issue #14): the
+    /// Server's profile deliberately carries no `connections:` block (the
+    /// Builder/Server Secret split keeps warehouse coordinates out of the
+    /// HTTP pod), and `serve` never reads a connection — so the profile must
+    /// load. Every path that *would* read it (`connectors::prepare`, hence
+    /// `run`/`verify`/`interface`; and the deploy pre-flight, so a Builder is
+    /// refused before apply, not inside its pod) raises
+    /// `missing_connection_error` — the same message resolve used to bail
+    /// with, moved from load time to use time.
+    MissingConnection {
+        connection: String,
+    },
+}
+
+/// The error a `MissingConnection` source raises the moment anything needs
+/// its connection. One function so the wording can't drift between the
+/// engine and the deploy pre-flight.
+pub fn missing_connection_error(source: &str, connection: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "source '{source}' uses connection '{connection}', but the profile has no \
+         `connections.{connection}` entry"
+    )
+}
+
+/// Refuse the first `MissingConnection` source, with `missing_connection_error`.
+/// Called by every consumer that is about to read a warehouse (`connectors::
+/// prepare`) and by the deploy pre-flight; never by `serve`.
+pub fn check_connections_bound(sources: &IndexMap<String, ResolvedSource>) -> Result<()> {
+    for (name, src) in sources {
+        if let ResolvedSource::MissingConnection { connection } = src {
+            return Err(missing_connection_error(name, connection));
+        }
+    }
+    Ok(())
 }
 
 /// What a `connection` source reads (ADR 0007): a warehouse table path,
@@ -151,7 +186,7 @@ impl ResolvedSource {
         match self {
             ResolvedSource::Raw(uri) => Some(uri),
             ResolvedSource::Cell { storage, .. } => Some(storage),
-            ResolvedSource::Connection { .. } => None,
+            ResolvedSource::Connection { .. } | ResolvedSource::MissingConnection { .. } => None,
         }
     }
 }
@@ -276,12 +311,16 @@ pub fn resolve(def: &CellDef, b: &Bindings) -> Result<ResolvedBindings> {
                 query,
                 incremental,
             } => {
-                let conn = b.connections.get(connection).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "source '{name}' uses connection '{connection}', but the profile has no \
-                         `connections.{connection}` entry"
-                    )
-                })?;
+                // Deferred, not refused — see `ResolvedSource::MissingConnection`.
+                let Some(conn) = b.connections.get(connection) else {
+                    sources.insert(
+                        name.clone(),
+                        ResolvedSource::MissingConnection {
+                            connection: connection.clone(),
+                        },
+                    );
+                    continue;
+                };
                 let resolved_conn = resolve_connection(connection, conn)?;
                 // ADR 0007 §3: the shipped watermark mechanics append
                 // `WHERE cursor > <literal>` to an engine-generated
@@ -863,8 +902,12 @@ mod tests {
         }
     }
 
+    /// Issue #14: a missing connection is *deferred* at resolve time (the
+    /// Server loads a connections-free profile) and refused, with the same
+    /// message resolve used to produce, by `check_connections_bound` — the
+    /// gate every warehouse reader passes through.
     #[test]
-    fn resolve_errors_when_connection_is_missing() {
+    fn resolve_defers_a_missing_connection_and_check_refuses_it() {
         let def = cell_with_source(
             "crm_accounts",
             Source::Connection {
@@ -884,9 +927,21 @@ mod tests {
             cells: IndexMap::new(),
             connections: IndexMap::new(),
         };
-        let err = resolve(&def, &b).unwrap_err().to_string();
+        let resolved = resolve(&def, &b).unwrap();
+        assert!(matches!(
+            resolved.sources.get("crm_accounts"),
+            Some(ResolvedSource::MissingConnection { connection }) if connection == "crm"
+        ));
+        assert!(resolved.sources["crm_accounts"].location().is_none());
+        let err = check_connections_bound(&resolved.sources)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("connections.crm"), "unexpected error: {err}");
         assert!(err.contains("crm_accounts"), "unexpected error: {err}");
+        assert!(
+            err.contains("the profile has no"),
+            "unexpected error: {err}"
+        );
     }
 
     fn bindings_with_crm_connection() -> Bindings {

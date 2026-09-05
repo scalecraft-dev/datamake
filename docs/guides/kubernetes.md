@@ -3,9 +3,14 @@
 `datamk deploy` runs a cell's two workloads on a Kubernetes cluster:
 
 - the **Builder** — a CronJob running `datamk run`, rebuilding snapshots on
-  `schedule` (omit `schedule` for serve-only, no CronJob), and
+  `schedule` (omit `schedule` ⇒ no CronJob), and
 - the **Server** — a Deployment (+ ClusterIP Service) running `datamk serve`,
-  exposing the interface as REST + OpenAPI.
+  exposing the interface as REST + OpenAPI (omit `serve` ⇒ no Server).
+
+Each is deployed iff its block is present in the overlay; at least one is
+required. A cell that only exists to be composed by other cells needs no
+Server — downstream cells build against its published artifact, never its
+HTTP endpoint — so omit `serve:` and it runs as a Builder only.
 
 `deploy` runs on your machine and talks to the cluster through your kubeconfig
 (or in-cluster config). It applies to the **namespace named in the deploy
@@ -51,12 +56,15 @@ s3:
 # deploy/prod.yaml — how/where the workloads run. Tracked, PR-reviewed, secret-free.
 target: kubernetes
 namespace: data-prod
-schedule: "0 * * * *"        # Builder cron; omit ⇒ serve-only, no CronJob
-serve:
+schedule: "0 * * * *"        # Builder cron; omit ⇒ no CronJob
+serve:                       # omit ⇒ no Server (no Deployment, no Service); `serve: {}` ⇒ defaults
   port: 8080
-  replicas: 1                # >1 requires a postgres:// catalog (enforced)
+  replicas: 1                # each replica holds its own catalog copy
 image: registry/you/datamk:tag   # omit ⇒ this binary's version tag
 # imagePullSecret: regcred       # a k8s Secret *name*; only for private registries
+# serviceAccounts:               # opt-in, one identity per role (see "Identities")
+#   builder: mycell-builder      #   init Job + CronJob run as this account
+#   server: mycell-server        #   the Deployment runs as this account
 # allow_anonymous: true          # top-level; required to deploy a shareable cell
                                  # with empty access.roles (a deliberately open endpoint)
 ```
@@ -69,10 +77,18 @@ composes with External Secrets / Vault / sealed-secrets). Create them in the
 target namespace before deploying:
 
 ```bash
-# The profile — name must be <cell>-<profile>, key must be <profile>.yaml.
-# Mounted read-only at /cell/profiles/<profile>.yaml in every pod.
+# The Builder's profile — name must be <cell>-<profile>, key must be <profile>.yaml.
+# The full profile: storage creds + `connections:`. Mounted read-only at
+# /cell/profiles/<profile>.yaml in the init Job and CronJob pods only.
 kubectl -n data-prod create secret generic mycell-prod \
   --from-file=prod.yaml=profiles/prod.yaml
+
+# The Server's profile — name must be <cell>-<profile>-server, same key. A copy
+# of the profile WITHOUT the `connections:` block (the Server never reads a
+# warehouse; pre-flight refuses this Secret if it carries one). Mounted at the
+# same path in the Deployment's pods only. Only needed when the overlay has `serve:`.
+kubectl -n data-prod create secret generic mycell-prod-server \
+  --from-file=prod.yaml=profiles/prod-server.yaml
 
 # Only when cell.yaml sets access.roles — name <cell>-principals, key principals.json.
 # Mounted at /etc/datamk/principals.json; the profile's `principals:` must equal
@@ -80,6 +96,24 @@ kubectl -n data-prod create secret generic mycell-prod \
 kubectl -n data-prod create secret generic mycell-principals \
   --from-file=principals.json=principals.json
 ```
+
+## Identities: Builder and Server
+
+The three pods are two identities. The **Builder** (init Job + CronJob) reads
+the warehouse and writes the object store; the **Server** (Deployment) reads
+the object store and serves HTTP. `deploy` keeps them apart in two ways:
+
+- **Profile Secrets are split** (always). Builder pods mount `<cell>-<profile>`;
+  the Server mounts `<cell>-<profile>-server`, which must not carry
+  `connections:`. No warehouse host, database, or user reaches the HTTP pod.
+  Principals are mounted into the Server only — `serve` is their only reader.
+- **Service accounts are opt-in.** Set `serviceAccounts: {builder, server}` in
+  the overlay and `deploy` renders a ServiceAccount per name (applied before
+  any pod) and sets `serviceAccountName` on that role's pods. Under Workload
+  Identity, bind your cloud IAM to each account yourself — `deploy` emits the
+  account with name, namespace, and labels only, never the IAM annotation, so
+  a re-deploy can't clobber your binding. Leave the block out and every pod
+  runs as the namespace default, as on a laptop or `kind` cluster.
 
 ## Deploy
 
@@ -94,14 +128,15 @@ datamk deploy -f cell.yaml -p prod
 A real apply is server-side apply (declarative, idempotent — re-running `deploy`
 reconciles), in this order:
 
-1. **ConfigMap** — the cell's content (`cell.yaml`, `sql/*`, the release pin),
+1. **ServiceAccounts** (only those named in `serviceAccounts:`), then the
+   **ConfigMap** — the cell's content (`cell.yaml`, `sql/*`, the release pin),
    content-hash-named and immutable; a content change rolls the Server.
 2. **Init Job** — a one-shot `datamk run`, **waited to completion**. This
    initializes the DuckLake catalog and builds the first snapshot before the
    Server starts, so `serve`'s read-only attach never races an uninitialized
    catalog. A broken transform or unreachable catalog/store fails the deploy
    here, loudly, **with the build pod's logs**.
-3. **Service, Deployment, CronJob.**
+3. **Service, Deployment** (only with `serve:`), **CronJob** (only with `schedule:`).
 
 Exit 0 means every object was applied and the init build completed. Flags:
 `--skip-init` (you drive the Builder yourself), `--init-timeout <secs>`
@@ -109,7 +144,7 @@ Exit 0 means every object was applied and the init build completed. Flags:
 
 ## Reaching the Server
 
-The Service is **ClusterIP only** — deploy never provisions a LoadBalancer or
+(Only when the overlay has `serve:`.) The Service is **ClusterIP only** — deploy never provisions a LoadBalancer or
 Ingress, least of all for a possibly-anonymous endpoint. From your machine:
 
 ```bash
@@ -128,13 +163,25 @@ fresh data on experimental routes. Supported routes serve their pinned snapshot
 ## What pre-flight refuses (before anything is applied)
 
 - Local storage or a non-metadata-DB catalog; `replicas > 1` without `postgres://`.
-- `shareable: false` (the Server would deny everything) or an empty `interface:`.
+- An overlay with neither `serve:` nor `schedule:` — nothing would run after the
+  first build. An all-bound cell (every export bound, nothing to build) without
+  `serve:` — the Server is the only workload it has.
+- When `serve:` is present: `shareable: false` (the Server would deny everything)
+  or an empty `interface:`. Skipped for a Builder-only deploy — there is no
+  endpoint to protect.
 - `access.roles` set but: no `principals:` in the profile, the path doesn't equal
   the in-cluster mount, the `<cell>-principals` Secret is missing, or its JSON
   doesn't parse (validated with the same parser `serve` uses at startup).
-- A shareable cell with empty `roles` and no `allow_anonymous: true` — an open
-  endpoint must be a recorded, deliberate decision.
-- A referenced `imagePullSecret` or profile Secret that doesn't exist.
+- When `serve:` is present: a shareable cell with empty `roles` and no
+  `allow_anonymous: true` — an open endpoint must be a recorded, deliberate decision.
+- A referenced `imagePullSecret` or profile Secret that doesn't exist: the
+  Builder's `<cell>-<profile>` when a Builder is rendered, the Server's
+  `<cell>-<profile>-server` when `serve:` is present — or a Server Secret that
+  carries a `connections:` block.
+- `serviceAccounts.server` without `serve:`, or `serviceAccounts.builder` on an
+  all-bound cell — an account nothing would run as.
+- A `connection` source whose connection is missing from the profile — the
+  Builder would fail inside its pod.
 
 ## A complete working example
 

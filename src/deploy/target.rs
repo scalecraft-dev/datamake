@@ -171,6 +171,14 @@ pub trait DeployTarget {
     /// Which of the cell's workloads this target can host.
     fn supports(&self) -> Workloads;
 
+    /// Whether *this* deploy actually renders the long-lived Server (issue
+    /// #8). `supports()` is the target's capability; this is the overlay's
+    /// choice — on Kubernetes, whether `serve:` is present. The agnostic
+    /// pre-flight runs the Server-only checks (servable, auth) only when
+    /// both hold: a compose-only cell deployed as Builder-only has no HTTP
+    /// surface for those checks to protect.
+    fn serves(&self, cfg: &DeployConfig) -> Result<bool>;
+
     /// Render + (unless `ctx.dry_run`) apply whatever runs the cell here.
     ///
     /// Returns a boxed future rather than a plain `Result` because a real apply
