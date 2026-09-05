@@ -20,8 +20,12 @@ pub(crate) struct KubernetesConfig {
     /// `--retention-days` on the init Job and CronJob. 0 disables compaction.
     #[serde(default)]
     pub(crate) retention_days: Option<u64>,
+    /// Server topology. Presence-based (issue #8, ADR 0002 §1 amendment):
+    /// absent ⇒ no Deployment and no Service — a cell that exists only to be
+    /// composed has no HTTP consumer. `serve: {}` deploys a Server with every
+    /// default; a bare `serve:` (YAML null) is *absent*, not empty.
     #[serde(default)]
-    pub(crate) serve: ServeTopology,
+    pub(crate) serve: Option<ServeTopology>,
     #[serde(default)]
     pub(crate) image: Option<String>,
     #[serde(default, rename = "imagePullSecret")]
@@ -52,16 +56,24 @@ impl KubernetesConfig {
     /// CLI default (`cli.rs`) is 8080; mirrored here so an omitted overlay still
     /// renders a coherent Service + Deployment + probe port.
     pub(crate) fn port(&self) -> u16 {
-        self.serve.port.unwrap_or(8080)
+        self.serve.as_ref().and_then(|s| s.port).unwrap_or(8080)
     }
 
     pub(crate) fn replicas(&self) -> u32 {
-        self.serve.replicas.unwrap_or(1)
+        self.serve.as_ref().and_then(|s| s.replicas).unwrap_or(1)
     }
 
     /// Mirrors `serve`'s own CLI default (`cli.rs`).
     pub(crate) fn poll_interval(&self) -> u64 {
-        self.serve.poll_interval.unwrap_or(15)
+        self.serve.as_ref().and_then(|s| s.poll_interval).unwrap_or(15)
+    }
+
+    /// Whether this overlay deploys a Server at all (issue #8): `serve:` is
+    /// present. Read by the target-agnostic pre-flight (via
+    /// `DeployTarget::serves`) to gate the Server-only checks, and by
+    /// `manifests()` to decide whether a Service + Deployment render.
+    pub(crate) fn serves(&self) -> bool {
+        self.serve.is_some()
     }
 
     /// Mirrors `run`'s own CLI default (`cli.rs`).
@@ -110,12 +122,27 @@ impl KubernetesConfig {
             }
         }
 
-        if self.serve.port == Some(0) {
-            bail!("kubernetes overlay `serve.port` must be non-zero");
+        if let Some(serve) = &self.serve {
+            if serve.port == Some(0) {
+                bail!("kubernetes overlay `serve.port` must be non-zero");
+            }
+
+            if serve.poll_interval == Some(0) {
+                bail!("kubernetes overlay `serve.poll_interval` must be non-zero (seconds)");
+            }
         }
 
-        if self.serve.poll_interval == Some(0) {
-            bail!("kubernetes overlay `serve.poll_interval` must be non-zero (seconds)");
+        // Issue #8: with neither block the render would be a ConfigMap and a
+        // one-shot init Job — nothing runs after the first build, which is
+        // never what anyone meant. `serve: {}` is named explicitly because a
+        // bare `serve:` parses as YAML null, i.e. absent.
+        if self.serve.is_none() && self.schedule.is_none() {
+            bail!(
+                "kubernetes overlay defines neither `serve:` nor `schedule:` — that renders only \
+                 a ConfigMap and a one-shot init Job, so nothing runs after the first build.\n\
+                 Add `serve: {{}}` to deploy the Server (`datamk serve`), or \
+                 `schedule: \"0 * * * *\"` to deploy the Builder CronJob (`datamk run`), or both."
+            );
         }
 
         if let Some(secret) = &self.image_pull_secret {
@@ -183,16 +210,54 @@ imagePullSecret: regcred
     }
 
     #[test]
-    fn defaults_apply_when_the_overlay_omits_everything() {
-        let k8s = parse("target: kubernetes\n");
+    fn defaults_apply_when_the_overlay_omits_everything_but_serve() {
+        let k8s = parse("target: kubernetes\nserve: {}\n");
         k8s.validate().unwrap();
+        assert!(k8s.serves());
         assert_eq!(k8s.namespace(), "default");
         assert_eq!(k8s.port(), 8080);
         assert_eq!(k8s.replicas(), 1);
+        assert_eq!(k8s.poll_interval(), 15);
         // Image tags mirror the git tag: v-prefixed semver.
         assert!(k8s
             .image_ref()
             .starts_with("ghcr.io/scalecraft-dev/datamk:v"));
+    }
+
+    /// Issue #8: `serve:` is presence-based, mirroring `schedule:`.
+    #[test]
+    fn serve_alone_and_schedule_alone_are_both_valid() {
+        let serve_only = parse("serve:\n  replicas: 2\n");
+        serve_only.validate().unwrap();
+        assert!(serve_only.serves());
+        assert!(serve_only.schedule.is_none());
+
+        let schedule_only = parse("schedule: \"0 * * * *\"\n");
+        schedule_only.validate().unwrap();
+        assert!(!schedule_only.serves());
+        // Accessors still answer with defaults — nothing reads them without
+        // a Server, but they must not panic.
+        assert_eq!(schedule_only.port(), 8080);
+    }
+
+    /// Issue #8: a bare `serve:` is YAML null ⇒ absent, NOT an empty block.
+    /// Pinned so nobody "fixes" the footgun by treating null as `{}`; the
+    /// validate message names `serve: {}` for exactly this reason.
+    #[test]
+    fn bare_serve_key_is_absent_not_empty() {
+        let k8s = parse("serve:\nschedule: \"0 * * * *\"\n");
+        assert!(!k8s.serves());
+        k8s.validate().unwrap();
+    }
+
+    #[test]
+    fn neither_serve_nor_schedule_is_rejected() {
+        for yaml in ["target: kubernetes\n", "serve:\n", "namespace: data\n"] {
+            let err = parse(yaml).validate().unwrap_err().to_string();
+            assert!(err.contains("neither `serve:` nor `schedule:`"), "{yaml:?} -> {err}");
+            assert!(err.contains("serve: {}"), "{yaml:?} -> {err}");
+            assert!(err.contains("schedule:"), "{yaml:?} -> {err}");
+        }
     }
 
     #[test]
@@ -204,6 +269,7 @@ imagePullSecret: regcred
 target: kubernetes
 allow_anonymous: true
 namespace: data-prod
+serve: {}
 "#,
         );
         k8s.validate().unwrap();
@@ -215,6 +281,7 @@ namespace: data-prod
         for bad in ["Data-Prod", "-data", "data-", "", "UPPER", "has_underscore"] {
             let k8s = KubernetesConfig {
                 namespace: Some(bad.to_string()),
+                serve: Some(ServeTopology::default()),
                 ..Default::default()
             };
             let err = k8s.validate().unwrap_err().to_string();
@@ -237,11 +304,11 @@ namespace: data-prod
     #[test]
     fn port_zero_is_rejected() {
         let k8s = KubernetesConfig {
-            serve: ServeTopology {
+            serve: Some(ServeTopology {
                 port: Some(0),
                 replicas: None,
                 poll_interval: None,
-            },
+            }),
             ..Default::default()
         };
         let err = k8s.validate().unwrap_err().to_string();
@@ -253,6 +320,7 @@ namespace: data-prod
         for bad in ["Reg-Cred", "reg_cred", &"a".repeat(254)] {
             let k8s = KubernetesConfig {
                 image_pull_secret: Some(bad.to_string()),
+                serve: Some(ServeTopology::default()),
                 ..Default::default()
             };
             let err = k8s.validate().unwrap_err().to_string();

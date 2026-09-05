@@ -50,10 +50,15 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
     // recomputing it (and risking drift on what "all-bound" means).
     let all_bound = crate::config::builds_no_snapshot(&loaded.transforms);
 
+    // Issue #8: the Server-only checks key on "this deploy renders a
+    // Server", not "this target could host one".
+    let serves = target.supports().long_lived() && target.serves(&cfg)?;
+
     preflight::check(&PreflightInput {
         def: &loaded.def,
         bindings: &loaded.bindings,
         supports: target.supports(),
+        serves,
         allow_anonymous: cfg.allow_anonymous,
         profile: &args.profile,
         all_bound,

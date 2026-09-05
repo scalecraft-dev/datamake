@@ -3,9 +3,14 @@
 `datamk deploy` runs a cell's two workloads on a Kubernetes cluster:
 
 - the **Builder** — a CronJob running `datamk run`, rebuilding snapshots on
-  `schedule` (omit `schedule` for serve-only, no CronJob), and
+  `schedule` (omit `schedule` ⇒ no CronJob), and
 - the **Server** — a Deployment (+ ClusterIP Service) running `datamk serve`,
-  exposing the interface as REST + OpenAPI.
+  exposing the interface as REST + OpenAPI (omit `serve` ⇒ no Server).
+
+Each is deployed iff its block is present in the overlay; at least one is
+required. A cell that only exists to be composed by other cells needs no
+Server — downstream cells build against its published artifact, never its
+HTTP endpoint — so omit `serve:` and it runs as a Builder only.
 
 `deploy` runs on your machine and talks to the cluster through your kubeconfig
 (or in-cluster config). It applies to the **namespace named in the deploy
@@ -51,10 +56,10 @@ s3:
 # deploy/prod.yaml — how/where the workloads run. Tracked, PR-reviewed, secret-free.
 target: kubernetes
 namespace: data-prod
-schedule: "0 * * * *"        # Builder cron; omit ⇒ serve-only, no CronJob
-serve:
+schedule: "0 * * * *"        # Builder cron; omit ⇒ no CronJob
+serve:                       # omit ⇒ no Server (no Deployment, no Service); `serve: {}` ⇒ defaults
   port: 8080
-  replicas: 1                # >1 requires a postgres:// catalog (enforced)
+  replicas: 1                # each replica holds its own catalog copy
 image: registry/you/datamk:tag   # omit ⇒ this binary's version tag
 # imagePullSecret: regcred       # a k8s Secret *name*; only for private registries
 # allow_anonymous: true          # top-level; required to deploy a shareable cell
@@ -101,7 +106,7 @@ reconciles), in this order:
    Server starts, so `serve`'s read-only attach never races an uninitialized
    catalog. A broken transform or unreachable catalog/store fails the deploy
    here, loudly, **with the build pod's logs**.
-3. **Service, Deployment, CronJob.**
+3. **Service, Deployment** (only with `serve:`), **CronJob** (only with `schedule:`).
 
 Exit 0 means every object was applied and the init build completed. Flags:
 `--skip-init` (you drive the Builder yourself), `--init-timeout <secs>`
@@ -109,7 +114,7 @@ Exit 0 means every object was applied and the init build completed. Flags:
 
 ## Reaching the Server
 
-The Service is **ClusterIP only** — deploy never provisions a LoadBalancer or
+(Only when the overlay has `serve:`.) The Service is **ClusterIP only** — deploy never provisions a LoadBalancer or
 Ingress, least of all for a possibly-anonymous endpoint. From your machine:
 
 ```bash
@@ -128,12 +133,17 @@ fresh data on experimental routes. Supported routes serve their pinned snapshot
 ## What pre-flight refuses (before anything is applied)
 
 - Local storage or a non-metadata-DB catalog; `replicas > 1` without `postgres://`.
-- `shareable: false` (the Server would deny everything) or an empty `interface:`.
+- An overlay with neither `serve:` nor `schedule:` — nothing would run after the
+  first build. An all-bound cell (every export bound, nothing to build) without
+  `serve:` — the Server is the only workload it has.
+- When `serve:` is present: `shareable: false` (the Server would deny everything)
+  or an empty `interface:`. Skipped for a Builder-only deploy — there is no
+  endpoint to protect.
 - `access.roles` set but: no `principals:` in the profile, the path doesn't equal
   the in-cluster mount, the `<cell>-principals` Secret is missing, or its JSON
   doesn't parse (validated with the same parser `serve` uses at startup).
-- A shareable cell with empty `roles` and no `allow_anonymous: true` — an open
-  endpoint must be a recorded, deliberate decision.
+- When `serve:` is present: a shareable cell with empty `roles` and no
+  `allow_anonymous: true` — an open endpoint must be a recorded, deliberate decision.
 - A referenced `imagePullSecret` or profile Secret that doesn't exist.
 
 ## A complete working example

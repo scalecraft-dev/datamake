@@ -72,8 +72,14 @@ pub(crate) async fn apply_all(
             );
         }
     }
-    applied.push(apply_one(client, namespace, "Service", &m.service).await?);
-    applied.push(apply_one(client, namespace, "Deployment", &m.deployment).await?);
+    // Issue #8: Service + Deployment only when the overlay has `serve:` —
+    // same shape as the CronJob branch below.
+    if let Some(svc) = &m.service {
+        applied.push(apply_one(client, namespace, "Service", svc).await?);
+    }
+    if let Some(dep) = &m.deployment {
+        applied.push(apply_one(client, namespace, "Deployment", dep).await?);
+    }
     if let Some(cj) = &m.cronjob {
         applied.push(apply_one(client, namespace, "CronJob", cj).await?);
     }

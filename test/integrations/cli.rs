@@ -119,7 +119,7 @@ fn all_bound_fixture(tag: &str) -> PathBuf {
     .unwrap();
     std::fs::write(
         dir.join("deploy/prod.yaml"),
-        "target: kubernetes\nallow_anonymous: true\n",
+        "target: kubernetes\nallow_anonymous: true\nserve: {}\n",
     )
     .unwrap();
     dir
@@ -562,6 +562,66 @@ fn deploy_dry_run_renders_no_init_job_for_an_all_bound_cell() {
         "an all-bound cell has nothing to build — no init Job may be \
          rendered, or a real apply would crash-loop it: stdout: {stdout}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #8: an overlay with `schedule:` and no `serve:` deploys the Builder
+/// only — no Service, no Deployment — through the real CLI/preflight/render
+/// path. The fixture is made `shareable: false` too, so this also pins that
+/// the agnostic Server-only pre-flight (servable/auth) is skipped when no
+/// Server is rendered: a compose-only cell has no HTTP surface to protect.
+#[test]
+fn deploy_dry_run_without_serve_renders_no_server_and_skips_server_preflight() {
+    let dir = fixture("orders", "deploynoserve");
+    std::fs::write(
+        dir.join("deploy/prod.yaml"),
+        "target: kubernetes\nschedule: \"0 * * * *\"\n",
+    )
+    .unwrap();
+    let cell = std::fs::read_to_string(dir.join("cell.yaml")).unwrap();
+    assert!(cell.contains("shareable: true"), "fixture drift: {cell}");
+    std::fs::write(
+        dir.join("cell.yaml"),
+        cell.replace("shareable: true", "shareable: false"),
+    )
+    .unwrap();
+
+    let out = run(
+        &dir,
+        &["deploy", "-f", "cell.yaml", "-p", "prod", "--dry-run"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("preflight  ok"), "stderr: {stderr}");
+    assert!(stderr.contains("builder  "), "stderr: {stderr}");
+    assert!(!stderr.contains("server   "), "stderr: {stderr}");
+    assert!(stderr.contains("this cell is built, not served"), "stderr: {stderr}");
+    assert!(stdout.contains("kind: ConfigMap"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: Job"), "stdout: {stdout}");
+    assert!(stdout.contains("kind: CronJob"), "stdout: {stdout}");
+    assert!(!stdout.contains("kind: Deployment"), "stdout: {stdout}");
+    assert!(!stdout.contains("kind: Service"), "stdout: {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #8: neither `serve:` nor `schedule:` is refused with the fix named.
+#[test]
+fn deploy_refuses_an_overlay_with_neither_serve_nor_schedule() {
+    let dir = fixture("orders", "deployneither");
+    std::fs::write(
+        dir.join("deploy/prod.yaml"),
+        "target: kubernetes\nallow_anonymous: true\n",
+    )
+    .unwrap();
+    let out = run(
+        &dir,
+        &["deploy", "-f", "cell.yaml", "-p", "prod", "--dry-run"],
+    );
+    assert!(!out.status.success(), "must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("neither `serve:` nor `schedule:`"), "stderr: {stderr}");
+    assert!(stderr.contains("serve: {}"), "stderr: {stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -94,14 +94,19 @@ pub(crate) struct Manifests {
     /// deploy — same `Option` idiom as `cronjob` below, for the same "this
     /// workload does not apply to this cell" reason.
     pub(crate) init_job: Option<Job>,
-    pub(crate) service: Service,
-    pub(crate) deployment: Deployment,
+    /// `None` when the overlay has no `serve:` block (issue #8): a cell that
+    /// exists only to be composed has no HTTP consumer, so no Service and no
+    /// Deployment — presence-based, exactly like `schedule:` ⇒ `cronjob`.
+    pub(crate) service: Option<Service>,
+    pub(crate) deployment: Option<Deployment>,
     pub(crate) cronjob: Option<CronJob>,
 }
 
-/// Build every manifest this cell's topology needs: ConfigMap, init Job,
-/// Service, Deployment always; CronJob only when `schedule` is set (ADR 0002
-/// §1).
+/// Build every manifest this cell's topology needs: ConfigMap always; init
+/// Job unless the cell is all-bound; Service + Deployment only when `serve:`
+/// is present; CronJob only when `schedule:` is set (ADR 0002 §1, amended by
+/// issue #8). `KubernetesConfig::validate` has already refused the
+/// neither-`serve`-nor-`schedule` overlay.
 ///
 /// The **profile never appears here** — it's delivered as a Secret volume
 /// referenced by name (`profile_secret_name`), never embedded. Only the
@@ -111,14 +116,14 @@ pub(crate) fn manifests(input: &RenderInput) -> Result<Manifests> {
     Ok(Manifests {
         configmap: render_configmap(input)?,
         init_job: render_init_job(input),
-        service: render_service(input),
-        deployment: render_deployment(input),
+        service: input.k8s.serves().then(|| render_service(input)),
+        deployment: input.k8s.serves().then(|| render_deployment(input)),
         cronjob: render_cronjob(input),
     })
 }
 
 impl Manifests {
-    /// Serialize to the same `ConfigMap, Job, Service, Deployment, CronJob?`
+    /// Serialize to the same `ConfigMap, Job?, Service?, Deployment?, CronJob?`
     /// order `--dry-run` has always printed in — dependency order (ADR 0002
     /// step 3: the ConfigMap must exist before anything mounts it, and the
     /// init Job must run and complete before the Server is ever applied), and
@@ -134,16 +139,12 @@ impl Manifests {
         if let Some(job) = &self.init_job {
             docs.push(rendered_doc("Job", &job.metadata, job)?);
         }
-        docs.push(rendered_doc(
-            "Service",
-            &self.service.metadata,
-            &self.service,
-        )?);
-        docs.push(rendered_doc(
-            "Deployment",
-            &self.deployment.metadata,
-            &self.deployment,
-        )?);
+        if let Some(svc) = &self.service {
+            docs.push(rendered_doc("Service", &svc.metadata, svc)?);
+        }
+        if let Some(dep) = &self.deployment {
+            docs.push(rendered_doc("Deployment", &dep.metadata, dep)?);
+        }
         if let Some(cj) = &self.cronjob {
             docs.push(rendered_doc("CronJob", &cj.metadata, cj)?);
         }
@@ -724,6 +725,13 @@ mod tests {
         CellArtifact::collect(dir, "cell.yaml", &def).unwrap()
     }
 
+    /// The minimal *serving* overlay (issue #8: `serve:` is presence-based,
+    /// so `KubernetesConfig::default()` renders no Service/Deployment).
+    /// Tests that exercise `manifests()`/`docs()` and expect a Server use this.
+    fn serving() -> KubernetesConfig {
+        serde_yaml::from_str("serve: {}").unwrap()
+    }
+
     fn input<'a>(k8s: &'a KubernetesConfig, artifact: &'a CellArtifact) -> RenderInput<'a> {
         RenderInput {
             cell: "orders",
@@ -1278,18 +1286,38 @@ mod tests {
     #[test]
     fn render_all_includes_cronjob_only_when_scheduled() {
         let art = orders_artifact();
-        let no_schedule = KubernetesConfig::default();
+        let no_schedule = serving();
         let docs = render_all(&input(&no_schedule, &art)).unwrap();
         let kinds: Vec<_> = docs.iter().map(|d| d.kind.as_str()).collect();
         assert_eq!(kinds, vec!["ConfigMap", "Job", "Service", "Deployment"]);
 
-        let scheduled: KubernetesConfig = serde_yaml::from_str("schedule: \"0 * * * *\"").unwrap();
+        let scheduled: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"\nserve: {}").unwrap();
         let docs = render_all(&input(&scheduled, &art)).unwrap();
         let kinds: Vec<_> = docs.iter().map(|d| d.kind.as_str()).collect();
         assert_eq!(
             kinds,
             vec!["ConfigMap", "Job", "Service", "Deployment", "CronJob"]
         );
+    }
+
+    /// Issue #8: omitting `serve:` renders no Service and no Deployment,
+    /// mirroring how omitting `schedule:` renders no CronJob. Checked at the
+    /// `manifests()`/`docs()` level — the same path `--dry-run` and a real
+    /// apply share — not just the pure per-object renderers.
+    #[test]
+    fn service_and_deployment_absent_when_serve_is_omitted() {
+        let art = orders_artifact();
+        let builder_only: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"").unwrap();
+        let m = manifests(&input(&builder_only, &art)).unwrap();
+        assert!(m.service.is_none(), "no `serve:` ⇒ no Service");
+        assert!(m.deployment.is_none(), "no `serve:` ⇒ no Deployment");
+        assert!(m.init_job.is_some());
+        assert!(m.cronjob.is_some());
+        let docs = m.docs().unwrap();
+        let kinds: Vec<_> = docs.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["ConfigMap", "Job", "CronJob"]);
     }
 
     /// Issue #6/#11 (H1, the deploy-relax regression): `manifests()` — not
@@ -1303,7 +1331,7 @@ mod tests {
     #[test]
     fn manifests_render_no_init_job_for_an_all_bound_cell() {
         let art = orders_artifact();
-        let k8s = KubernetesConfig::default();
+        let k8s = serving();
 
         let mut normal = input(&k8s, &art);
         normal.all_bound = false;
@@ -1333,7 +1361,8 @@ mod tests {
     #[test]
     fn rendered_yaml_carries_kind_and_never_the_profile_dsn() {
         let art = orders_artifact();
-        let k8s = KubernetesConfig::default();
+        let k8s: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"\nserve: {}").unwrap();
         let docs = render_all(&input(&k8s, &art)).unwrap();
         for d in &docs {
             assert!(d.body.contains(&format!("kind: {}", d.kind)), "{}", d.body);

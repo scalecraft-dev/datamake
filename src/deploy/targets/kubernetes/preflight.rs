@@ -107,6 +107,35 @@ pub(super) fn check_no_schedule_for_an_all_bound_cell(
     Ok(())
 }
 
+/// Issue #8 × issue #6/#11: with `serve:` now presence-based, an all-bound
+/// cell that omits it has no workload left — the Builder is already refused
+/// for it (above), and there is no Server to render. `KubernetesConfig::
+/// validate`'s generic neither-`serve`-nor-`schedule` message would tell the
+/// author to add `schedule:`, which is exactly the wrong advice for this
+/// cell, so this runs **before** `validate()` in `deploy_impl` and names the
+/// only fix that works.
+pub(super) fn check_all_bound_cell_has_a_server(
+    cell: &str,
+    all_bound: bool,
+    k8s: &KubernetesConfig,
+) -> Result<()> {
+    if all_bound && !k8s.serves() {
+        let and_schedule = if k8s.schedule.is_some() {
+            " and remove `schedule:` (a Builder has nothing to build here)"
+        } else {
+            ""
+        };
+        bail!(
+            "cell '{cell}' has no materializing transforms (every export is bound), so the \
+             Server (`datamk serve`, which serves `/context`) is the only workload it can \
+             run — and this deploy overlay has no `serve:` block, so nothing would be \
+             deployed.\n\
+             Add `serve: {{}}` to this deploy overlay{and_schedule}."
+        );
+    }
+    Ok(())
+}
+
 /// When `access.roles` is set, the profile's `principals:` must equal the path
 /// the principals Secret is actually mounted at in-cluster (ADR 0002 §5) — the
 /// only place that Secret's data lands. Any other value means `serve` starts
@@ -226,6 +255,36 @@ mod tests {
     fn an_all_bound_cell_with_no_schedule_passes() {
         let k8s = KubernetesConfig::default();
         check_no_schedule_for_an_all_bound_cell("t", true, &k8s).unwrap();
+    }
+
+    /// Issue #8: an all-bound cell with no `serve:` has no workload at all,
+    /// and the fix is `serve: {}` — never `schedule:`.
+    #[test]
+    fn all_bound_cell_without_serve_is_refused_with_the_serve_fix() {
+        let k8s: KubernetesConfig = serde_yaml::from_str("namespace: data").unwrap();
+        let err = check_all_bound_cell_has_a_server("t", true, &k8s)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cell 't'"), "got: {err}");
+        assert!(err.contains("Add `serve: {}`"), "got: {err}");
+        assert!(!err.contains("remove `schedule:`"), "got: {err}");
+
+        let with_schedule: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"").unwrap();
+        let err = check_all_bound_cell_has_a_server("t", true, &with_schedule)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Add `serve: {}`"), "got: {err}");
+        assert!(err.contains("remove `schedule:`"), "got: {err}");
+    }
+
+    #[test]
+    fn all_bound_cell_with_serve_passes_and_materializing_cell_never_needs_one() {
+        let serving: KubernetesConfig = serde_yaml::from_str("serve: {}").unwrap();
+        check_all_bound_cell_has_a_server("t", true, &serving).unwrap();
+        let builder_only: KubernetesConfig =
+            serde_yaml::from_str("schedule: \"0 * * * *\"").unwrap();
+        check_all_bound_cell_has_a_server("t", false, &builder_only).unwrap();
     }
 
     #[test]

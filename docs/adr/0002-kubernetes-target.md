@@ -31,8 +31,19 @@ A Kubernetes `deploy` realizes the cell's two workloads (ADR 0001 §3) as:
 - a **CronJob** running `datamk run` to rebuild snapshots on `schedule`, and
 - a **Deployment** (+ **Service**) running `datamk serve` to expose the interface.
 
-If `schedule` is omitted, only the Server is deployed (serve-only, no CronJob).
-Kubernetes supports **both** workloads, so `Kubernetes::supports()` returns `Both`.
+Both are **presence-based** in the overlay (amended by issue #8, 2026-09): the
+CronJob renders iff `schedule:` is present, the Deployment + Service iff `serve:`
+is present. A cell that exists only to be composed by other cells has no HTTP
+consumer — composition is build-time against published artifacts, never a call
+to the upstream Server — so it omits `serve:` and runs no idle Server. An overlay
+with neither block is refused at schema validation (it would render only a
+ConfigMap and a one-shot init Job). `serve: {}` deploys a Server with every
+default; a bare `serve:` is YAML null, i.e. absent.
+Kubernetes supports **both** workloads, so `Kubernetes::supports()` returns `Both`;
+whether *this* deploy renders a Server is `DeployTarget::serves(overlay)`, and the
+agnostic Server-only pre-flight (servable, auth — ADR 0001 §7/§8) keys on that,
+not on the target's capability. Those checks are unchanged whenever a Server is
+rendered.
 
 Additionally, a `deploy` renders a one-shot **init Job** running `datamk run`, and
 applies + **waits for it to complete before the Server** (order: ConfigMap → init
@@ -74,12 +85,12 @@ The `target: kubernetes` overlay (`deploy/<name>.yaml`, ADR 0001 §6) carries:
 # deploy/prod.yaml  (tracked, PR-reviewed, secret-free)
 target: kubernetes
 namespace: data-prod
-schedule: "0 * * * *"       # cron for the run CronJob; omit ⇒ serve-only, no CronJob
+schedule: "0 * * * *"       # cron for the run CronJob; omit ⇒ no CronJob
 # allow_anonymous: true     # top-level (agnostic, ADR 0001 §6/§8): required to deploy
                             # a shareable cell with empty roles. NOT nested under `serve:` —
                             # the target-agnostic pre-flight reads it without parsing this
                             # target's sub-schema.
-serve:
+serve:                      # omit ⇒ no Deployment, no Service (issue #8); `serve: {}` ⇒ defaults
   port: 8080
   replicas: 2
 # image:                    # omit ⇒ default to this binary's version (ADR 0001 §5)
