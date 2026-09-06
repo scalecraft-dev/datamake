@@ -5398,10 +5398,7 @@ mod tests {
             chain.contains("Remove the trailing semicolon"),
             "got: {chain}"
         );
-        assert!(
-            chain.contains("docs/guides/incremental.md"),
-            "got: {chain}"
-        );
+        assert!(chain.contains("docs/guides/incremental.md"), "got: {chain}");
     }
 
     #[test]
