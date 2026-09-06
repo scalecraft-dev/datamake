@@ -1,210 +1,100 @@
 # Serving
 
-`datamk serve` exposes a cell's declared interface as REST + OpenAPI. This
-guide covers the operational surface of that endpoint: the query grammar it
-accepts, how it behaves under load, and what to put in front of it.
+`datamk serve` exposes a cell's interface as REST + OpenAPI + `/context`.
 
-## Serving several cells from one process (ADR 0014)
+```bash
+datamk serve -f cell.yaml            # profile local
+datamk serve -f cell.yaml -p prod    # published profile: the poller follows LATEST
+datamk serve                         # datamk.yaml in cwd → project mode; else cell.yaml
+```
 
-A root `datamk.yaml` lists the cells one process mounts behind one port:
+| Flag | Default | Scope in project mode |
+| --- | --- | --- |
+| `--port` | 8080 | process |
+| `--max-concurrency` | 64 | per mounted cell |
+| `--poll-interval` | | process; one poller thread per published cell |
+| `--no-data` | off | every cell; unions with per-cell `no_data: true` |
+| `--drain-timeout` | 10s | process |
+| `-p/--profile` | `local` | overrides the project `profile:` and every per-cell `profile:` |
+
+## Routes
+
+```
+GET /                        {"status":"ok"} plus execution number in published mode; pre-auth
+GET /openapi.json
+GET /context                 ?include=docs inlines docs pages
+GET /<name>@<major>          ?<grain col>=<value>&limit=100&offset=0
+```
+
+Every route except `/` sits behind `access:`. Data responses carry
+`Link: </context>; rel="describedby"`, `X-Datamk-Context-Digest`, and, in
+published mode, `X-Datamk-Execution`. `/context` and `/openapi.json` send
+`Cache-Control: private`.
+
+## Query grammar
+
+- **Grain columns**: exact equality only. No ranges, operators, or non-grain columns.
+- **`limit`**: default 100, max 1000 (clamped).
+- **`offset`**: max 1,000,000 (rejected above).
+- Anything else is **400**. Unknown parameters are never ignored.
+- Pages are ordered by the declared grain (`ORDER BY ALL` for grainless exports) before `LIMIT`/`OFFSET`.
+- No SQL, filter expressions, projections, or `order_by` on this socket. Use `datamk attach` for that.
+- There is no NULL literal. Rows with a NULL grain value are reachable only unfiltered; `verify` reports them as `null_rows`. Coalesce to a sentinel in the transform if callers need them.
+
+`/context` accepts only `include=docs`. Any other parameter, unknown token,
+or empty value is 400.
+
+## Status codes
+
+| Code | Meaning |
+| --- | --- |
+| 200 | Rows as a bare JSON array. |
+| 400 | Unknown or invalid query parameter. |
+| 401 | Missing or unknown bearer token (`access.roles` set). |
+| 403 | Cell not shareable, or token lacks an allowed role. |
+| 404 | No such export route. |
+| 500 | Query execution failed. |
+| 503 | Over the concurrency cap. Retry with backoff. |
+
+## Multi-cell projects
+
+A root `datamk.yaml` mounts several cells behind one port.
 
 ```yaml
-# datamk.yaml — the cells this project serves behind one port.
-# Paths are relative to this file; a directory means <dir>/cell.yaml.
-# Only `datamk serve` reads this file today.
 datamk: 1
-
-# The profile every cell uses unless it names its own.
-# `datamk serve -p <name>` overrides this AND every per-cell `profile:`.
-profile: prod
-
+profile: prod                    # default for every cell
 cells:
-  # Shorthand: just the path. The cell mounts at its own declared name.
-  - datamk-examples/weather
-
-  # Long form: the same path, plus per-cell overrides.
+  - datamk-examples/weather      # mounts at its cell: name
   - path: dplat-datamake/flight-spend
     profile: local
-    mount: flights     # URL segment; defaults to the cell's `cell:` name
-    no_data: true      # serve /flights/context, mount no data routes
+    mount: flights               # URL segment
+    no_data: true
 ```
 
-`datamk serve` with no `-f` uses `datamk.yaml` if it's in the current
-directory, else `cell.yaml`. Each cell keeps its own everything — connection,
-catalog, poller, principals file, authorization policy, and concurrency cap.
-The process is shared; nothing else is.
-
 ```
-GET /                       {"status":"ok","cells":["weather","flights"]}
-GET /weather/               {"cell":"weather","status":"ok","execution":7}
+GET /                        {"status":"ok","cells":["weather","flights"]}
+GET /weather/                {"cell":"weather","status":"ok","execution":7}
 GET /weather/context
-GET /weather/openapi.json   servers: [{"url":"/weather"}]
-GET /weather/temp_daily@1?city=SEA&limit=50
+GET /weather/openapi.json    servers: [{"url":"/weather"}]
+GET /weather/temp_daily@1?city=SEA
 ```
 
-A cell's base URL is `https://host/weather`, so a mesh manifest entry is just
-`{"name": "weather", "url": "https://host/weather"}` — `mesh emit` needs no
-special handling. Note that a `mount:` override desynchronizes
-`mesh emit --store --url-template "https://host/{name}"`, which derives names
-from store prefixes rather than from your project file.
+- Single-cell serving is unchanged: flat routes, no `servers` block, same digest.
+- Each cell keeps its own connection, catalog, poller, `principals:` file, policy, and concurrency cap. A token for one cell is 401 at another.
+- `GET /` lists only the mounts whose policy admits the caller. No root `/context` or aggregate `/openapi.json`.
+- Every listed cell must open or the server does not start.
+- `DATAMK_MEMORY_LIMIT` is the whole process budget, divided across cells. Unparseable values fail at startup.
+- `datamk deploy` does not read `datamk.yaml`. Project mode is for local, single-VM, and behind-your-own-proxy serving.
+- A `mount:` override desynchronizes `mesh emit --store --url-template`.
 
-**Serving one cell is unchanged.** Flat `/`, `/context`, `/<name>@<major>`,
-no `servers` block, same headers. A cell mounted in a project has the same
-interface digest it has standing alone.
+## Operations
 
-### What the root route does and does not say
-
-`GET /` lists only the mounts whose own `authorize()` admits the caller — an
-anonymous caller against an all-private project gets `[]`, and a
-non-shareable cell is invisible to everyone. `status` is unconditional so a
-liveness probe needs no credential.
-
-It carries names only: no exports, no descriptions, no digests, and there is
-no root `/context` or aggregate `/openapi.json`. A route that summarized
-other cells would be a served mesh manifest, which ADR 0012 §6 refuses.
-Discovery across cells is `datamk mesh emit`'s job — a static document you
-host, not a live index this socket serves.
-
-### Flags in project mode
-
-| Flag | Scope |
-| ---- | ----- |
-| `--port` | Process. One socket. |
-| `--max-concurrency` | **Per mounted cell.** A shared cap would let one cell's saturation shed every other cell's liveness route. |
-| `--poll-interval` | Process. Each published cell gets its own poller thread, staggered. |
-| `--no-data` | Applies to every cell, and unions with per-cell `no_data: true`. There is no per-cell way to turn it off. |
-| `-p/--profile` | Overrides the project `profile:` **and** every per-cell `profile:`. |
-
-Set `DATAMK_MEMORY_LIMIT` to the process's whole budget, not one cell's:
-`serve` divides it across the mounted cells and caps DuckDB's thread count
-per connection. An unparseable value fails at startup rather than quietly
-handing every cell the full budget.
-
-Every listed cell must open or the server does not start — a partially
-mounted server passes its own probe while serving 404s a caller cannot tell
-from a typo.
-
-### Per-cell authorization
-
-Each mounted cell authorizes against its **own** profile's `principals:`
-file and its own `access.roles` — a token minted for one cell is a 401 at
-another cell's mount. A relative `principals:` path resolves against that
-cell's directory, not the directory you started the server from.
-
-### What co-tenancy costs you
-
-One process is one failure domain, one restart, one scaling unit, and one
-set of resource limits. Cells with materially different sensitivity are the
-case where this is the wrong packaging: a per-cell `profile:` pins that
-cell's credentials *and* its `principals:` file, so a cell pinned to `local`
-in a production deployment serves a local catalog under a local policy while
-the process still looks healthy. The startup banner prints the profile for
-every mount — read it.
-
-`datamk deploy` does not read `datamk.yaml`; it renders a single-cell
-workload. Multi-cell serving is the local, single-VM, and
-behind-your-own-proxy story.
-
-## The query grammar is closed
-
-A data route (`GET /<name>@<major>`) accepts exactly:
-
-- **Grain columns** as filters — exact equality only. No ranges, no
-  operators, no non-grain columns.
-- **`limit`** — rows per page. Values above the maximum (1000) are clamped;
-  the default is 100.
-- **`offset`** — rows to skip. Requests beyond the maximum (1,000,000) are
-  rejected; filter by grain columns instead of paginating that deep.
-
-There is no NULL literal: a grain column that is NULL for some rows leaves
-those rows reachable only by an unfiltered read. `datamk verify` warns when
-it measures such rows and the count is published per column as
-`null_rows` on both the export's `check` and its `probe` in `/context`. If
-callers need to reach them, coalesce the column to a sentinel of its own
-type in the transform (`coalesce(utm_campaign, 'none')`); a sentinel is not
-a fix for a grain that is *not unique* — `DISTINCT` already treats NULLs as
-equal, so rows sharing a grain tuple with a NULL in it are duplicates like
-any other.
-
-Anything else — an unknown parameter name, a non-grain column, a
-non-integer `limit`/`offset` — is rejected with **400**, never silently
-ignored. A silently ignored filter would return unfiltered rows the caller
-reads as a filtered subset: a confidently wrong number, not an error.
-
-Pagination is deterministic: the read is ordered by the declared grain
-(every column, via `ORDER BY ALL`, for a grainless export) before
-`LIMIT`/`OFFSET` applies, so pages stitch together without skipping or
-double-counting rows.
-
-datamk never accepts a query from a caller — no filter expressions, no
-projections, no `order_by`, on this socket, in any version. A consumer that
-needs real SQL should attach the storage plane read-only (`datamk attach`)
-and run it with its own engine, credentials, and bill.
-
-## `/context`'s query grammar is closed too (ADR 0013)
-
-`GET /context` accepts exactly one query parameter:
-
-- **`include`** — a comma-separated list drawn from a closed vocabulary
-  (today: `docs`). `?include=docs` inlines every declared docs page's
-  content into the response; omit it for the default document (identity
-  and measurements only, no page content).
-
-Any other parameter name, an unrecognized `include` token, or an empty
-value (`?include=` or a trailing comma) is **400** — the same
-never-silently-ignored discipline as the data door. `?include=docs` on a
-cell with no `docs:` fields is a normal **200** with an empty `docs: {}`,
-not an error.
-
-The two variants carry different `ETag`s (the docs variant appends a
-content-hash suffix) so caching and `If-None-Match` work correctly per
-variant; `X-Datamk-Context-Digest`, `/openapi.json`'s `info.version`, and
-the mesh manifest's `context_digest` all stay pinned to the plain interface
-digest regardless of which variant produced them. Both `/context` and
-`/openapi.json` now send `Cache-Control: private` — `authorize()` is
-all-or-nothing, and a shared cache keyed on URI alone could otherwise hand
-a cached 200 to a caller with no token.
-
-## Memory in a container
-
-DuckDB sizes its default memory limit from host RAM; under a cgroup that is
-the wrong number. datamk reads the container's limit (`memory.max` /
-`memory.limit_in_bytes`) and defaults DuckDB to 75% of it, logging the
-value at start-up. `DATAMK_MEMORY_LIMIT` overrides it.
-
-## Stopping
-
-`serve` handles `SIGTERM` and `SIGINT`: it stops accepting connections
-(so a readiness probe on `/` fails from that moment and an orchestrator
-routes new traffic elsewhere), finishes in-flight requests for up to
-`--drain-timeout` seconds (default 10), and exits 0. Requests still open
-when the drain expires are dropped, with a warning. One log line on
-receipt, one on exit.
-
-Run it as PID 1 (`exec datamk serve …`) — no init shim or signal-forwarding
-wrapper is needed — and keep `--drain-timeout` under the orchestrator's
-termination grace period (Kubernetes: `terminationGracePeriodSeconds`,
-30 s by default).
-
-## Throttling
-
-`serve` applies one concurrency cap per served cell (`--max-concurrency`,
-default 64): requests over the cap are shed immediately with **503**, instead
-of queueing without bound. Agents fan out and retry tirelessly; shedding keeps
-the endpoint honest about capacity instead of stacking latency. In a project
-the caps are independent, so a saturated cell sheds its own traffic and not
-its neighbours'; the project root sits outside them entirely and stays
-answerable.
-
-The cap is per cell, not per client — one greedy caller can consume a cell's
-whole allowance, and a project of N cells admits up to N times the cap in
-total. For
-per-client rate limiting, fairness, TLS termination, and request logging,
-put a reverse proxy in front. Example (nginx):
+- **Memory**: under a cgroup, DuckDB defaults to 75% of `memory.max`. `DATAMK_MEMORY_LIMIT` overrides.
+- **Shutdown**: `SIGTERM`/`SIGINT` stop accepting, drain up to `--drain-timeout`, exit 0. Run as PID 1. Keep the drain under the orchestrator's grace period (Kubernetes default 30s).
+- **Throttling**: the cap is per cell, not per client. Put a reverse proxy in front for per-client limits, TLS, and request logs:
 
 ```nginx
 limit_req_zone $binary_remote_addr zone=datamk:10m rate=20r/s;
-
 server {
     listen 443 ssl;
     location / {
@@ -214,22 +104,5 @@ server {
 }
 ```
 
-On Kubernetes, the same job belongs to your ingress controller (e.g.
-`nginx.ingress.kubernetes.io/limit-rps`) or service mesh.
-
-## Status codes
-
-| Code | Meaning |
-| ---- | ------- |
-| 200  | Rows (a bare JSON array). |
-| 400  | Unknown or invalid query parameter. |
-| 401  | Missing or unknown bearer token (`access.roles` is set). |
-| 403  | Cell not shareable, or token lacks an allowed role. |
-| 404  | No such export route. |
-| 500  | Query execution failed. |
-| 503  | Over the concurrency cap — retry with backoff. |
-
-The pre-auth `/` health route carries one liveness fact (plus the served
-execution number in published mode); everything else — `/context`,
-`/openapi.json`, and the data routes — sits behind the same `access`
-policy.
+Design rationale: [ADR 0013](../adr/0013-long-form-docs-pages.md),
+[ADR 0014](../adr/0014-multi-cell-serving.md).

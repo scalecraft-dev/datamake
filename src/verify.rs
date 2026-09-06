@@ -773,7 +773,7 @@ pub(crate) fn check_replace_incremental_gate(
                      with just the delta (truncation). Read the accumulated table instead (an \
                      upsert/append model over '{source}' in this cell), or change this model to \
                      materialize: upsert/append if it should itself accumulate. See \
-                     docs/guides/incremental.md §4.",
+                     docs/guides/incremental.md.",
                     t.sql
                 );
             }
@@ -2404,7 +2404,7 @@ interface:
              'events' — rebuilding from the delta would replace the table's history with just \
              the delta (truncation). Read the accumulated table instead (an upsert/append \
              model over 'events' in this cell), or change this model to materialize: \
-             upsert/append if it should itself accumulate. See docs/guides/incremental.md §4."
+             upsert/append if it should itself accumulate. See docs/guides/incremental.md."
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1050,7 +1050,7 @@ fn composition_error_context(action: &str, select_text: &str) -> String {
     if select_text.trim_end().ends_with(';') {
         ctx.push_str(
             " Remove the trailing semicolon: the file is wrapped as a subquery \
-             (docs/guides/incremental.md §4).",
+             (docs/guides/incremental.md).",
         );
     }
     ctx
@@ -1275,7 +1275,7 @@ fn write_eject_artifact(
              --     data layer never depends on datamk to be read. There is no supported way to\n\
              --     point cell.yaml `transforms:` at this file directly — edit the `sql:` file's\n\
              --     SELECT and let the next run regenerate this.\n\
-             -- (d) Full recipe: docs/guides/incremental.md §4.\n\n"
+             -- (d) Full recipe: docs/guides/incremental.md.\n\n"
         )
     } else {
         format!(
@@ -1291,7 +1291,7 @@ fn write_eject_artifact(
              --     data layer never depends on datamk to be read. There is no supported way to\n\
              --     point cell.yaml `transforms:` at this file directly — edit the `sql:` file's\n\
              --     SELECT and let the next run regenerate this.\n\
-             -- (d) Full recipe: docs/guides/incremental.md §4.\n\n"
+             -- (d) Full recipe: docs/guides/incremental.md.\n\n"
         )
     };
 
@@ -1315,7 +1315,7 @@ fn log_eject_notice(table: &str, artifact_path: &Path) {
     tracing::info!(
         table = %table,
         "materialize: eject artifact {} (engine guards not included — see \
-         docs/guides/incremental.md §4)",
+         docs/guides/incremental.md)",
         artifact_path.display()
     );
 }
@@ -4976,7 +4976,7 @@ mod tests {
         // longer representable (see the note above `materialize_test_cell`'s
         // verify_replay tests). The one way left to trip verify_replay
         // through the declarative surface is the documented determinism
-        // caveat (docs/guides/incremental.md §6): a SELECT that isn't a
+        // caveat (docs/guides/incremental.md): a SELECT that isn't a
         // pure function of its inputs produces different content on the
         // real run vs. the replay, and `random()` guarantees that.
         let cell = materialize_test_cell(
@@ -5399,7 +5399,7 @@ mod tests {
             "got: {chain}"
         );
         assert!(
-            chain.contains("docs/guides/incremental.md §4"),
+            chain.contains("docs/guides/incremental.md"),
             "got: {chain}"
         );
     }
@@ -5969,7 +5969,7 @@ mod tests {
         );
         // (d) pointer to the guide.
         assert!(
-            artifact.contains("docs/guides/incremental.md §4"),
+            artifact.contains("docs/guides/incremental.md"),
             "got: {artifact}"
         );
         // The three statements, in order, runnable as pasted.
@@ -6194,7 +6194,7 @@ mod tests {
             "got: {artifact}"
         );
         assert!(
-            artifact.contains("docs/guides/incremental.md §4"),
+            artifact.contains("docs/guides/incremental.md"),
             "got: {artifact}"
         );
         // One statement — no staging, no bootstrap.

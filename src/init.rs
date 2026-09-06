@@ -369,7 +369,7 @@ const ORDERS_DAILY_SQL: &str = r#"-- Public export `orders_daily@2`. Grain (orde
 -- order_totals (an accumulator, not the incremental source directly — guard
 -- 4c would refuse that). This export declares `grain:` explicitly
 -- (cell.yaml) rather than inheriting one: `replace` has no `key:`, so there
--- is nothing to inherit from (see docs/guides/incremental.md §4).
+-- is nothing to inherit from (see docs/guides/incremental.md).
 SELECT
     order_date,
     region,
