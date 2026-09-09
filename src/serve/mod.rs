@@ -744,7 +744,15 @@ fn build_state(
     let source_check =
         crate::manifest::SourceCheckRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
             .as_ref()
-            .map(|r| crate::context::SourceCheck::from_record(r, &all_routes));
+            .map(|r| {
+                let mut sc = crate::context::SourceCheck::from_record(r, &all_routes);
+                // The census's `top_values` are row-derived and leave with
+                // the probe's `values` under --no-data; the counts stay.
+                if !data_mounted {
+                    sc.withhold_values();
+                }
+                sc
+            });
     // H3: precomputed once here, from the exact two values above — never
     // recomputed on the request path, same discipline as `docs_bundle_sha12`.
     let observed_bundle_sha12 = observed_bundle_sha12(source_check.as_ref(), &source_descriptions);
@@ -2986,12 +2994,13 @@ pub(in crate::serve) mod smoke {
                 profile: "local".to_string(),
                 exports: BTreeMap::from([(
                     "orders_daily@2".to_string(),
-                    crate::manifest::GrainMeasurement {
+                    crate::manifest::ExportMeasurement {
                         check: "grain_unique".to_string(),
                         grain: vec!["order_date".to_string(), "region".to_string()],
                         rows: 4,
-                        distinct_grain: 4,
+                        distinct_grain: Some(4),
                         null_rows,
+                        columns: BTreeMap::new(),
                     },
                 )]),
             }

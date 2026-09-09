@@ -97,7 +97,7 @@ on a schedule, not at pod start; it stages every bound object.
 | Verb | On a discovered cell |
 |---|---|
 | `run`, `attach`, `rollback` | Refuse |
-| `verify` | Live-checks types and grain against the warehouse; sets `status: verified_at_source`. Grain check scans the table |
+| `verify` | Live-checks types and grain against the warehouse and takes the column census (`check.columns`: NULLs per column, top values of low-cardinality columns); sets `status: verified_at_source`. Warns when a column description or definition says a column is empty and the census says otherwise. Grain check scans the table |
 | `context` | Emits the document with `discovered_from` and per-export `deployed`; a draft with a note if the record is missing or stale |
 | `serve` | Serves `/context` and `/openapi.json`; refuses to start without a fresh record |
 | `release` | Pins `supported` exports; the meaning ratchet hashes authored prose only |
@@ -110,6 +110,7 @@ on a schedule, not at pod start; it stages every bound object.
   requires an override with `version` and `contract: supported`.
 - The record is stale after a `cell.yaml` edit or under a different profile.
   `serve` refuses; `context` says so in `notes[]`.
+- A grainless model still gets a `check` (`check: schema`) with the census; only `distinct_grain` is missing. An export with `freshness` in its override and a loaded interval gets `freshness_observed` (age of `deployed.intervals.end` at verify time), beside the claim, never compared to it.
 - `deployed` and `discovered_from` sit outside the interface digest.
   `description` and `schema` are inside it. A docs page rename moves the
   digest; a prose edit does not.

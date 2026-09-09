@@ -6,6 +6,26 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added: the column census on bound exports, and prose the data contradicts
+
+`verify` now measures every declared column of a bound export (`bind:`,
+and every export of a discovered cell): NULLs per column, and for a
+non-grain column of at most 50 distinct values, the exact count and the
+five most frequent values; wider columns are flagged `distinct_over_50`
+and list nothing. It ships as `exports[].check.columns` (`top_values`
+withheld under `--no-data`, like the probe's `values`). A grainless bound
+export, which carried no `check` at all, now carries one with
+`check: "schema"`, `grain: []` and no `distinct_grain`; `grain_unique` is
+unchanged. Where a column `description` or a definition applying to that
+column says the column is empty (`currently null`, `backfill pending`,
+`not yet populated`, `not populated`, `always null`, `empty`) and the
+census measured rows populated, `verify` and `release` warn and the
+document says so in `notes[]`, naming the export, column, claimant and
+phrase. A warning, never a failure. Discovered exports with a `freshness`
+claim and a loaded interval also get `freshness_observed` (`at`,
+`intervals_end`, `age_seconds`) beside the claim; the claim stays
+advisory (issue #11) and nothing compares the two.
+
 ### Added — `datamk mcp` (issue #32, ADR 0012 amendment 2026-09-05)
 
 The served interface as an MCP server over stdio. Three tools, whatever
