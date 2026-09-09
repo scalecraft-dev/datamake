@@ -65,6 +65,32 @@ warehouse. Column descriptions from `column_descriptions`, then inline `--`
 comments, then the warehouse comment. Grain from `grains`, then the
 override. Each value carries its origin in `from`.
 
+## Relationships
+
+A model's `references` are its join keys, and the document projects them so
+an agent joining two exports reads the join instead of guessing it. Each
+export with references carries `relationships[]`: one entry per reference,
+`{column, to, to_column, to_one_verified}`. `to` is the route of an export
+in the same cell whose grain is exactly `to_column` (the alias of a
+`col AS name` reference, else the column itself), one entry per matching
+export; `null` when no selected export has that grain, so the key is still
+named. `to_one_verified` is the target's last `check` from `datamk verify`:
+`true` if its grain was unique, `false` if not, `null` if never checked.
+Composite references (`(a, b)`) are not projected. Resolution never crosses
+cells and never names an unselected or private model.
+
+```sql
+MODEL (name invoice.flight_spend, grain (month, flight_id),
+       references (flight_id, advertiser AS advertiser_id));
+```
+
+```json
+"relationships": [
+  { "column": "flight_id", "to": "ui_flights@1", "to_column": "flight_id", "to_one_verified": true },
+  { "column": "advertiser", "to": null, "to_column": "advertiser_id", "to_one_verified": null }
+]
+```
+
 ## Sync
 
 `datamk sync -f cell.yaml -p prod` reads the state store (`_versions`,
@@ -115,6 +141,9 @@ on a schedule, not at pod start; it stages every bound object.
   digest; a prose edit does not.
 - `depends_on` names selected parents by route; `depends_on_unselected` is
   a count.
+- `relationships[].{column, to, to_column}` are in the interface digest;
+  `to_one_verified` is not. A cell whose models declare no `references`
+  keeps its digest.
 - A dev environment's edits never appear. Snapshots join on
   `(name, identifier)`.
 - Verify the inline-comment extractor against your project by dumping

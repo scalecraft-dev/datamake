@@ -288,6 +288,13 @@ pub struct ExportDoc {
     /// (the unselected models are not this cell's to disclose, ADR 0012 §5).
     #[serde(skip_serializing_if = "is_zero")]
     pub depends_on_unselected: usize,
+    /// ADR 0016 amendment 2026-09-09: the join keys the modeling tool
+    /// declared for this model (SQLMesh `references`), each resolved to the
+    /// export in this cell whose grain is exactly that key, so an agent
+    /// joining two exports reads the join instead of guessing it. Omitted
+    /// when the tool declared none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipDoc>,
     /// ADR 0016 §7: what the modeling tool says about this model's
     /// deployment — kind, cron, owner, tags, fingerprint, loaded intervals.
     /// A measured block (`at` = the sync time), outside the digest, so an
@@ -309,6 +316,60 @@ pub struct ExportDoc {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// One declared join key, resolved within the cell. `column` is this
+/// export's column; `to_column` is the key it joins on (the alias of an
+/// aliased reference, else `column`); `to` is the route of an export whose
+/// grain is exactly `[to_column]`, or `null` when no selected export has that
+/// grain, so the reader still learns the column is a key. One entry per
+/// matching export: two exports unique on the same key are both valid
+/// targets. `column`, `to`, `to_column` are the tool's claim (one origin,
+/// `sqlmesh`, so no `from`); `to_one_verified` restates the target's
+/// `check`: `true` when its last `grain_unique` measurement found the
+/// grain unique, `false` when it did not, `null` when nothing measured it
+/// (or `to` is null). Its timestamp is the target export's `check.at`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelationshipDoc {
+    pub column: String,
+    pub to: Option<String>,
+    pub to_column: String,
+    pub to_one_verified: Option<bool>,
+}
+
+/// `relationships[]` for one export: every declared reference against the
+/// cell's own (visibility-filtered, route-sorted) export list. Self is
+/// never a target, and only a grain of exactly one column matches; a
+/// composite grain that merely contains the key is not one row per key.
+fn relationships(route: &str, e: &Export, routes: &[(String, Export)]) -> Vec<RelationshipDoc> {
+    let Some(d) = e.discovered.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for r in &d.references {
+        let targets: Vec<&str> = routes
+            .iter()
+            .filter(|(rt, t)| rt != route && t.grain.len() == 1 && t.grain[0] == r.name)
+            .map(|(rt, _)| rt.as_str())
+            .collect();
+        if targets.is_empty() {
+            out.push(RelationshipDoc {
+                column: r.column.clone(),
+                to: None,
+                to_column: r.name.clone(),
+                to_one_verified: None,
+            });
+        }
+        for t in targets {
+            out.push(RelationshipDoc {
+                column: r.column.clone(),
+                to: Some(t.to_string()),
+                to_column: r.name.clone(),
+                to_one_verified: None,
+            });
+        }
+    }
+    out
 }
 
 /// The tool-side facts of a discovered export (ADR 0016 §7), on the wire.
@@ -787,6 +848,7 @@ pub fn interface(
                     .as_ref()
                     .map(|d| d.depends_on_unselected)
                     .unwrap_or(0),
+                relationships: relationships(route, e, routes),
                 deployed: e.discovered.as_ref().map(DeployedBlock::from),
                 probe: None,
                 check: None,
@@ -1087,12 +1149,24 @@ pub fn assemble(facts: Facts) -> ContextDocument {
         .as_mut()
         .map(|c| std::mem::take(&mut c.exports))
         .unwrap_or_default();
+    // `relationships[].to_one_verified` restates the target export's own
+    // measurement: unique iff the counts agree. Read from the numbers, not
+    // from `source_check.outcome`, so a record that one day carries a failed
+    // measurement reads `false` without a vocabulary change. A target with
+    // no check (never verified, stale record, or grainless) stays `null`.
+    let one_per_key: IndexMap<String, bool> = checks
+        .iter()
+        .map(|(route, c)| (route.clone(), c.rows == c.distinct_grain))
+        .collect();
     let exports = interface
         .exports
         .into_iter()
         .map(|mut e| {
             e.probe = probes.shift_remove(&e.route);
             e.check = checks.shift_remove(&e.route);
+            for r in e.relationships.iter_mut() {
+                r.to_one_verified = r.to.as_deref().and_then(|t| one_per_key.get(t).copied());
+            }
             e
         })
         .collect();
@@ -1441,6 +1515,18 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
         query: &'a Option<QueryBlock>,
         binding: &'a Option<BindingBlock>,
         depends_on: &'a [String],
+        // The declared join (column, to, to_column) is interface: an agent
+        // composes queries on it. `to_one_verified` is a measurement and
+        // stays out. Skipped when empty so a cell with no references keeps
+        // its digest across this addition.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        relationships: Vec<RelationshipProjection<'a>>,
+    }
+    #[derive(Serialize)]
+    struct RelationshipProjection<'a> {
+        column: &'a str,
+        to: &'a Option<String>,
+        to_column: &'a str,
     }
     #[derive(Serialize)]
     struct ColumnProjection<'a> {
@@ -1502,6 +1588,15 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
                 query: &e.query,
                 binding: &e.binding,
                 depends_on: &e.depends_on,
+                relationships: e
+                    .relationships
+                    .iter()
+                    .map(|r| RelationshipProjection {
+                        column: &r.column,
+                        to: &r.to,
+                        to_column: &r.to_column,
+                    })
+                    .collect(),
             })
             .collect(),
         upstreams: interface
@@ -2043,6 +2138,238 @@ interface:
             !doc.grain_verified,
             "a grainless discoverable export must not report grain_verified: true"
         );
+    }
+
+    /// A discovered cell built through the real materialization path, so
+    /// the relationship tests exercise `DiscoveredExport.references` the way
+    /// `config::load` sets it. `models`: (object, grain, references as
+    /// `col` or `col AS name`).
+    fn discovered_def(overrides: &str, models: &[(&str, &[&str], &[&str])]) -> CellDef {
+        use crate::catalog::ir::{
+            ColumnsSource, DeployedCatalog, DeployedModel, Evidence, Reference,
+        };
+        let d: crate::config::Discover = serde_yaml::from_str(&format!(
+            "from: sqlmesh\nstate: s\nwarehouse: wh\nselect:\n  schemas: [inv]\n{overrides}"
+        ))
+        .unwrap();
+        let models = models
+            .iter()
+            .map(|(object, grain, refs)| DeployedModel {
+                name: format!("db.{object}"),
+                object: object.to_string(),
+                catalog: Some("db".to_string()),
+                fingerprint: "1".to_string(),
+                version: Some("1".to_string()),
+                data_hash: Some("d".to_string()),
+                kind: "FULL".to_string(),
+                cron: None,
+                owner: None,
+                tags: Vec::new(),
+                description: None,
+                columns: IndexMap::new(),
+                columns_source: ColumnsSource::Warehouse,
+                grain: grain.iter().map(|g| g.to_string()).collect(),
+                references: refs
+                    .iter()
+                    .map(|r| match r.split_once(" AS ") {
+                        Some((c, n)) => Reference {
+                            column: c.to_string(),
+                            name: n.to_string(),
+                        },
+                        None => Reference {
+                            column: r.to_string(),
+                            name: r.to_string(),
+                        },
+                    })
+                    .collect(),
+                depends_on: Vec::new(),
+                intervals: None,
+                pending_restatement: None,
+            })
+            .collect();
+        let catalog = DeployedCatalog {
+            tool: "sqlmesh".to_string(),
+            environment: "prod".to_string(),
+            plan_id: "p1".to_string(),
+            finalized_at: "2026-09-09T00:00:00Z".to_string(),
+            synced_at: "2026-09-09T00:01:00Z".to_string(),
+            evidence: Evidence::EnvironmentRow,
+            schema_version: "100".to_string(),
+            models,
+            total_models: 0,
+            unselected_models: 0,
+        };
+        let mut def: CellDef = serde_yaml::from_str("cell: c\n").unwrap();
+        crate::catalog::select::materialize(&mut def, &d, &catalog, false).unwrap();
+        def
+    }
+
+    fn check_of(rows: i64, distinct: i64) -> ExportCheck {
+        ExportCheck {
+            at: "2026-09-09T01:00:00Z".to_string(),
+            check: "grain_unique".to_string(),
+            grain: vec!["flight_id".to_string()],
+            rows,
+            distinct_grain: distinct,
+            null_rows: BTreeMap::new(),
+        }
+    }
+
+    /// ADR 0016 amendment 2026-09-09: a reference resolves to every
+    /// discoverable export whose grain is exactly that one column, never
+    /// to itself, never to a composite grain that merely contains it, never
+    /// to a private export. An unresolved one is still listed with
+    /// `to: null` so the key is not lost.
+    #[test]
+    fn relationships_resolve_references_to_single_column_grains_in_the_cell() {
+        let def = discovered_def(
+            "overrides:\n  - model: inv.campaigns\n    visibility: private\n",
+            &[
+                ("inv.flights", &["flight_id"], &[]),
+                ("inv.flights_v2", &["flight_id"], &[]),
+                ("inv.flights_daily", &["flight_id", "day"], &[]),
+                ("inv.campaigns", &["campaign_id"], &[]),
+                (
+                    "inv.spend",
+                    &["month", "flight_id"],
+                    &["flight_id", "campaign_id", "advertiser AS advertiser_id"],
+                ),
+            ],
+        );
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            false,
+            false,
+            true,
+        );
+        let v = serde_json::to_value(&doc).unwrap();
+        let spend = v["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["route"] == "inv_spend@1")
+            .unwrap();
+        assert_eq!(
+            spend["relationships"],
+            serde_json::json!([
+                { "column": "flight_id", "to": "inv_flights@1",
+                  "to_column": "flight_id", "to_one_verified": null },
+                { "column": "flight_id", "to": "inv_flights_v2@1",
+                  "to_column": "flight_id", "to_one_verified": null },
+                { "column": "campaign_id", "to": null,
+                  "to_column": "campaign_id", "to_one_verified": null },
+                { "column": "advertiser", "to": null,
+                  "to_column": "advertiser_id", "to_one_verified": null }
+            ])
+        );
+        // No references declared: no key at all, like `depends_on`.
+        let flights = v["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["route"] == "inv_flights@1")
+            .unwrap();
+        assert!(flights.get("relationships").is_none(), "{flights}");
+        // The private target is named nowhere.
+        assert!(!serde_json::to_string(&v).unwrap().contains("campaigns@1"));
+    }
+
+    /// `to_one_verified` is the target's own `check`, read from the counts:
+    /// true when unique, false when not, null when nothing measured it,
+    /// and it never moves the interface digest, while the declared join
+    /// does.
+    #[test]
+    fn to_one_verified_restates_the_targets_grain_check_and_stays_out_of_the_digest() {
+        let def = discovered_def(
+            "",
+            &[
+                ("inv.flights", &["flight_id"], &[]),
+                ("inv.flights_v2", &["flight_id"], &[]),
+                (
+                    "inv.spend",
+                    &["month", "flight_id"],
+                    &["flight_id", "advertiser_id"],
+                ),
+            ],
+        );
+        let routes = discoverable_routes(&def).unwrap();
+        let mut exports = IndexMap::new();
+        exports.insert("inv_flights@1".to_string(), check_of(4, 4));
+        exports.insert("inv_flights_v2@1".to_string(), check_of(5, 4));
+        let source_check = SourceCheck {
+            outcome: "passed".to_string(),
+            checked_at: "2026-09-09T01:00:00Z".to_string(),
+            data_as_of: None,
+            datamk_version: "0.0.27".to_string(),
+            exports,
+        };
+        let build_with = |check: Option<SourceCheck>| {
+            build(
+                &def,
+                &routes,
+                None,
+                check,
+                None,
+                Vec::new(),
+                IndexMap::new(),
+                IndexMap::new(),
+                false,
+                false,
+                true,
+            )
+        };
+        let doc = build_with(Some(source_check.clone()));
+        let v = serde_json::to_value(&doc).unwrap();
+        let spend = v["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["route"] == "inv_spend@1")
+            .unwrap();
+        let verified: Vec<serde_json::Value> = spend["relationships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["to_one_verified"].clone())
+            .collect();
+        assert_eq!(
+            verified,
+            vec![
+                serde_json::json!(true),
+                serde_json::json!(false),
+                serde_json::Value::Null
+            ]
+        );
+
+        // Digest: the measurement is out, the declared join is in.
+        let data = DataBlock {
+            served_here: false,
+            channels: Vec::new(),
+        };
+        let checked = interface(&def, &routes, &IndexMap::new());
+        let d1 = interface_digest("c", &checked, &data);
+        let unchecked = build_with(None);
+        assert!(unchecked
+            .exports
+            .iter()
+            .all(|e| e.relationships.iter().all(|r| r.to_one_verified.is_none())));
+        let mut without = def.clone();
+        for e in without.interface.iter_mut() {
+            if let Some(d) = e.discovered.as_mut() {
+                d.references.clear();
+            }
+        }
+        let routes2 = discoverable_routes(&without).unwrap();
+        let d2 = interface_digest("c", &interface(&without, &routes2, &IndexMap::new()), &data);
+        assert_ne!(d1, d2, "a declared join is an interface fact");
     }
 
     /// ADR 0012 §4: a `private` export appears nowhere, in any form, not

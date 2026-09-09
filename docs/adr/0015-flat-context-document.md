@@ -267,3 +267,17 @@ accepting a warehouse-documented column, as it does today.
 - The closed `origin` set proves too coarse (an agent needs "which
   warehouse" or "which tool version"). Reversal is additive: `from` values
   become objects; the map shape stays.
+
+## Amendment (2026-09-09): a fact that restates a measurement
+
+§3 says a fact is a measurement iff it sits in a block with a timestamp,
+and a claim iff it carries `from`. ADR 0016's `relationships[]`
+(amendment 2026-09-09) adds a third, derived case: `to_one_verified`
+restates the *target* export's `check` (its `rows == distinct_grain`) on
+the record that consumes it. It is a measurement, timestamped by the target
+export's `check.at`, and it lives beside the claim it qualifies so an agent
+reads the join and its safety in one place. The rule holds by reference,
+not by position: a derived field must name the measured block it restates,
+must be `null` whenever that block is absent, and must stay out of the
+digest (§5). `relationships[].{column, to, to_column}` have exactly one
+origin (the tool) and, like `depends_on`, carry no `from`.

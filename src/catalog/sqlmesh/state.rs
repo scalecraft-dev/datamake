@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use super::identifier::Fingerprint;
 use super::names::{self, ModelName};
+use crate::catalog::ir::Reference;
 
 /// The `_versions.schema_version` values this reader has been exercised
 /// against. A different one is a hard error naming both numbers (§3).
@@ -76,6 +77,8 @@ pub struct StateModel {
     /// SQLMesh itself does.
     pub column_descriptions: IndexMap<String, String>,
     pub grain: Vec<String>,
+    /// Declared `references`, single-column ones only (see `references`).
+    pub references: Vec<Reference>,
     /// Parents' names, unquoted.
     pub depends_on: Vec<String>,
 }
@@ -286,6 +289,51 @@ fn grain_columns(v: Option<&Value>) -> Vec<String> {
     out
 }
 
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches('"').trim_matches('`').to_string()
+}
+
+/// A reference expression as SQLMesh stores it (`_refs_to_sql`, the same
+/// serializer `grains` uses): `item_id`, `id AS order_id`, or a composite
+/// `(a, b)`. The alias, when present, is the key the reference joins on
+/// (`Reference.name` in SQLMesh: the expression's output name). Composites
+/// are skipped, since there is no single-column grain for them to resolve to.
+fn references(v: Option<&Value>) -> Vec<Reference> {
+    let mut out = Vec::new();
+    for r in str_list(v) {
+        let r = r.trim();
+        if r.is_empty() {
+            continue;
+        }
+        let inner = r.trim_start_matches('(').trim_end_matches(')').trim();
+        if inner.contains(',') {
+            continue; // composite: `(a, b)` or `(a, b) AS name`
+        }
+        // The last top-level ` AS ` splits expression from alias; a `CAST(x
+        // AS INT)` inside parentheses is part of the expression.
+        let upper = inner.to_ascii_uppercase();
+        let mut depth = 0i32;
+        let mut split = None;
+        for (i, c) in upper.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ' ' if depth == 0 && upper[i..].starts_with(" AS ") => split = Some(i),
+                _ => {}
+            }
+        }
+        let (column, name) = match split {
+            Some(i) => (unquote(&inner[..i]), unquote(&inner[i + 4..])),
+            None => (unquote(inner), unquote(inner)),
+        };
+        if column.is_empty() || name.is_empty() {
+            continue;
+        }
+        out.push(Reference { column, name });
+    }
+    out
+}
+
 /// Every environment snapshot's `_snapshots` row, joined on
 /// `(name, identifier)`. Missing rows are an error naming the model — the
 /// environment promised a snapshot the store no longer holds.
@@ -419,6 +467,7 @@ pub fn read_models(
             declared_columns,
             column_descriptions,
             grain: grain_columns(node.get("grains")),
+            references: references(node.get("references")),
             depends_on,
         };
         by_key.insert(key, model);
@@ -690,6 +739,56 @@ mod tests {
             .unwrap();
         assert_eq!(inc.grain, vec!["id", "event_date"]);
         assert_eq!(inc.kind, "INCREMENTAL_BY_TIME_RANGE");
+        // `references (item_id, id AS order_id)`: the bare one keeps its
+        // name, the aliased one joins on the alias.
+        assert_eq!(
+            inc.references,
+            vec![
+                Reference {
+                    column: "item_id".to_string(),
+                    name: "item_id".to_string()
+                },
+                Reference {
+                    column: "id".to_string(),
+                    name: "order_id".to_string()
+                },
+            ]
+        );
+        let full = models
+            .iter()
+            .find(|m| m.name.table == "full_model")
+            .unwrap();
+        assert!(full.references.is_empty());
+    }
+
+    #[test]
+    fn references_split_on_the_top_level_alias_and_skip_composites() {
+        let v = serde_json::json!([
+            "item_id",
+            "id AS order_id",
+            "lower(code) as sku",
+            "CAST(x AS INT) AS y",
+            "\"Quoted Col\" AS key",
+            "(a, b)",
+            "(a, b) AS ab",
+            ""
+        ]);
+        let refs = references(Some(&v));
+        let pairs: Vec<(&str, &str)> = refs
+            .iter()
+            .map(|r| (r.column.as_str(), r.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("item_id", "item_id"),
+                ("id", "order_id"),
+                ("lower(code)", "sku"),
+                ("CAST(x AS INT)", "y"),
+                ("Quoted Col", "key"),
+            ]
+        );
+        assert!(references(None).is_empty());
     }
 
     #[test]

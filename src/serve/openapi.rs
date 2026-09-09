@@ -375,6 +375,29 @@ fn export_schema() -> Value {
                                 (discovered cells)." },
             "depends_on_unselected": { "type": "integer",
                 "description": "Parents left out by selection — a count, never names." },
+            "relationships": {
+                "type": "array",
+                "description": "Join keys the modeling tool declared for this export (SQLMesh \
+                                `references`), resolved within the cell: `to` is the route of \
+                                an export whose grain is exactly `to_column`, or null when no \
+                                selected export has that grain. One entry per matching export. \
+                                `to_one_verified` restates the target's `check`: true if its \
+                                last grain_unique measurement passed, false if it failed, null \
+                                if never measured. Omitted when the tool declared none.",
+                "items": {
+                    "type": "object",
+                    "required": ["column", "to", "to_column", "to_one_verified"],
+                    "properties": {
+                        "column": { "type": "string", "description": "This export's column." },
+                        "to": { "type": ["string", "null"],
+                                "description": "Route key of the target export, or null." },
+                        "to_column": { "type": "string",
+                                       "description": "The target's grain column (the alias of \
+                                                       an aliased reference, else `column`)." },
+                        "to_one_verified": { "type": ["boolean", "null"] }
+                    }
+                }
+            },
             "deployed": {
                 "type": "object",
                 "description": "What the modeling tool says about this model's deployment \
@@ -756,6 +779,11 @@ mod tests {
         // legitimately lacks it).
         assert!(export["probe"]["properties"].get("null_rows").is_some());
         assert!(export["check"]["properties"].get("null_rows").is_some());
+        // ADR 0016 amendment 2026-09-09: the declared join, resolved.
+        assert_eq!(
+            export["relationships"]["items"]["required"],
+            json!(["column", "to", "to_column", "to_one_verified"])
+        );
         assert!(!export["check"]["required"]
             .as_array()
             .unwrap()

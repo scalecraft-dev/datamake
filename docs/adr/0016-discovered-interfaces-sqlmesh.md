@@ -560,3 +560,58 @@ IAM-token state attach through the proxy, provenance (191/191 columns from
 the tool on the smaller project; 52/55 honestly `none` on the monorepo
 slice), in-cell lineage, and the refusal semantics.
 
+
+## Amendment (2026-09-09): `references` become `relationships[]`
+
+An agent reading two discovered exports had grain and lineage but no join
+key, and guessed: observed on a real estate as a double `LEFT JOIN` with a
+`COALESCE` across a dimension the model already keyed. The model had
+declared the key. SQLMesh's `references` are join keys: a reference named
+`x` joins the model whose grain is `x`, and an alias (`col AS x`) renames
+the local column to the target's key (`Reference.name` in
+`core/reference.py`; serialized by the same `_refs_to_sql` as `grains`, so
+the blob holds `["item_id", "id AS order_id"]`). §10 kept SQL, audits and
+`mapping_schema` out of the document; `references` were never in that list
+and are interface, not implementation. They now ride the reader beside
+`grains` (`StateModel.references`, `DeployedModel.references`,
+`DiscoveredExport.references`, single-column only) and land on the
+document as:
+
+```json
+"relationships": [
+  { "column": "item_id", "to": "documented@2", "to_column": "item_id", "to_one_verified": true },
+  { "column": "id", "to": null, "to_column": "order_id", "to_one_verified": null }
+]
+```
+
+- **Resolution is in-cell and exact.** `to` is the route of a discoverable
+  export in the same cell whose grain is exactly `[to_column]`; one entry
+  per match (two exports unique on the same key are both valid targets),
+  never self, never a composite grain that merely contains the key, never a
+  private or unselected model (§7's disclosure rule). Unresolved references
+  are listed with `to: null` so the agent still learns the column is a key.
+  Composite references `(a, b)` are not projected: the rule keys on a
+  single-column grain, and inventing a target for them would be a guess.
+- **`to_one_verified` is the target's own measurement,** read from the
+  counts of its last `check` (`rows == distinct_grain`): `true`, `false`,
+  or `null` when nothing measured it: no check record, a stale one, or a
+  grainless target. It is derived from the numbers rather than from
+  `source_check.outcome` so that a record carrying a failed measurement
+  reads `false` without a vocabulary change; today `verify` bails before
+  writing on any failure, so `false` waits on that behaviour, which this
+  amendment does not change. ADR 0015 §3's claim/measurement rule is
+  amended for this derived case (ADR 0015, amendment 2026-09-09).
+- **Digest.** `{column, to, to_column}` are interface (an agent composes
+  queries on them) and join the projection; `to_one_verified` stays out.
+  The projection skips an empty list, so every cell without references
+  keeps its digest across this addition. `datamk_context` stays 4.
+- **Fixture.** `incremental_model` declares
+  `references (item_id, id AS order_id)`; its prod `_snapshots` row was
+  hand-edited to carry the same list (fingerprints untouched, since a replan
+  would move `metadata_hash`, and the reader never recomputes it), so the
+  end-to-end test resolves `item_id` to two targets, leaves `order_id`
+  unresolved, and reads `to_one_verified: true` after `verify`.
+
+Not done here: a hand-authored `references:` on `interface[]` exports (the
+same block would then have a `cell.yaml` origin and need `from`), and
+cross-cell resolution (a mesh-level question).

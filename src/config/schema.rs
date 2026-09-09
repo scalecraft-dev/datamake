@@ -338,6 +338,11 @@ pub struct DiscoveredExport {
     pub depends_on: Vec<String>,
     /// How many parents selection left out — a count, never their names.
     pub depends_on_unselected: usize,
+    /// The model's declared join keys (SQLMesh `references`), verbatim
+    /// from the tool; resolved to routes in the document's
+    /// `relationships[]` (ADR 0016 amendment 2026-09-09).
+    #[serde(default)]
+    pub references: Vec<crate::catalog::ir::Reference>,
     /// `synced_at` — the measurement's timestamp.
     pub at: String,
 }

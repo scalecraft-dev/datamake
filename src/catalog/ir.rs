@@ -93,6 +93,10 @@ pub struct DeployedModel {
     pub columns_source: ColumnsSource,
     #[serde(default)]
     pub grain: Vec<String>,
+    /// Join keys the model declares (SQLMesh `references`), in declared
+    /// order. Single-column only; see `Reference`.
+    #[serde(default)]
+    pub references: Vec<Reference>,
     /// Unquoted model names of this model's parents (one hop).
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -102,6 +106,19 @@ pub struct DeployedModel {
     pub intervals: Option<Interval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_restatement: Option<bool>,
+}
+
+/// One join key a model declares (SQLMesh `references (col)` or
+/// `references (col AS name)`): `column` is the model's own column,
+/// `name` is the key it joins on: the alias when one is written, else the
+/// column itself. SQLMesh's own join rule is "a reference named X joins the
+/// model whose grain is X", and the document's `relationships[]` resolves
+/// it the same way. Composite references (`(a, b)`) are not carried: the
+/// rule keys on a single-column grain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reference {
+    pub column: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

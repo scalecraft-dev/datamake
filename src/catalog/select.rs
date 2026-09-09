@@ -259,6 +259,7 @@ pub fn materialize(
                 pending_restatement: m.pending_restatement,
                 depends_on,
                 depends_on_unselected,
+                references: m.references.clone(),
                 at: catalog.synced_at.clone(),
             }),
         });
@@ -301,6 +302,7 @@ mod tests {
             columns: IndexMap::new(),
             columns_source: ColumnsSource::Warehouse,
             grain: Vec::new(),
+            references: Vec::new(),
             depends_on: Vec::new(),
             intervals: None,
             pending_restatement: None,

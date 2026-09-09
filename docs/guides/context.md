@@ -46,6 +46,7 @@ Flat document. A record with `from` is a **claim** (origin per field:
 | `exports[]` | Per export: `name`, `version`, `route`, `contract`, `description`, `grain`, `freshness`, `schema`, and exactly one of `query` / `binding`. |
 | `exports[].schema.<col>` | `type`, optional `unit`, `description`, `from`. |
 | `exports[].query` | `filters`, `filter_semantics`, `limit_default` 100, `limit_max` 1000, `offset_max` 1000000, `sample_request`. |
+| `exports[].relationships[]` | Discovered exports: the tool's declared join keys, resolved in-cell. `column`, `to` (route whose grain is exactly `to_column`, or `null`), `to_column`, `to_one_verified` (target's last `check`: `true`/`false`/`null`). Absent when none declared. |
 | `exports[].probe` | At swap: `at`, `rows`, `coverage` (min/max per grain col), `values` (per col, with `complete`), `null_rows` (per grain col), `example_request` (from one real row). |
 | `exports[].check` | Live-check measurement (bound exports): `at`, `check`, `grain`, `rows`, `distinct_grain`, `null_rows`. Absent when no grain is declared. |
 | `exports[].freshness` | Author's `freshness:` verbatim. Advisory only, never measured. |

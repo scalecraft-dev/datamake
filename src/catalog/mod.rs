@@ -463,6 +463,7 @@ fn read_sqlmesh(
             columns,
             columns_source,
             grain: m.grain.clone(),
+            references: m.references.clone(),
             depends_on: m.depends_on.clone(),
             intervals: interval,
             pending_restatement: intervals.get(&m.raw_name).map(|r| r.pending_restatement),
@@ -725,6 +726,22 @@ mod tests {
         assert_eq!(inc["depends_on_unselected"], 1);
         assert!(inc.get("depends_on").is_none());
         assert_eq!(inc["grain"], serde_json::json!(["id", "event_date"]));
+        // `references (item_id, id AS order_id)`: `item_id` resolves to
+        // every selected export whose grain is exactly that column (route
+        // order); `order_id` is no export's grain, so it is listed with
+        // `to: null`. Nothing has been verified yet.
+        assert_eq!(
+            inc["relationships"],
+            serde_json::json!([
+                { "column": "item_id", "to": "documented@2",
+                  "to_column": "item_id", "to_one_verified": null },
+                { "column": "item_id", "to": "sqlmesh_example_full_model@1",
+                  "to_column": "item_id", "to_one_verified": null },
+                { "column": "id", "to": null,
+                  "to_column": "order_id", "to_one_verified": null }
+            ])
+        );
+        assert!(full.get("relationships").is_none());
 
         // The dev environment's edit never leaks into prod's document.
         assert!(!serde_json::to_string(&v)
@@ -736,6 +753,27 @@ mod tests {
         let doc = crate::context::build_document(&file, "local", true).unwrap();
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "verified_at_source", "{v}");
+        // The targets' grain checks passed, so the joins are one-to-one.
+        let inc = v["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "sqlmesh_example_incremental_model")
+            .unwrap();
+        let verified: Vec<serde_json::Value> = inc["relationships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["to_one_verified"].clone())
+            .collect();
+        assert_eq!(
+            verified,
+            vec![
+                serde_json::json!(true),
+                serde_json::json!(true),
+                serde_json::Value::Null
+            ]
+        );
 
         // `run` refuses with the sync hint; `attach`/`rollback` refuse.
         let err = crate::engine::run(&file, "local", None, crate::engine::RunOptions::default())

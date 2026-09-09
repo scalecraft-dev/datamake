@@ -6,6 +6,21 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added: `exports[].relationships[]` on discovered cells (ADR 0016 amendment 2026-09-09)
+
+A discovered export served grain and lineage but not join keys, so an
+agent querying two exports guessed the join (observed: a double LEFT JOIN
+with COALESCE over a dimension). SQLMesh models declare `references`
+natively; `sync` now reads them beside `grains`, and the document projects
+each as `{column, to, to_column, to_one_verified}`: `to` is the route of an
+export in the same cell whose grain is exactly that key (one entry per
+match, `null` when none, so the key is still named), `to_column` is the
+alias of a `col AS name` reference or the column itself, and
+`to_one_verified` restates the target's last `check` (`true`, `false`, or
+`null` when never checked). The declared join is in the interface digest;
+`to_one_verified` is not, and a cell with no references keeps its digest.
+Composite references are not projected. `datamk_context` stays 4.
+
 ### Added — `datamk mcp` (issue #32, ADR 0012 amendment 2026-09-05)
 
 The served interface as an MCP server over stdio. Three tools, whatever
