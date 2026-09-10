@@ -367,6 +367,18 @@ fn artifact_files(art: &CellArtifact) -> Vec<&ArtifactFile> {
     if let Some(catalog) = &art.deployed_catalog {
         files.push(catalog);
     }
+    // ADR 0018 §4: the ingested Ossie semantic model, mounted the same way
+    // — a future verify/context/serve phase reads it off disk, never the
+    // `semantic_model:` source directly.
+    if let Some(semantic_model) = &art.semantic_model {
+        files.push(semantic_model);
+    }
+    // ADR 0018 §6: `.cell/semantic_check.json`, mounted the same way —
+    // `serve`'s startup load needs it to surface verified semantic claims
+    // on the hosted door without re-running plan-time checks in-cluster.
+    if let Some(semantic_check) = &art.semantic_check {
+        files.push(semantic_check);
+    }
     files
 }
 

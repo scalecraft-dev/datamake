@@ -1,0 +1,55 @@
+version: 0.1.1
+semantic_model:
+  - name: invoice
+    description: Customer invoicing.
+    ai_context:
+      instructions: Use for revenue and billing questions.
+      synonyms: [billing, invoicing]
+    datasets:
+      - name: invoice
+        source: '"dw-main-silver".invoice.flight_spend'
+        primary_key: [invoice_id]
+        description: One row per invoice line.
+        ai_context:
+          instructions: Use for revenue questions.
+          synonyms: [invoices, bills]
+        fields:
+          - name: invoice_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: invoice_id
+          - name: account_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: account_id
+          - name: amount
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: amount
+            ai_context: The invoiced amount, gross, in USD.
+      - name: account
+        source: '"dw-main-silver".invoice.account'
+        primary_key: [account_id]
+        description: One row per billing account.
+        fields:
+          - name: account_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: account_id
+    relationships:
+      - name: invoice_to_account
+        from: invoice
+        to: account
+        from_columns: [account_id]
+        to_columns: [account_id]
+    metrics:
+      - name: total_invoiced
+        description: Sum of invoiced amounts.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(amount)

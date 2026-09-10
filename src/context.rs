@@ -110,6 +110,30 @@ pub struct ContextDocument {
     pub docs: Vec<DocsDoc>,
     /// The affordance to fetch docs content — a constant, always present.
     pub include_request: String,
+    /// The Ossie semantic-model index (ADR 0018 §7) — always present,
+    /// `[]` without a bound `semantic_model:`. Full detail lives behind
+    /// `?model=`/`--model` (`semantic_model`) or per-route in
+    /// `exports[].semantic`.
+    pub semantic_models: Vec<SemanticModelIndexDoc>,
+    /// The bound semantic model's own provenance (ADR 0018 §4/§7) — a
+    /// measurement, outside every digest. Present iff `semantic_model:` is
+    /// declared and `.cell/semantic_model.json` is fresh; `checked_at` is
+    /// additionally gated on a fresh `.cell/semantic_check.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticBlock>,
+    /// One semantic model in full (ADR 0018 §7) — `?model=`/`--model` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<SemanticModelDoc>,
+    /// `?terms=`/`--terms` hits against an Ossie dataset, field, metric or
+    /// synonym (ADR 0018 §7) — always present (`[]` when nothing was asked
+    /// or nothing Ossie-side matched); a term with both a `definitions:` hit
+    /// and an Ossie hit appears in both `definitions` and here.
+    pub semantic_matches: Vec<SemanticMatch>,
+    /// Every addressable Ossie token, resolved against on `?terms=` and
+    /// folded into `interface_digest` — never serialized; a request-time
+    /// resolution aid `narrow_terms` carries alongside `definitions`.
+    #[serde(skip)]
+    pub semantic_lookup: Vec<SemanticLookupEntry>,
     /// Build provenance from the published run summary (ADR 0012 §5).
     /// Absent when no published execution stands behind the document — a
     /// direct-attach cell writes no summary; that absence is served as-is,
@@ -313,6 +337,13 @@ pub struct ExportDoc {
     /// and not only that it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub check: Option<ExportCheck>,
+    /// Every Ossie dataset bound to this route (ADR 0018 §7) — `[]` without
+    /// a bound semantic model, or when nothing binds to this route.
+    /// `verified`/`primary_key_check`/relationship and metric `status`
+    /// overlay from a fresh `.cell/semantic_check.json` in `assemble`; the
+    /// dataset/field claims themselves are structural, from `interface`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub semantic: Vec<DatasetDoc>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -702,6 +733,218 @@ pub struct DataBlock {
     pub channels: Vec<String>,
 }
 
+/// One semantic model, in the `/context` whole-cell index (ADR 0018 §7) —
+/// name, prose, source file and counts only, never its datasets or fields
+/// (that's `semantic_model`, gated behind `?model=`). Always present in
+/// full, on every door, the same as `semantic_models` itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticModelIndexDoc {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub file: String,
+    pub datasets: usize,
+    pub bound: usize,
+    pub metrics: usize,
+}
+
+/// The served/emitted form of `Resolved` (ADR 0018 §4/§7, M7):
+/// `{"commit": "…"}` for a git source, `{"dir": true}` for a directory
+/// source — never `Resolved::Dir`'s absolute path, which names a directory
+/// on the sync host and stays in the sidecar (`.cell/semantic_model.json`)
+/// only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ResolvedDoc {
+    Commit { commit: String },
+    Dir { dir: bool },
+}
+
+impl From<&crate::ossie::record::Resolved> for ResolvedDoc {
+    fn from(r: &crate::ossie::record::Resolved) -> Self {
+        match r {
+            crate::ossie::record::Resolved::Commit { commit } => ResolvedDoc::Commit {
+                commit: commit.clone(),
+            },
+            crate::ossie::record::Resolved::Dir { .. } => ResolvedDoc::Dir { dir: true },
+        }
+    }
+}
+
+/// The ingested semantic model's own provenance (ADR 0018 §4/§7) — a
+/// measurement, outside every digest. `synced_at`/`content_sha256`/
+/// `resolved`/`files` are `datamk sync`'s stamp; `checked_at` is `datamk
+/// verify`'s, present only when a fresh `.cell/semantic_check.json` binds.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticBlock {
+    pub synced_at: String,
+    pub content_sha256: String,
+    pub resolved: ResolvedDoc,
+    pub files: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+}
+
+/// One Ossie field, as the document emits it (ADR 0018 §7). `expression` is
+/// the field's `ANSI_SQL` variant only — the one dialect datamk ever
+/// plan-checks or surfaces; `dialects` names every variant the field
+/// actually declares, so an agent can tell "no ANSI_SQL" from "no field."
+/// `verified`/`reason` overlay from a fresh `.cell/semantic_check.json`
+/// (`assemble`) — a measurement beside the claim, never in the digest.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldDoc {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    pub dialects: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datatype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_time: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_context: Option<crate::ossie::AiContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One Ossie relationship touching a dataset (ADR 0018 §7) — the other
+/// side's route when it's bound, `null` when it isn't; `status` overlays
+/// from a fresh check (`"verified"`/`"unbound"`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RelationshipDoc {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub from_columns: Vec<String>,
+    pub to_columns: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// One Ossie metric (ADR 0018 §7) — `expression` is its `ANSI_SQL` variant
+/// only (`null` for a foreign-dialect-only metric); `status` overlays from a
+/// fresh check (`"verified"`, `"unverified:dialect"`, `"unverified:unbound"`).
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricDoc {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datatype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_context: Option<crate::ossie::AiContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// A pointer to a metric of the same model that references a dataset but
+/// isn't fully checkable from that dataset's own route alone (ADR 0018 §7)
+/// — one or more of the metric's other referenced datasets bind to a
+/// different route, or none at all. Never the expression: an agent wanting
+/// the full metric follows `model` to `?model=<model>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricRef {
+    pub name: String,
+    pub model: String,
+}
+
+/// One Ossie dataset (ADR 0018 §7) — shared shape between `exports[].
+/// semantic[]` (route-scoped: `routes` still lists every route it binds to,
+/// which may be more than the one being served) and `semantic_model.
+/// datasets[]` (whole-model: an unbound dataset appears with `routes: []`).
+/// `from` names which of `description`/`ai_context`/`fields` are present,
+/// always `"ossie"` (ADR 0015 §2) — Ossie content is never authored by
+/// datamake, so there is no second origin it could carry.
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetDoc {
+    pub model: String,
+    pub dataset: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_context: Option<crate::ossie::AiContext>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub from: FromMap,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub primary_key: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_key_check: Option<String>,
+    /// Every route this dataset binds to (ADR 0018 §5: a dataset can bind
+    /// to two majors); `[]` for a dataset `semantic_model` lists but nothing
+    /// binds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<FieldDoc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipDoc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricDoc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metric_refs: Vec<MetricRef>,
+}
+
+/// One semantic model in full (ADR 0018 §7) — `?model=`/`--model` only,
+/// never part of the default document. Includes every dataset the model
+/// declares, bound or not (an unbound dataset carries `routes: []`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticModelDoc {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_context: Option<crate::ossie::AiContext>,
+    pub file: String,
+    pub datasets: Vec<DatasetDoc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipDoc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricDoc>,
+}
+
+/// One `?terms=` hit against an Ossie name or synonym (ADR 0018 §7, M8) —
+/// `kind` is `"model"`, `"dataset"`, `"field"`, `"metric"`, or `"synonym"`.
+/// `dataset`/`field` are `None` for a `"model"` hit (it names no one of
+/// those). Every hit is returned, so a token colliding across two models
+/// lists both.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticMatch {
+    pub token: String,
+    pub kind: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One addressable Ossie token, indexed once (ADR 0018 §7) so `?terms=`
+/// resolution and `interface_digest`'s lookup keys never re-walk
+/// `SemanticIndex`. Not on the wire — `ContextDocument::semantic_lookup` is
+/// `#[serde(skip)]`; `SemanticMatch` is what a request actually returns.
+#[derive(Debug, Clone)]
+pub struct SemanticLookupEntry {
+    pub token: String,
+    pub kind: String,
+    pub model: String,
+    pub dataset: Option<String>,
+    pub field: Option<String>,
+    pub description: Option<String>,
+}
+
 /// The interface as a whole — every claim, no measurements: what the digest
 /// covers, and what `serve` precomputes once at startup (the interface never
 /// changes for the lifetime of the process). `assemble` lays measurements
@@ -723,6 +966,14 @@ pub struct Interface {
     /// Any `sha256`/`bytes`/`content` present here is ignored by the digest.
     pub docs: Vec<DocsDoc>,
     pub include_request: String,
+    /// ADR 0018 §7: always present (`[]` without a bound semantic model).
+    pub semantic_models: Vec<SemanticModelIndexDoc>,
+    /// `checked_at` is always `None` here — `interface` has no access to
+    /// `.cell/semantic_check.json`; `assemble` overlays it from `Facts`.
+    pub semantic: Option<SemanticBlock>,
+    /// Every addressable Ossie name/synonym, indexed once. Feeds
+    /// `semantic_matches` resolution and `interface_digest`'s lookup keys.
+    pub semantic_lookup: Vec<SemanticLookupEntry>,
 }
 
 /// The one visibility-filtered route list every consumer reads (ADR 0012 §4):
@@ -794,6 +1045,16 @@ pub fn interface(
     routes: &[(String, Export)],
     source_descriptions: &IndexMap<String, IndexMap<String, String>>,
 ) -> Interface {
+    // M1: every consumer of this document reads the index restricted to
+    // `routes` (already the visibility-filtered list, ADR 0012 §4) — never
+    // `def.semantic` directly, which is bound against the full interface
+    // and would leak a private export's route key into `DatasetDoc.routes`
+    // and `semantic_models[].bound`.
+    let route_keys: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+    let semantic_index = def
+        .semantic
+        .as_ref()
+        .map(|idx| idx.restricted_to(&route_keys));
     let exports = routes
         .iter()
         .map(|(route, e)| {
@@ -849,6 +1110,10 @@ pub fn interface(
                 deployed: e.discovered.as_ref().map(DeployedBlock::from),
                 probe: None,
                 check: None,
+                semantic: semantic_index
+                    .as_ref()
+                    .map(|index| route_semantic_docs(index, route))
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -874,6 +1139,21 @@ pub fn interface(
         from.insert("description".to_string(), Origin::CellYaml);
     }
 
+    let (semantic_models, semantic, semantic_lookup) = match &semantic_index {
+        Some(index) => (
+            semantic_models_index(index),
+            Some(SemanticBlock {
+                synced_at: index.synced_at().to_string(),
+                content_sha256: index.content_sha256().to_string(),
+                resolved: ResolvedDoc::from(index.resolved()),
+                files: index.files().len(),
+                checked_at: None, // `assemble` overlays from a fresh semantic-check record
+            }),
+            semantic_lookup_entries(index),
+        ),
+        None => (Vec::new(), None, Vec::new()),
+    };
+
     Interface {
         description: def.description.clone(),
         from,
@@ -884,6 +1164,483 @@ pub fn interface(
         definitions_request: DEFINITIONS_REQUEST.to_string(),
         docs: docs_entries(def, routes),
         include_request: INCLUDE_DOCS_REQUEST.to_string(),
+        semantic_models,
+        semantic,
+        semantic_lookup,
+    }
+}
+
+/// `semantic_models[]` (ADR 0018 §7): one summary row per Ossie model,
+/// counting how many of its datasets are bound to this cell's exports.
+fn semantic_models_index(index: &crate::ossie::bind::SemanticIndex) -> Vec<SemanticModelIndexDoc> {
+    index
+        .models()
+        .iter()
+        .map(|m| {
+            let bound = m
+                .datasets
+                .iter()
+                .filter(|d| !index.route_for(&m.name, &d.name).is_empty())
+                .count();
+            SemanticModelIndexDoc {
+                name: m.name.clone(),
+                description: m.description.clone(),
+                file: index
+                    .model_files()
+                    .get(&m.name)
+                    .cloned()
+                    .unwrap_or_default(),
+                datasets: m.datasets.len(),
+                bound,
+                metrics: m.metrics.len(),
+            }
+        })
+        .collect()
+}
+
+/// Every dataset bound to `route`, as `DatasetDoc`s with `metrics`/
+/// `metric_refs` already split (ADR 0018 §7). Verification (`verified`,
+/// `primary_key_check`, relationship/metric `status`) is not filled here —
+/// `interface` builds claims only; `assemble` overlays measurements from a
+/// fresh `.cell/semantic_check.json`.
+fn route_semantic_docs(index: &crate::ossie::bind::SemanticIndex, route: &str) -> Vec<DatasetDoc> {
+    index
+        .datasets_for_route(route)
+        .into_iter()
+        .filter_map(|(model_name, ds)| {
+            let model = index.model(model_name)?;
+            let mut doc = dataset_doc(model, ds, index);
+            let (full, refs) = metrics_for_route_dataset(model, &ds.name, route, index);
+            doc.metrics = full;
+            doc.metric_refs = refs;
+            Some(doc)
+        })
+        .collect()
+}
+
+/// One Ossie dataset's claims (ADR 0018 §7) — `metrics`/`metric_refs` are
+/// left empty; callers fill them (`route_semantic_docs` splits full vs.
+/// pointer per route, `semantic_model_doc` fills every referencing metric
+/// in full since there's no narrower route to reduce to).
+fn dataset_doc(
+    model: &crate::ossie::SemanticModel,
+    ds: &crate::ossie::Dataset,
+    index: &crate::ossie::bind::SemanticIndex,
+) -> DatasetDoc {
+    let mut from = FromMap::new();
+    if ds.description.is_some() {
+        from.insert("description".to_string(), Origin::Ossie);
+    }
+    if ds.ai_context.is_some() {
+        from.insert("ai_context".to_string(), Origin::Ossie);
+    }
+    if !ds.fields.is_empty() {
+        from.insert("fields".to_string(), Origin::Ossie);
+    }
+    let relationships = model
+        .relationships
+        .iter()
+        .filter(|r| r.from == ds.name || r.to == ds.name)
+        .map(|r| relationship_doc(r, index, &model.name))
+        .collect();
+    DatasetDoc {
+        model: model.name.clone(),
+        dataset: ds.name.clone(),
+        source: ds.source.clone(),
+        description: ds.description.clone(),
+        ai_context: ds.ai_context.clone(),
+        from,
+        primary_key: ds.primary_key.clone(),
+        primary_key_check: None,
+        routes: index.route_for(&model.name, &ds.name).to_vec(),
+        fields: ds.fields.iter().map(field_doc).collect(),
+        relationships,
+        metrics: Vec::new(),
+        metric_refs: Vec::new(),
+    }
+}
+
+fn field_doc(f: &crate::ossie::Field) -> FieldDoc {
+    let dialects: Vec<String> = f
+        .expression
+        .dialects
+        .iter()
+        .map(|d| d.dialect.as_str().to_string())
+        .collect();
+    FieldDoc {
+        name: f.name.clone(),
+        expression: crate::ossie::verify::ansi_sql(&f.expression).map(str::to_string),
+        dialects,
+        datatype: f.datatype.map(|dt| format!("{dt:?}")),
+        is_time: f.dimension.as_ref().and_then(|d| d.is_time),
+        description: f.description.clone(),
+        ai_context: f.ai_context.clone(),
+        verified: None,
+        reason: None,
+    }
+}
+
+fn relationship_doc(
+    r: &crate::ossie::Relationship,
+    index: &crate::ossie::bind::SemanticIndex,
+    model_name: &str,
+) -> RelationshipDoc {
+    RelationshipDoc {
+        name: r.name.clone(),
+        from: r.from.clone(),
+        to: r.to.clone(),
+        from_columns: r.from_columns.clone(),
+        to_columns: r.to_columns.clone(),
+        from_route: index.route_for(model_name, &r.from).first().cloned(),
+        to_route: index.route_for(model_name, &r.to).first().cloned(),
+        status: None,
+    }
+}
+
+fn metric_doc(m: &crate::ossie::Metric) -> MetricDoc {
+    MetricDoc {
+        name: m.name.clone(),
+        expression: crate::ossie::verify::ansi_sql(&m.expression).map(str::to_string),
+        datatype: m.datatype.map(|dt| format!("{dt:?}")),
+        description: m.description.clone(),
+        ai_context: m.ai_context.clone(),
+        status: None,
+    }
+}
+
+/// Every dataset a metric's `ANSI_SQL` expression touches (ADR 0018 §6/§7):
+/// `referenced_datasets`' own result when non-empty, else "every currently
+/// bound dataset of the model" — the same fallback `check_metrics` applies
+/// when a metric qualifies no dataset by name (e.g. `COUNT(*)`), so a metric
+/// is checkable/placeable under the identical rule in both places.
+fn metric_target_set<'a>(
+    model: &'a crate::ossie::SemanticModel,
+    expr: &str,
+    index: &crate::ossie::bind::SemanticIndex,
+) -> Vec<&'a crate::ossie::Dataset> {
+    let referenced = crate::ossie::verify::referenced_datasets(model, expr);
+    if !referenced.is_empty() {
+        return referenced;
+    }
+    model
+        .datasets
+        .iter()
+        .filter(|d| !index.route_for(&model.name, &d.name).is_empty())
+        .collect()
+}
+
+/// Split `model`'s metrics between "full" (every referenced dataset is
+/// bound to `route` specifically) and "pointer only" (`metric_refs`) for
+/// one dataset on one route (ADR 0018 §7). A dialect-only metric (no
+/// `ANSI_SQL` variant) appears in neither — it still lists in full under
+/// `semantic_model.metrics[]`, which is unconditional.
+fn metrics_for_route_dataset(
+    model: &crate::ossie::SemanticModel,
+    ds_name: &str,
+    route: &str,
+    index: &crate::ossie::bind::SemanticIndex,
+) -> (Vec<MetricDoc>, Vec<MetricRef>) {
+    let mut full = Vec::new();
+    let mut refs = Vec::new();
+    for m in &model.metrics {
+        let Some(expr) = crate::ossie::verify::ansi_sql(&m.expression) else {
+            continue;
+        };
+        let target_set = metric_target_set(model, expr, index);
+        if !target_set.iter().any(|d| d.name == ds_name) {
+            continue;
+        }
+        let is_full = target_set.iter().all(|d| {
+            index
+                .route_for(&model.name, &d.name)
+                .iter()
+                .any(|r| r == route)
+        });
+        if is_full {
+            full.push(metric_doc(m));
+        } else {
+            refs.push(MetricRef {
+                name: m.name.clone(),
+                model: model.name.clone(),
+            });
+        }
+    }
+    (full, refs)
+}
+
+/// The `AiContextDetail.synonyms` of an `ai_context`, when it's the object
+/// form — the string form carries no synonyms by construction.
+fn synonyms_of(ai: &Option<crate::ossie::AiContext>) -> &[String] {
+    match ai {
+        Some(crate::ossie::AiContext::Detail(d)) => &d.synonyms,
+        _ => &[],
+    }
+}
+
+/// Whether a token is addressable via `?terms=`/`--terms` (ADR 0018 §7):
+/// `[A-Za-z0-9_.-]{1,64}`. A synonym outside this grammar is kept in
+/// `semantic_model`'s prose but never indexed here — `datamk sync` warns
+/// about it at ingest time.
+pub(crate) fn is_addressable_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Every addressable Ossie name/synonym across the whole bound semantic
+/// model (ADR 0018 §7, M6/M8), indexed once: dataset and field
+/// names/synonyms point at their dataset; metric names/synonyms point at
+/// their metric; a model's own name and `ai_context.synonyms` are indexed
+/// too, `kind: "model"`, `dataset`/`field` both `None` — `datamk sync`
+/// warns about a model-level synonym that fails the token grammar on the
+/// same premise as every other level (that it would otherwise be
+/// addressable), so it must actually be indexed here. `is_addressable_token`
+/// gates every name here, not just synonyms — a dataset/field/metric/model
+/// name with a space would otherwise reach `?terms=`'s lookup and the
+/// `model` OpenAPI enum and then 400 at the door; a non-addressable name
+/// stays in the document (`semantic_model`/`exports[].semantic`), just not
+/// in this index.
+fn semantic_lookup_entries(index: &crate::ossie::bind::SemanticIndex) -> Vec<SemanticLookupEntry> {
+    let mut out = Vec::new();
+    for model in index.models() {
+        if is_addressable_token(&model.name) {
+            out.push(SemanticLookupEntry {
+                token: model.name.clone(),
+                kind: "model".to_string(),
+                model: model.name.clone(),
+                dataset: None,
+                field: None,
+                description: model.description.clone(),
+            });
+        }
+        for syn in synonyms_of(&model.ai_context)
+            .iter()
+            .filter(|s| is_addressable_token(s))
+        {
+            out.push(SemanticLookupEntry {
+                token: syn.clone(),
+                kind: "synonym".to_string(),
+                model: model.name.clone(),
+                dataset: None,
+                field: None,
+                description: model.description.clone(),
+            });
+        }
+        for ds in &model.datasets {
+            if !is_addressable_token(&ds.name) {
+                continue;
+            }
+            out.push(SemanticLookupEntry {
+                token: ds.name.clone(),
+                kind: "dataset".to_string(),
+                model: model.name.clone(),
+                dataset: Some(ds.name.clone()),
+                field: None,
+                description: ds.description.clone(),
+            });
+            for syn in synonyms_of(&ds.ai_context)
+                .iter()
+                .filter(|s| is_addressable_token(s))
+            {
+                out.push(SemanticLookupEntry {
+                    token: syn.clone(),
+                    kind: "synonym".to_string(),
+                    model: model.name.clone(),
+                    dataset: Some(ds.name.clone()),
+                    field: None,
+                    description: ds.description.clone(),
+                });
+            }
+            for f in &ds.fields {
+                if is_addressable_token(&f.name) {
+                    out.push(SemanticLookupEntry {
+                        token: f.name.clone(),
+                        kind: "field".to_string(),
+                        model: model.name.clone(),
+                        dataset: Some(ds.name.clone()),
+                        field: Some(f.name.clone()),
+                        description: f.description.clone(),
+                    });
+                }
+                for syn in synonyms_of(&f.ai_context)
+                    .iter()
+                    .filter(|s| is_addressable_token(s))
+                {
+                    out.push(SemanticLookupEntry {
+                        token: syn.clone(),
+                        kind: "synonym".to_string(),
+                        model: model.name.clone(),
+                        dataset: Some(ds.name.clone()),
+                        field: Some(f.name.clone()),
+                        description: f.description.clone(),
+                    });
+                }
+            }
+        }
+        for m in &model.metrics {
+            if is_addressable_token(&m.name) {
+                out.push(SemanticLookupEntry {
+                    token: m.name.clone(),
+                    kind: "metric".to_string(),
+                    model: model.name.clone(),
+                    dataset: None,
+                    field: None,
+                    description: m.description.clone(),
+                });
+            }
+            for syn in synonyms_of(&m.ai_context)
+                .iter()
+                .filter(|s| is_addressable_token(s))
+            {
+                out.push(SemanticLookupEntry {
+                    token: syn.clone(),
+                    kind: "synonym".to_string(),
+                    model: model.name.clone(),
+                    dataset: None,
+                    field: None,
+                    description: m.description.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Case-insensitive resolution of `tokens` against `lookup` (ADR 0018 §7) —
+/// every hit is returned, so a token colliding across two models' datasets
+/// (or a dataset and a metric) lists both, each naming its model. Shared by
+/// the served door (`serve::resolve_terms`'s Ossie half) and the portable
+/// door (`narrow_terms`).
+pub fn resolve_semantic_matches(
+    tokens: &[String],
+    lookup: &[SemanticLookupEntry],
+) -> Vec<SemanticMatch> {
+    let mut out = Vec::new();
+    for tok in tokens {
+        for entry in lookup {
+            if entry.token.eq_ignore_ascii_case(tok) {
+                out.push(SemanticMatch {
+                    token: tok.clone(),
+                    kind: entry.kind.clone(),
+                    model: entry.model.clone(),
+                    dataset: entry.dataset.clone(),
+                    field: entry.field.clone(),
+                    description: entry.description.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Overlay a fresh `.cell/semantic_check.json`'s verification onto one
+/// `DatasetDoc` (ADR 0018 §7): `primary_key_check`, per-field `verified`/
+/// `reason`, and relationship/metric `status`. `route` is the exact route
+/// the check was run against (`Some` for `exports[].semantic`, keyed
+/// identically to `verify::check`'s own write); `semantic_model_doc` passes
+/// the dataset's first bound route (or `None`) since a whole-model view has
+/// no single route to disambiguate a multiply-bound dataset by.
+fn overlay_semantic_dataset(
+    doc: &mut DatasetDoc,
+    route: Option<&str>,
+    check: &crate::ossie::record::SemanticCheckRecord,
+) {
+    let key = crate::ossie::verify::dataset_key(&doc.model, &doc.dataset, route);
+    if let Some(dc) = check.datasets.get(&key) {
+        doc.primary_key_check = Some(dc.primary_key.clone());
+        for f in &mut doc.fields {
+            if let Some(fc) = dc.fields.get(&f.name) {
+                f.verified = Some(fc.verified);
+                f.reason.clone_from(&fc.reason);
+            }
+        }
+    }
+    for r in &mut doc.relationships {
+        if let Some(status) = check
+            .relationships
+            .get(&format!("{}/{}", doc.model, r.name))
+        {
+            r.status = Some(status.clone());
+        }
+    }
+    for m in &mut doc.metrics {
+        if let Some(status) = check.metrics.get(&format!("{}/{}", doc.model, m.name)) {
+            m.status = Some(status.clone());
+        }
+    }
+}
+
+/// One semantic model in full (ADR 0018 §7): `?model=`/`--model`. Every
+/// dataset the model declares, bound or not; every metric that references a
+/// dataset lists in full (there is no narrower route to reduce a whole-model
+/// view to, unlike `exports[].semantic`'s per-route `metrics`/
+/// `metric_refs` split). `check`, when given, overlays verification exactly
+/// as `assemble` does for the route-scoped view.
+pub fn semantic_model_doc(
+    model: &crate::ossie::SemanticModel,
+    index: &crate::ossie::bind::SemanticIndex,
+    check: Option<&crate::ossie::record::SemanticCheckRecord>,
+) -> SemanticModelDoc {
+    let datasets = model
+        .datasets
+        .iter()
+        .map(|ds| {
+            let mut doc = dataset_doc(model, ds, index);
+            doc.metrics = model
+                .metrics
+                .iter()
+                .filter(|m| {
+                    crate::ossie::verify::ansi_sql(&m.expression).is_some_and(|expr| {
+                        let target_set = metric_target_set(model, expr, index);
+                        target_set.iter().any(|d| d.name == ds.name)
+                    })
+                })
+                .map(metric_doc)
+                .collect();
+            if let Some(check) = check {
+                let route = index
+                    .route_for(&model.name, &ds.name)
+                    .first()
+                    .map(String::as_str);
+                overlay_semantic_dataset(&mut doc, route, check);
+            }
+            doc
+        })
+        .collect();
+    let mut relationships: Vec<RelationshipDoc> = model
+        .relationships
+        .iter()
+        .map(|r| relationship_doc(r, index, &model.name))
+        .collect();
+    let mut metrics: Vec<MetricDoc> = model.metrics.iter().map(metric_doc).collect();
+    if let Some(check) = check {
+        for r in &mut relationships {
+            if let Some(status) = check
+                .relationships
+                .get(&format!("{}/{}", model.name, r.name))
+            {
+                r.status = Some(status.clone());
+            }
+        }
+        for m in &mut metrics {
+            if let Some(status) = check.metrics.get(&format!("{}/{}", model.name, m.name)) {
+                m.status = Some(status.clone());
+            }
+        }
+    }
+    SemanticModelDoc {
+        name: model.name.clone(),
+        description: model.description.clone(),
+        ai_context: model.ai_context.clone(),
+        file: index
+            .model_files()
+            .get(&model.name)
+            .cloned()
+            .unwrap_or_default(),
+        datasets,
+        relationships,
+        metrics,
     }
 }
 
@@ -1109,6 +1866,13 @@ pub struct Facts {
     /// `NOTE_NOTHING_BUILT`, which reads as "not yet" for a cell that never
     /// will be.
     pub is_all_never: bool,
+    /// ADR 0018 §6/§7: the fresh `.cell/semantic_check.json` record, when
+    /// one binds — read once (startup for `serve`, once per `datamk
+    /// context` invocation), never on the request path. Overlays
+    /// `semantic.checked_at` and every `exports[].semantic[]` entry's
+    /// verification; absent leaves every claim un-overlaid (`verified`/
+    /// `primary_key_check`/`status` all `None`), never fabricated as passing.
+    pub semantic_check: Option<crate::ossie::record::SemanticCheckRecord>,
 }
 
 /// Assemble a document from prebuilt facts (how the serve handler works —
@@ -1140,6 +1904,7 @@ pub fn assemble(facts: Facts) -> ContextDocument {
         channels,
         direct_attach,
         is_all_never,
+        semantic_check,
     } = facts;
     let status = if provenance.is_some() {
         Status::Verified
@@ -1204,6 +1969,15 @@ pub fn assemble(facts: Facts) -> ContextDocument {
             if let Some(check) = &e.check {
                 notes.extend(empty_claim_notes(&e, definitions, check));
             }
+            // ADR 0018 §7: overlay verification onto every Ossie dataset
+            // bound to this route, keyed by the exact route being served —
+            // never `route_for(..).first()`, which is `semantic_model_doc`'s
+            // whole-model fallback for a dataset with no single route.
+            if let Some(check) = &semantic_check {
+                for ds_doc in &mut e.semantic {
+                    overlay_semantic_dataset(ds_doc, Some(&e.route), check);
+                }
+            }
             e
         })
         .collect();
@@ -1235,6 +2009,15 @@ pub fn assemble(facts: Facts) -> ContextDocument {
         })
         .collect();
 
+    // ADR 0018 §7: `checked_at` is the one piece of `semantic` that a
+    // startup-fixed `Interface` can't supply — everything else
+    // (`synced_at`/`content_sha256`/`resolved`/`files`) came from `datamk
+    // sync`, already on `interface.semantic`.
+    let semantic = interface.semantic.map(|mut s| {
+        s.checked_at = semantic_check.as_ref().map(|c| c.checked_at.clone());
+        s
+    });
+
     ContextDocument {
         datamk_context: DATAMK_CONTEXT_VERSION,
         cell,
@@ -1250,6 +2033,11 @@ pub fn assemble(facts: Facts) -> ContextDocument {
         definitions_request: interface.definitions_request,
         docs,
         include_request: interface.include_request,
+        semantic_models: interface.semantic_models,
+        semantic,
+        semantic_model: None,
+        semantic_matches: Vec::new(),
+        semantic_lookup: interface.semantic_lookup,
         build: provenance,
         source_check,
         freshness,
@@ -1297,22 +2085,32 @@ impl ContextDocument {
                     .strip_prefix("definition:")
                     .is_some_and(|t| kept_terms.contains(t))
         });
+        // ADR 0018 §7: `semantic_model` is a whole-cell view (never
+        // composable with route narrowing — `serve`/`datamk context` both
+        // refuse the combination before this runs); dropped defensively so
+        // a caller that narrows first and checks `?model=` second can never
+        // observe a stale one.
+        self.semantic_model = None;
         true
     }
 
-    /// `terms=` (ADR 0017 §3): case-insensitive lookup over `all_definitions`'
-    /// terms and aliases, deduplicated to canonical terms. Resolves against
-    /// the **whole cell** — `all_definitions`/`all_docs` must be the
-    /// unnarrowed lists (the caller captures them before calling
-    /// `narrow_to`), never `self.definitions`/`self.docs`, which
-    /// `/context/<route>` may already have reduced. Replaces
-    /// `self.definitions` with the matched subset (declared order) and
-    /// `self.docs` with exactly those terms' `definition:` pages (`sha256`/
-    /// `bytes` fingerprints carried over, since `all_docs` is `assemble`'s
-    /// output, not the fingerprint-less `Interface.docs`) — the cell page
-    /// and any export page are dropped, matching an `include=docs` fetch
-    /// under a filter never carrying every page again. Sets and returns
-    /// `missing_terms`: every token that resolved to no term or alias,
+    /// `terms=` (ADR 0017 §3, extended by ADR 0018 §7): case-insensitive
+    /// lookup over `all_definitions`' terms/aliases AND every addressable
+    /// Ossie dataset/field/metric name or synonym (`self.semantic_lookup`).
+    /// A token may hit both; every Ossie hit is returned (collisions across
+    /// models are all listed, each naming its model). Resolves against the
+    /// **whole cell** — `all_definitions`/`all_docs` must be the unnarrowed
+    /// lists (the caller captures them before calling `narrow_to`), never
+    /// `self.definitions`/`self.docs`, which `/context/<route>` may already
+    /// have reduced. Replaces `self.definitions` with the matched subset
+    /// (declared order), `self.semantic_matches` with every Ossie hit, and
+    /// `self.docs` with exactly the matched terms' `definition:` pages
+    /// (`sha256`/`bytes` fingerprints carried over, since `all_docs` is
+    /// `assemble`'s output, not the fingerprint-less `Interface.docs`) — the
+    /// cell page and any export page are dropped, matching an
+    /// `include=docs` fetch under a filter never carrying every page again.
+    /// Sets and returns `missing_terms`: every token that resolved to
+    /// nothing at all — neither a term/alias nor an Ossie name/synonym —
     /// verbatim, in request order, deduplicated.
     pub fn narrow_terms(
         &mut self,
@@ -1333,18 +2131,17 @@ impl ContextDocument {
         }
         let mut matched: Vec<String> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
+        let semantic_matches = resolve_semantic_matches(tokens, &self.semantic_lookup);
         for tok in tokens {
-            match index.get(&tok.to_ascii_lowercase()) {
-                Some(term) => {
-                    if !matched.iter().any(|t| t == term) {
-                        matched.push(term.to_string());
-                    }
+            let definitions_hit = index.get(&tok.to_ascii_lowercase());
+            let ossie_hit = semantic_matches.iter().any(|m| &m.token == tok);
+            if let Some(term) = definitions_hit {
+                if !matched.iter().any(|t| t == term) {
+                    matched.push(term.to_string());
                 }
-                None => {
-                    if !missing.contains(tok) {
-                        missing.push(tok.clone());
-                    }
-                }
+            }
+            if definitions_hit.is_none() && !ossie_hit && !missing.contains(tok) {
+                missing.push(tok.clone());
             }
         }
         self.definitions = all_definitions
@@ -1361,6 +2158,7 @@ impl ContextDocument {
             })
             .cloned()
             .collect();
+        self.semantic_matches = semantic_matches;
         self.missing_terms = missing.clone();
         missing
     }
@@ -1382,7 +2180,30 @@ impl ContextDocument {
             definitions_request: self.definitions_request.clone(),
             docs: self.docs.clone(),
             include_request: self.include_request.clone(),
+            semantic_models: self.semantic_models.clone(),
+            semantic: self.semantic.clone(),
+            semantic_lookup: self.semantic_lookup.clone(),
         }
+    }
+
+    /// `?model=<name>`/`--model <name>` (ADR 0018 §7): the one named
+    /// semantic model in full, verification overlaid from a fresh
+    /// `.cell/semantic_check.json` when `check` is given. Returns `false`,
+    /// leaving the document untouched, when `def.semantic` is absent or
+    /// names no such model — the caller turns that into a 404/error naming
+    /// the models that exist (`s.interface.semantic_models`/
+    /// `doc.semantic_models`).
+    pub fn with_semantic_model(
+        &mut self,
+        index: &crate::ossie::bind::SemanticIndex,
+        name: &str,
+        check: Option<&crate::ossie::record::SemanticCheckRecord>,
+    ) -> bool {
+        let Some(model) = index.model(name) else {
+            return false;
+        };
+        self.semantic_model = Some(semantic_model_doc(model, index, check));
+        true
     }
 
     /// Inline docs content (ADR 0013): marks `included: ["docs"]` and sets
@@ -1438,6 +2259,7 @@ pub fn build(
     served_here: bool,
     direct_attach: bool,
     is_all_never: bool,
+    semantic_check: Option<crate::ossie::record::SemanticCheckRecord>,
 ) -> ContextDocument {
     assemble(Facts {
         cell: def.cell.clone(),
@@ -1452,6 +2274,7 @@ pub fn build(
         channels: Vec::new(),
         direct_attach,
         is_all_never,
+        semantic_check,
     })
 }
 
@@ -1538,6 +2361,24 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
         docs: Vec<DocsProjection<'a>>,
         include_request: &'a str,
         data: &'a DataBlock,
+        // ADR 0018 §7/M3: lookup keys only — every addressable model,
+        // dataset, field, and metric name plus synonym, sorted as full
+        // `(kind, model, dataset, field, token)` tuples, never bare tokens
+        // — a bare-token set can't tell "field `amount` moved from dataset
+        // `a` to dataset `b`" from "nothing changed" when both datasets
+        // have a same-named field. Never prose (a description edit), never
+        // verification (a `datamk verify` re-run): this must change only
+        // when a *name* (or where it points) an agent could address
+        // appears, disappears, moves, or is renamed.
+        semantic_keys: Vec<SemanticKeyProjection<'a>>,
+    }
+    #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    struct SemanticKeyProjection<'a> {
+        kind: &'a str,
+        model: &'a str,
+        dataset: &'a str,
+        field: &'a str,
+        token: &'a str,
     }
     #[derive(Serialize)]
     struct ExportProjection<'a> {
@@ -1643,6 +2484,25 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
             .collect(),
         include_request: &interface.include_request,
         data,
+        semantic_keys: {
+            // `semantic_lookup` already carries a `"model"`-kind entry for
+            // every addressable model name/synonym (M8) — nothing further
+            // needs folding in from `semantic_models[]`.
+            let mut keys: Vec<SemanticKeyProjection> = interface
+                .semantic_lookup
+                .iter()
+                .map(|e| SemanticKeyProjection {
+                    kind: e.kind.as_str(),
+                    model: e.model.as_str(),
+                    dataset: e.dataset.as_deref().unwrap_or(""),
+                    field: e.field.as_deref().unwrap_or(""),
+                    token: e.token.as_str(),
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        },
     };
     let bytes = serde_json::to_vec(&projection).expect("context projection serializes");
     hex(&Sha256::digest(&bytes))
@@ -1693,23 +2553,29 @@ pub fn build_document(
     profile: &str,
     no_docs: bool,
 ) -> Result<ContextDocument> {
-    build_document_for(file, profile, no_docs, None, None)
+    build_document_for(file, profile, no_docs, None, None, None)
 }
 
 /// `build_document`, optionally narrowed to one export's route (`datamk
-/// context --export <route>`, the portable twin of `GET /context/<route>`)
-/// and/or to a `--terms` list (ADR 0017 §6, composing with `--export`
-/// exactly as `terms=` composes with `/context/<route>`). An unknown route
-/// is an error naming the ones that exist; an unknown term is an error
-/// naming the known ones — the deliberate CLI asymmetry with the served
-/// door (ADR 0013 §7): a file written by `--out` cannot be re-requested.
+/// context --export <route>`, the portable twin of `GET /context/<route>`),
+/// to a `--terms` list (ADR 0017 §6, composing with `--export` exactly as
+/// `terms=` composes with `/context/<route>`), and/or to one semantic model
+/// in full (`--model`, ADR 0018 §7) — mutually exclusive with `--export`
+/// (`model` is a whole-cell view). An unknown route or model is an error
+/// naming the ones that exist; an unknown term is an error naming the known
+/// ones — the deliberate CLI asymmetry with the served door (ADR 0013 §7):
+/// a file written by `--out` cannot be re-requested.
 pub fn build_document_for(
     file: &std::path::Path,
     profile: &str,
     no_docs: bool,
     export: Option<&str>,
     terms: Option<&[String]>,
+    model: Option<&str>,
 ) -> Result<ContextDocument> {
+    if export.is_some() && model.is_some() {
+        anyhow::bail!("--model is a whole-cell view; drop --export");
+    }
     let loaded = crate::config::load(file, profile)?;
     let routes = discoverable_routes(&loaded.def)?;
     let direct_attach = crate::config::direct_attach(&loaded.bindings);
@@ -1784,6 +2650,15 @@ pub fn build_document_for(
         .map(|r| r.sources.into_iter().collect())
         .unwrap_or_default();
 
+    // ADR 0018 §6/§7: same `fresh_for` gate as `source_check` above — the
+    // record `datamk verify`'s Ossie half persisted, embedded only when it
+    // still attests this exact `cell.yaml` under this profile.
+    let semantic_check = crate::ossie::record::SemanticCheckRecord::fresh_for(
+        &loaded.dir,
+        &cell_yaml_digest,
+        profile,
+    );
+
     let mut doc = build(
         &loaded.def,
         &routes,
@@ -1796,8 +2671,63 @@ pub fn build_document_for(
         /* served_here */ false, // a file serves no rows
         direct_attach,
         is_all_never,
+        semantic_check.clone(),
     );
     doc.data.channels = loaded.bindings.channels.clone();
+
+    // ADR 0018 §4: `semantic_model:` declared but `config::load` found no
+    // fresh `.cell/semantic_model.json` — `serve` refuses to start over
+    // this; `datamk context` warns and says so in the document instead.
+    if loaded.def.semantic_model.is_some() && loaded.def.semantic.is_none() {
+        let msg = format!(
+            "cell '{}' declares `semantic_model:` but .cell/semantic_model.json is missing or \
+             stale (cell.yaml changed since the last sync) — run `datamk sync`",
+            loaded.def.cell
+        );
+        tracing::warn!("{msg}");
+        doc.notes.push(
+            "semantic_model: declared but no fresh snapshot — definitions from Ossie are \
+             absent; run `datamk sync`"
+                .to_string(),
+        );
+    }
+
+    // ADR 0018 §4: source drift, `datamk context` only — never `serve`,
+    // never over the network for `git:`. A `dir:` source is re-walked and
+    // re-merged (the exact `sync_semantic` read path) and compared against
+    // the record's own `content_sha256`; an unreadable/relocated directory
+    // is treated as "not reachable right now", same as an unreachable git
+    // remote, and never blocks the document.
+    if let Some(index) = &loaded.def.semantic {
+        match &loaded.def.semantic_model {
+            Some(crate::ossie::source::SemanticModelSource::Dir { dir: raw }) => {
+                if let Ok(root) = crate::ossie::source::resolve_dir(&loaded.dir, raw) {
+                    if let Ok(files) = crate::ossie::source::walk(&root) {
+                        if let Ok(merged) = crate::ossie::source::merge(&files) {
+                            if merged.content_sha256 != index.content_sha256() {
+                                let msg = format!(
+                                    "semantic_model.dir has changed since the last sync \
+                                     ({} synced, {} on disk now) — the document describes the \
+                                     snapshot",
+                                    &index.content_sha256()[..12.min(index.content_sha256().len())],
+                                    &merged.content_sha256[..12.min(merged.content_sha256.len())]
+                                );
+                                tracing::warn!("{msg}");
+                                doc.notes.push(msg);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(crate::ossie::source::SemanticModelSource::Git { .. }) => {
+                doc.notes.push(format!(
+                    "semantic_model.git: not re-checked since {}",
+                    index.synced_at()
+                ));
+            }
+            None => {}
+        }
+    }
     // ADR 0016 §5: a discovered cell with no fresh record has no interface
     // to describe — say so, rather than emit an empty export list that reads
     // as "this cell has no exports".
@@ -1858,6 +2788,7 @@ pub fn build_document_for(
                 known.push(d.term.as_str());
                 known.extend(d.aliases.iter().map(String::as_str));
             }
+            known.extend(doc.semantic_lookup.iter().map(|e| e.token.as_str()));
             anyhow::bail!(
                 "unknown term(s): {} — known terms: {}",
                 missing.join(", "),
@@ -1865,6 +2796,38 @@ pub fn build_document_for(
                     "none".to_string()
                 } else {
                     known.join(", ")
+                }
+            );
+        }
+    }
+
+    // ADR 0018 §7: `--model` composes with `--terms`, is mutually exclusive
+    // with `--export` (checked at the top of this function), and errors
+    // naming the known models — the `--terms` precedent.
+    if let Some(name) = model {
+        // M1: `--model` must never show a private export's route key —
+        // restrict to the same discoverable route list `interface` (and
+        // `doc` itself) was built from.
+        let route_keys: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+        let index = loaded
+            .def
+            .semantic
+            .as_ref()
+            .map(|idx| idx.restricted_to(&route_keys));
+        let found = index
+            .as_ref()
+            .is_some_and(|idx| doc.with_semantic_model(idx, name, semantic_check.as_ref()));
+        if !found {
+            anyhow::bail!(
+                "no semantic model '{name}' — known models: {}",
+                if doc.semantic_models.is_empty() {
+                    "none".to_string()
+                } else {
+                    doc.semantic_models
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 }
             );
         }
@@ -1892,6 +2855,7 @@ pub fn build_document_for(
 /// statically, paste it into an agent's context. A thin wrapper over
 /// `build_document`: everything about the document's *content* lives there;
 /// this function only decides where the serialized bytes go.
+#[allow(clippy::too_many_arguments)]
 pub fn emit(
     file: &std::path::Path,
     profile: &str,
@@ -1899,10 +2863,11 @@ pub fn emit(
     no_docs: bool,
     export: Option<&str>,
     terms: Option<&[String]>,
+    model: Option<&str>,
 ) -> Result<()> {
     use anyhow::Context as _;
 
-    let doc = build_document_for(file, profile, no_docs, export, terms)?;
+    let doc = build_document_for(file, profile, no_docs, export, terms, model)?;
     let json = serde_json::to_string_pretty(&doc)?;
     match out {
         Some(path) => {
@@ -1980,6 +2945,7 @@ interface:
             /* served_here */ true,
             /* direct_attach */ false,
             false,
+            None,
         )
     }
 
@@ -2013,6 +2979,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "draft");
@@ -2053,6 +3020,7 @@ interface:
             true,
             true,
             false,
+            None,
         );
         assert_eq!(doc.status, Status::Draft);
         assert_eq!(doc.notes, vec![NOTE_DIRECT_ATTACH.to_string()]);
@@ -2079,6 +3047,7 @@ interface:
             true,
             /* direct_attach */ false,
             /* is_all_never */ true,
+            None,
         );
         assert_eq!(doc.status, Status::Draft);
         assert_eq!(doc.notes, vec![NOTE_VIRTUAL_CELL.to_string()]);
@@ -2108,6 +3077,7 @@ interface:
             true,
             /* direct_attach */ true,
             /* is_all_never */ true,
+            None,
         );
         assert_eq!(doc.status, Status::Draft);
         assert_eq!(
@@ -2148,6 +3118,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_eq!(doc.status, Status::Verified);
         assert!(
@@ -2162,6 +3133,97 @@ interface:
     fn private_exports_appear_nowhere_in_the_document() {
         let json = serde_json::to_string(&sample_verified()).unwrap();
         assert!(!json.contains("internal"), "leaked private export: {json}");
+    }
+
+    /// M1: an Ossie dataset bound (by name) to two majors of one export —
+    /// `orders@2` discoverable, `orders@1` private — must show only the
+    /// discoverable route once the index is narrowed the way `interface`
+    /// (every server/emitter) narrows it; `SemanticIndex::build`'s own
+    /// output (bound against the full interface) still carries both, which
+    /// is exactly the shape `restricted_to` exists to fix before a
+    /// document is built from it.
+    #[test]
+    fn interface_never_leaks_a_private_majors_route_through_semantic_routes() {
+        let def: CellDef = serde_yaml::from_str(
+            r#"
+cell: t
+interface:
+  - name: orders
+    version: 2.0.0
+    schema:
+      id: integer
+  - name: orders
+    version: 1.0.0
+    visibility: private
+    schema:
+      id: integer
+"#,
+        )
+        .unwrap();
+
+        let model = crate::ossie::SemanticModel {
+            name: "m".to_string(),
+            description: None,
+            ai_context: None,
+            datasets: vec![crate::ossie::Dataset {
+                name: "orders_ds".to_string(),
+                source: "orders".to_string(),
+                primary_key: vec![],
+                unique_keys: vec![],
+                description: None,
+                ai_context: None,
+                fields: vec![ossie_field("id", "id")],
+                custom_extensions: vec![],
+            }],
+            relationships: vec![],
+            metrics: vec![],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: IndexMap::from([("m".to_string(), "m.yaml".to_string())]),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        let full_index = crate::ossie::bind::SemanticIndex::build(record, &def.interface);
+        // Sanity: the un-narrowed index (what `config::load` produces) does
+        // bind to both majors — the leak this test guards against is real
+        // absent `interface`'s own narrowing.
+        assert_eq!(
+            full_index.route_for("m", "orders_ds"),
+            ["orders@2", "orders@1"]
+        );
+
+        let mut def = def;
+        def.semantic = Some(full_index);
+
+        let routes = discoverable_routes(&def).unwrap();
+        assert_eq!(routes.len(), 1, "only orders@2 is discoverable");
+        let iface = interface(&def, &routes, &IndexMap::new());
+
+        let export = iface
+            .exports
+            .iter()
+            .find(|e| e.route == "orders@2")
+            .unwrap();
+        assert_eq!(export.semantic.len(), 1);
+        assert_eq!(export.semantic[0].routes, vec!["orders@2".to_string()]);
+
+        assert_eq!(iface.semantic_models[0].bound, 1);
     }
 
     /// ADR 0012 §8: the serialization guard — a fully-populated document
@@ -2189,6 +3251,40 @@ interface:
                 "context document leaked `{banned}`-shaped content: {json}"
             );
         }
+    }
+
+    /// M7: the served/emitted `semantic.resolved` carries `{"dir": true}`
+    /// for a directory source, never the sync host's absolute path
+    /// (`sample_semantic_index`'s record resolves to `/abs/osi`).
+    #[test]
+    fn semantic_block_resolved_never_carries_the_sync_hosts_absolute_path() {
+        let def = sample_def_with_semantic();
+        let routes = discoverable_routes(&def).unwrap();
+        let iface = interface(&def, &routes, &IndexMap::new());
+        let semantic = iface.semantic.expect("semantic block present");
+        assert_eq!(semantic.resolved, ResolvedDoc::Dir { dir: true });
+
+        let json = serde_json::to_string(&semantic).unwrap();
+        assert!(!json.contains("/abs/osi"), "{json}");
+        assert!(json.contains("\"dir\":true"), "{json}");
+    }
+
+    #[test]
+    fn resolved_doc_serializes_commit_and_dir_shapes() {
+        let commit = ResolvedDoc::from(&crate::ossie::record::Resolved::Commit {
+            commit: "4f2a91c".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(&commit).unwrap(),
+            serde_json::json!({"commit": "4f2a91c"})
+        );
+        let dir = ResolvedDoc::from(&crate::ossie::record::Resolved::Dir {
+            dir: "/abs/osi".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(&dir).unwrap(),
+            serde_json::json!({"dir": true})
+        );
     }
 
     /// ADR 0012 §5: the upstream edge is nominal — `{ref, version}` only,
@@ -2238,6 +3334,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_eq!(
             digest_of(&verified),
@@ -2266,6 +3363,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_eq!(
             digest_of(&draft),
@@ -2288,6 +3386,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_ne!(
             digest_of(&draft),
@@ -2317,6 +3416,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
 
         // Injecting top-level content (as `?include=docs` would) must not
@@ -2351,6 +3451,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_eq!(
             digest_of(&base),
@@ -2374,6 +3475,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_ne!(
             digest_of(&base),
@@ -2397,6 +3499,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_ne!(
             digest_of(&base),
@@ -2423,6 +3526,7 @@ interface:
             false,
             true,
             false,
+            None,
         );
         doc.emitted_at = Some("2026-08-06T00:00:00Z".to_string());
         doc.cell_yaml_digest = Some("abc123".to_string());
@@ -2550,6 +3654,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         let with_upstreams = build(
             &def,
@@ -2567,6 +3672,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_eq!(
             digest_of(&draft),
@@ -2598,6 +3704,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
 
         let mut fp = IndexMap::new();
@@ -2630,6 +3737,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         // Inline docs content too, as `?include=docs` would.
         loaded.inline_docs(&[page("cell", "Some prose an agent will read.")]);
@@ -2664,6 +3772,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "draft", "no provenance ⇒ still draft");
@@ -2701,6 +3810,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         let v = serde_json::to_value(doc).unwrap();
         assert_eq!(v["upstreams"], serde_json::json!([]));
@@ -2790,6 +3900,7 @@ interface:
             false,
             None,
             None,
+            None,
         )
         .unwrap();
         let default_doc: serde_json::Value =
@@ -2810,6 +3921,7 @@ interface:
             "local",
             Some(&no_docs_out),
             true,
+            None,
             None,
             None,
         )
@@ -2880,7 +3992,8 @@ interface:
         );
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None).expect("emit the context document");
+        emit(&file, "local", Some(&out), false, None, None, None)
+            .expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(v["status"], "verified_at_source");
@@ -2973,7 +4086,8 @@ interface:
         crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None).expect("emit the context document");
+        emit(&file, "local", Some(&out), false, None, None, None)
+            .expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
 
@@ -3010,7 +4124,7 @@ interface:
         std::fs::write(&file, yaml).unwrap();
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None)
+        emit(&file, "local", Some(&out), false, None, None, None)
             .expect("emit must still succeed, just without the stale record");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -3218,6 +4332,7 @@ interface:
             channels: Vec::new(),
             direct_attach: false,
             is_all_never: false,
+            semantic_check: None,
         });
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "verified_at_source");
@@ -3244,6 +4359,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert_eq!(digest_of(&bare), digest_of(&doc));
     }
@@ -3363,6 +4479,7 @@ interface:
             channels: Vec::new(),
             direct_attach: false,
             is_all_never: true,
+            semantic_check: None,
         }
     }
 
@@ -3478,7 +4595,8 @@ interface:
         crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None).expect("emit the context document");
+        emit(&file, "local", Some(&out), false, None, None, None)
+            .expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         let check = &v["exports"][0]["check"];
@@ -3623,6 +4741,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         assert!(doc.narrow_to("orders_daily@2"));
         let terms: Vec<&str> = doc.definitions.iter().map(|d| d.term.as_str()).collect();
@@ -3655,6 +4774,7 @@ interface:
             true,
             false,
             false,
+            None,
         );
         let all_definitions = doc.definitions.clone();
         let all_docs = doc.docs.clone();
@@ -3702,5 +4822,753 @@ interface:
         assert!(missing.is_empty(), "{missing:?}");
         assert_eq!(doc.definitions.len(), 1);
         assert_eq!(doc.definitions[0].term, "unrelated");
+    }
+
+    // --- ADR 0018 §7: the Apache Ossie context document ---------------------
+
+    fn ansi(expr: &str) -> crate::ossie::Expression {
+        crate::ossie::Expression {
+            dialects: vec![crate::ossie::DialectExpression {
+                dialect: crate::ossie::Dialect::AnsiSql,
+                expression: expr.to_string(),
+            }],
+        }
+    }
+
+    fn ossie_field(name: &str, expr: &str) -> crate::ossie::Field {
+        crate::ossie::Field {
+            name: name.to_string(),
+            expression: ansi(expr),
+            dimension: None,
+            label: None,
+            description: None,
+            datatype: None,
+            ai_context: None,
+            custom_extensions: vec![],
+        }
+    }
+
+    fn ossie_field_with_synonym(name: &str, expr: &str, synonym: &str) -> crate::ossie::Field {
+        let mut f = ossie_field(name, expr);
+        f.ai_context = Some(crate::ossie::AiContext::Detail(
+            crate::ossie::AiContextDetail {
+                instructions: None,
+                synonyms: vec![synonym.to_string()],
+                examples: vec![],
+                extra: serde_json::Map::new(),
+            },
+        ));
+        f
+    }
+
+    fn ossie_dataset(
+        name: &str,
+        source: &str,
+        pk: &[&str],
+        fields: Vec<crate::ossie::Field>,
+    ) -> crate::ossie::Dataset {
+        crate::ossie::Dataset {
+            name: name.to_string(),
+            source: source.to_string(),
+            primary_key: pk.iter().map(|s| s.to_string()).collect(),
+            unique_keys: vec![],
+            description: Some(format!("{name} dataset")),
+            ai_context: None,
+            fields,
+            custom_extensions: vec![],
+        }
+    }
+
+    /// Two semantic models over `sample_def`'s exports (ADR 0018 §5): both
+    /// declare a dataset literally named `orders_daily`, binding by name to
+    /// the same export — the deliberate setup for the terms-collision test
+    /// below. `invoice` also declares an unbound dataset (`advertisers`, no
+    /// matching export) and a metric fully checkable against `orders_daily`
+    /// alone.
+    fn sample_semantic_index(def: &CellDef) -> crate::ossie::bind::SemanticIndex {
+        let routes = discoverable_routes(def).unwrap();
+        let invoice = crate::ossie::SemanticModel {
+            name: "invoice".to_string(),
+            description: Some("Invoice-side facts.".to_string()),
+            ai_context: None,
+            datasets: vec![
+                ossie_dataset(
+                    "orders_daily",
+                    "orders_daily",
+                    &["order_date", "region"],
+                    vec![
+                        ossie_field("order_date", "order_date"),
+                        ossie_field_with_synonym("revenue_field", "revenue", "rev"),
+                    ],
+                ),
+                ossie_dataset(
+                    "advertisers",
+                    "advertisers",
+                    &[],
+                    vec![ossie_field("name", "name")],
+                ),
+            ],
+            relationships: vec![crate::ossie::Relationship {
+                name: "orders_to_advertisers".to_string(),
+                from: "orders_daily".to_string(),
+                to: "advertisers".to_string(),
+                from_columns: vec!["region".to_string()],
+                to_columns: vec!["name".to_string()],
+                ai_context: None,
+                custom_extensions: vec![],
+            }],
+            metrics: vec![crate::ossie::Metric {
+                name: "total_revenue".to_string(),
+                expression: ansi("SUM(orders_daily.revenue)"),
+                description: Some("Sum of revenue.".to_string()),
+                datatype: None,
+                ai_context: None,
+                custom_extensions: vec![],
+            }],
+            custom_extensions: vec![],
+        };
+        let billing = crate::ossie::SemanticModel {
+            name: "billing".to_string(),
+            description: Some("Billing-side facts.".to_string()),
+            ai_context: None,
+            datasets: vec![ossie_dataset(
+                "orders_daily",
+                "orders_daily",
+                &[],
+                vec![ossie_field("amount", "revenue")],
+            )],
+            relationships: vec![],
+            metrics: vec![],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc123".to_string(),
+            files: vec!["invoice.yaml".to_string(), "billing.yaml".to_string()],
+            model_files: IndexMap::from([
+                ("invoice".to_string(), "invoice.yaml".to_string()),
+                ("billing".to_string(), "billing.yaml".to_string()),
+            ]),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![invoice, billing],
+            },
+        };
+        crate::ossie::bind::SemanticIndex::build(
+            record,
+            &routes.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+        )
+    }
+
+    fn sample_def_with_semantic() -> CellDef {
+        let mut def = sample_def();
+        def.semantic = Some(sample_semantic_index(&def));
+        def
+    }
+
+    #[test]
+    fn assemble_with_a_fresh_semantic_record_populates_the_index_and_route_context() {
+        let def = sample_def_with_semantic();
+        let routes = discoverable_routes(&def).unwrap();
+        let doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+        // Index: both models, counted correctly.
+        assert_eq!(doc.semantic_models.len(), 2);
+        let invoice = doc
+            .semantic_models
+            .iter()
+            .find(|m| m.name == "invoice")
+            .unwrap();
+        assert_eq!(invoice.datasets, 2, "orders_daily + advertisers");
+        assert_eq!(invoice.bound, 1, "only orders_daily binds");
+        assert_eq!(invoice.metrics, 1);
+        let billing = doc
+            .semantic_models
+            .iter()
+            .find(|m| m.name == "billing")
+            .unwrap();
+        assert_eq!(billing.datasets, 1);
+        assert_eq!(billing.bound, 1);
+
+        // Route context: one entry per model bound to this route (both
+        // models declare a dataset literally named `orders_daily`).
+        let export = doc
+            .exports
+            .iter()
+            .find(|e| e.route == "orders_daily@2")
+            .unwrap();
+        assert_eq!(export.semantic.len(), 2, "{:?}", export.semantic);
+        let models: Vec<&str> = export.semantic.iter().map(|d| d.model.as_str()).collect();
+        assert!(models.contains(&"invoice"));
+        assert!(models.contains(&"billing"));
+        // The unbound dataset never appears in any route's context.
+        assert!(export.semantic.iter().all(|d| d.dataset != "advertisers"));
+        let invoice_ds = export
+            .semantic
+            .iter()
+            .find(|d| d.model == "invoice")
+            .unwrap();
+        assert_eq!(invoice_ds.routes, vec!["orders_daily@2".to_string()]);
+        // The metric, fully qualified by `orders_daily` alone, lists in
+        // full under this dataset — never as a pointer.
+        assert_eq!(invoice_ds.metrics.len(), 1);
+        assert_eq!(invoice_ds.metrics[0].name, "total_revenue");
+        assert!(invoice_ds.metric_refs.is_empty());
+        // The relationship touching `orders_daily` lists too, its other
+        // side unbound.
+        assert_eq!(invoice_ds.relationships.len(), 1);
+        assert_eq!(invoice_ds.relationships[0].to_route, None);
+
+        // `?model=` shows the unbound dataset too, with `routes: []`.
+        let mut model_doc = doc.clone();
+        assert!(model_doc.with_semantic_model(def.semantic.as_ref().unwrap(), "invoice", None));
+        let sm = model_doc.semantic_model.unwrap();
+        assert_eq!(sm.datasets.len(), 2);
+        let advertisers = sm
+            .datasets
+            .iter()
+            .find(|d| d.dataset == "advertisers")
+            .unwrap();
+        assert!(advertisers.routes.is_empty());
+
+        // Unknown model is not found.
+        let mut none_doc = doc.clone();
+        assert!(!none_doc.with_semantic_model(def.semantic.as_ref().unwrap(), "nope", None));
+        assert!(none_doc.semantic_model.is_none());
+    }
+
+    #[test]
+    fn narrow_to_keeps_the_index_and_route_semantic_but_drops_the_full_model() {
+        let def = sample_def_with_semantic();
+        let routes = discoverable_routes(&def).unwrap();
+        let mut doc = build(
+            &def,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+        doc.with_semantic_model(def.semantic.as_ref().unwrap(), "invoice", None);
+        assert!(doc.semantic_model.is_some());
+        assert!(doc.narrow_to("orders_daily@2"));
+        assert_eq!(
+            doc.semantic_models.len(),
+            2,
+            "the index is cell-wide, never narrowed"
+        );
+        assert_eq!(doc.exports.len(), 1);
+        assert_eq!(doc.exports[0].semantic.len(), 2);
+        assert!(
+            doc.semantic_model.is_none(),
+            "a whole-cell view must not survive route narrowing"
+        );
+    }
+
+    #[test]
+    fn terms_resolve_ossie_dataset_field_metric_and_synonym_with_cross_model_collisions() {
+        let def = sample_def_with_semantic();
+        let index = def.semantic.as_ref().unwrap();
+        let lookup = semantic_lookup_entries(index);
+
+        // A dataset name shared by two models: every hit is returned.
+        let hits = resolve_semantic_matches(&["orders_daily".to_string()], &lookup);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        let mut models: Vec<&str> = hits.iter().map(|m| m.model.as_str()).collect();
+        models.sort_unstable();
+        assert_eq!(models, vec!["billing", "invoice"]);
+        assert!(hits.iter().all(|m| m.kind == "dataset"));
+
+        // A field name, unique to one model.
+        let hits = resolve_semantic_matches(&["revenue_field".to_string()], &lookup);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "field");
+        assert_eq!(hits[0].model, "invoice");
+        assert_eq!(hits[0].dataset.as_deref(), Some("orders_daily"));
+
+        // A metric name.
+        let hits = resolve_semantic_matches(&["total_revenue".to_string()], &lookup);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "metric");
+
+        // A synonym, case-insensitive.
+        let hits = resolve_semantic_matches(&["REV".to_string()], &lookup);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "synonym");
+        assert_eq!(hits[0].field.as_deref(), Some("revenue_field"));
+
+        // M8: a model's own name is indexed too, `kind: "model"`, with
+        // `dataset`/`field` both absent.
+        let hits = resolve_semantic_matches(&["invoice".to_string()], &lookup);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, "model");
+        assert_eq!(hits[0].model, "invoice");
+        assert!(hits[0].dataset.is_none());
+        assert!(hits[0].field.is_none());
+    }
+
+    /// M6: a name outside the addressable token grammar
+    /// (`[A-Za-z0-9_.-]{1,64}`) is not indexed for `?terms=`/the OpenAPI
+    /// enums — it still exists in the document (`semantic_model`/
+    /// `exports[].semantic`), just not in the lookup — mirroring what
+    /// already applied to synonyms before this fix reached dataset/field/
+    /// metric/model names too.
+    #[test]
+    fn non_addressable_names_are_not_indexed_but_still_appear_in_the_document() {
+        let mut ds = ossie_dataset("has space", "orders_daily", &[], vec![]);
+        ds.fields.push(ossie_field("also bad", "id"));
+        let model = crate::ossie::SemanticModel {
+            name: "model with space".to_string(),
+            description: None,
+            ai_context: None,
+            datasets: vec![ds],
+            relationships: vec![],
+            metrics: vec![crate::ossie::Metric {
+                name: "metric bad".to_string(),
+                expression: ansi("COUNT(*)"),
+                description: None,
+                datatype: None,
+                ai_context: None,
+                custom_extensions: vec![],
+            }],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: IndexMap::from([("model with space".to_string(), "m.yaml".to_string())]),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        let index = crate::ossie::bind::SemanticIndex::build(record, &[]);
+        let lookup = semantic_lookup_entries(&index);
+        assert!(lookup.is_empty(), "{lookup:?}");
+
+        // Still present in the model listing itself — not dropped, just
+        // not addressable.
+        assert_eq!(index.models()[0].name, "model with space");
+        assert_eq!(index.models()[0].datasets[0].name, "has space");
+    }
+
+    #[test]
+    fn missing_terms_only_lists_tokens_with_no_hit_anywhere() {
+        let mut doc = {
+            let def = sample_def_with_semantic();
+            let routes = discoverable_routes(&def).unwrap();
+            build(
+                &def,
+                &routes,
+                None,
+                None,
+                None,
+                Vec::new(),
+                IndexMap::new(),
+                IndexMap::new(),
+                true,
+                false,
+                false,
+                None,
+            )
+        };
+        let all_definitions = doc.definitions.clone();
+        let all_docs = doc.docs.clone();
+        let missing = doc.narrow_terms(
+            &[
+                "orders_daily".to_string(),
+                "total_revenue".to_string(),
+                "genuinely-nowhere".to_string(),
+            ],
+            &all_definitions,
+            &all_docs,
+        );
+        assert_eq!(missing, vec!["genuinely-nowhere".to_string()]);
+        assert_eq!(doc.missing_terms, vec!["genuinely-nowhere".to_string()]);
+        let tokens: Vec<&str> = doc
+            .semantic_matches
+            .iter()
+            .map(|m| m.token.as_str())
+            .collect();
+        assert!(tokens.contains(&"orders_daily"));
+        assert!(tokens.contains(&"total_revenue"));
+    }
+
+    /// A one-model index over `sample_def`'s export, with `edit` applied to
+    /// the `invoice` model's datasets before binding — the shared scaffold
+    /// for the digest test below.
+    fn index_with_invoice_edit(
+        def: &CellDef,
+        edit: impl FnOnce(&mut Vec<crate::ossie::Dataset>),
+    ) -> crate::ossie::bind::SemanticIndex {
+        let routes = discoverable_routes(def).unwrap();
+        let mut model = sample_semantic_index(def)
+            .models()
+            .iter()
+            .find(|m| m.name == "invoice")
+            .unwrap()
+            .clone();
+        edit(&mut model.datasets);
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc123".to_string(),
+            files: vec!["invoice.yaml".to_string()],
+            model_files: IndexMap::from([("invoice".to_string(), "invoice.yaml".to_string())]),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        crate::ossie::bind::SemanticIndex::build(
+            record,
+            &routes.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn semantic_digest_moves_on_a_new_dataset_name_but_not_on_a_description_edit() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+
+        let mut def_base = def.clone();
+        def_base.semantic = Some(index_with_invoice_edit(&def, |_| {}));
+        let base = build(
+            &def_base,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+
+        // A description-only edit (prose, never a lookup key) must not move
+        // the digest.
+        let mut def_desc = def.clone();
+        def_desc.semantic = Some(index_with_invoice_edit(&def, |datasets| {
+            datasets[0].description = Some("A wholly different sentence.".to_string());
+        }));
+        let with_desc = build(
+            &def_desc,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(
+            digest_of(&base),
+            digest_of(&with_desc),
+            "a description edit must not move the digest"
+        );
+
+        // A new dataset name (a lookup key) must move the digest.
+        let mut def_new = def.clone();
+        def_new.semantic = Some(index_with_invoice_edit(&def, |datasets| {
+            datasets.push(ossie_dataset(
+                "brand_new_dataset",
+                "brand_new_dataset",
+                &[],
+                vec![],
+            ));
+        }));
+        let with_new_dataset = build(
+            &def_new,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+        assert_ne!(
+            digest_of(&base),
+            digest_of(&with_new_dataset),
+            "a new addressable dataset name must move the digest"
+        );
+    }
+
+    /// M3: a bare token set can't distinguish "field `revenue_field` moved
+    /// from `orders_daily` to `advertisers`" from "nothing changed" — the
+    /// token itself is present before and after. The digest must move
+    /// anyway, because `interface_digest` projects `(kind, model, dataset,
+    /// field, token)` tuples, not bare tokens.
+    #[test]
+    fn semantic_digest_moves_when_a_field_moves_between_datasets_with_the_same_token() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+
+        let mut def_base = def.clone();
+        def_base.semantic = Some(index_with_invoice_edit(&def, |_| {}));
+        let base = build(
+            &def_base,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+
+        let mut def_moved = def.clone();
+        def_moved.semantic = Some(index_with_invoice_edit(&def, |datasets| {
+            // `datasets[0]` is `orders_daily` (fields: order_date,
+            // revenue_field); `datasets[1]` is `advertisers` (field: name)
+            // — move `revenue_field` across, same field name, new dataset.
+            let moved = datasets[0].fields.remove(1);
+            assert_eq!(moved.name, "revenue_field");
+            datasets[1].fields.push(moved);
+        }));
+        let with_moved = build(
+            &def_moved,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+
+        assert_ne!(
+            digest_of(&base),
+            digest_of(&with_moved),
+            "a field moving to a different dataset must move the digest, even though the token \
+             set is unchanged"
+        );
+    }
+
+    // --- ADR 0018 §4/§7: `datamk context` staleness and drift on a real
+    // --- filesystem cell (the `verify.rs` end-to-end scaffold pattern) -----
+
+    fn semantic_context_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-context-semantic-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn datamk_context_warns_and_notes_when_semantic_model_is_declared_but_stale() {
+        let dir = semantic_context_dir("stale");
+        // `semantic_model.dir` is declared but never synced — no
+        // `.cell/semantic_model.json`, and (deliberately) no `osi/`
+        // directory either, matching a cell whose modeling repo hasn't
+        // been cloned locally yet.
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: t\nsemantic_model:\n  dir: osi\n",
+        )
+        .unwrap();
+
+        let file = dir.join("cell.yaml");
+        let doc = build_document_for(&file, "local", true, None, None, None)
+            .expect("datamk context must still emit, not refuse");
+        assert!(
+            doc.notes
+                .iter()
+                .any(|n| n.contains("declared but no fresh snapshot")),
+            "{:?}",
+            doc.notes
+        );
+        assert!(doc.semantic.is_none());
+        assert!(doc.semantic_models.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn datamk_context_notes_dir_drift_since_the_last_sync() {
+        let dir = semantic_context_dir("drift");
+        std::fs::create_dir_all(dir.join("osi")).unwrap();
+        std::fs::write(
+            dir.join("osi/invoice.yaml"),
+            "version: 0.1.1\n\
+             semantic_model:\n\
+             \x20 - name: invoice\n\
+             \x20   datasets:\n\
+             \x20     - name: flight_spend\n\
+             \x20       source: flight_spend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: t\nsemantic_model:\n  dir: osi\n",
+        )
+        .unwrap();
+        let file = dir.join("cell.yaml");
+        crate::catalog::sync(&file, "local", false).expect("datamk sync (Ossie half)");
+
+        // The source changes after the sync — `datamk context` re-walks the
+        // `dir:` source (never `serve`) and notes the drift without
+        // touching the sidecar record.
+        std::fs::write(
+            dir.join("osi/invoice.yaml"),
+            "version: 0.1.1\n\
+             semantic_model:\n\
+             \x20 - name: invoice\n\
+             \x20   datasets:\n\
+             \x20     - name: flight_spend\n\
+             \x20       source: flight_spend\n\
+             \x20     - name: advertisers\n\
+             \x20       source: advertisers\n",
+        )
+        .unwrap();
+
+        let doc = build_document_for(&file, "local", true, None, None, None)
+            .expect("datamk context must still emit over a drifted source");
+        assert!(
+            doc.notes
+                .iter()
+                .any(|n| n.contains("has changed since the last sync")),
+            "{:?}",
+            doc.notes
+        );
+        // The document itself still describes the synced snapshot (one
+        // model, one dataset) — drift is reported, never silently applied.
+        assert_eq!(doc.semantic_models.len(), 1);
+        assert_eq!(doc.semantic_models[0].datasets, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0018 §7: `--model` naming an unknown model exits non-zero naming
+    /// the models that exist — the `--terms` precedent.
+    #[test]
+    fn unknown_model_is_an_error_naming_the_known_ones() {
+        let dir = semantic_context_dir("cli-unknown-model");
+        std::fs::create_dir_all(dir.join("osi")).unwrap();
+        std::fs::write(
+            dir.join("osi/invoice.yaml"),
+            "version: 0.1.1\n\
+             semantic_model:\n\
+             \x20 - name: invoice\n\
+             \x20   datasets:\n\
+             \x20     - name: flight_spend\n\
+             \x20       source: flight_spend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: t\nsemantic_model:\n  dir: osi\n",
+        )
+        .unwrap();
+        let file = dir.join("cell.yaml");
+        crate::catalog::sync(&file, "local", false).expect("datamk sync (Ossie half)");
+
+        let err = build_document_for(&file, "local", true, None, None, Some("nope"))
+            .expect_err("an unknown model must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no semantic model 'nope'"), "{msg}");
+        assert!(msg.contains("invoice"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0018 §7: `--model` is a whole-cell view — composing it with
+    /// `--export` is a CLI error, never a silent narrowing of one or the
+    /// other.
+    #[test]
+    fn model_and_export_together_is_an_error() {
+        let def = sample_def();
+        let dir = semantic_context_dir("cli-model-export");
+        std::fs::write(dir.join("cell.yaml"), serde_yaml::to_string(&def).unwrap()).unwrap();
+        let file = dir.join("cell.yaml");
+        let err = build_document_for(
+            &file,
+            "local",
+            true,
+            Some("orders_daily@2"),
+            None,
+            Some("x"),
+        )
+        .expect_err("--export and --model together must fail");
+        assert!(err.to_string().contains("--model is a whole-cell view"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

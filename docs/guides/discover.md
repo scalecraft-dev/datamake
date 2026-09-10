@@ -122,4 +122,9 @@ on a schedule, not at pod start; it stages every bound object.
   SQLMesh's `column_descriptions` per model to JSON and running
   `datamk debug sqlmesh-comments <file>` (non-zero exit on mismatch).
 
+Business meaning beyond the contract (synonyms, metric definitions, join
+relationships) is a separate, orthogonal concern: `semantic_model:` ingests
+it from Apache Ossie the same way for a discovered or an authored cell — see
+[semantic-model.md](semantic-model.md).
+
 Design rationale: [ADR 0016](../adr/0016-discovered-interfaces-sqlmesh.md).

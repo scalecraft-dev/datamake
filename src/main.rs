@@ -10,6 +10,7 @@ mod logging;
 mod manifest;
 mod mesh;
 mod ops;
+mod ossie;
 mod project;
 mod release;
 mod serve;
@@ -148,6 +149,7 @@ async fn dispatch(command: Command) -> Result<()> {
             a.no_docs,
             a.export.as_deref(),
             a.terms.as_deref(),
+            a.model.as_deref(),
         ),
         Command::Mesh(a) => match a.command {
             cli::MeshCommand::Emit(e) => mesh::emit(

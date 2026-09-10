@@ -46,6 +46,25 @@ pub struct CellDef {
     /// never authored, never serialized back into `cell.yaml`.
     #[serde(skip)]
     pub discovered_from: Option<DiscoveredFrom>,
+    /// ADR 0018 §1: where a cell's Apache Ossie documents live — a
+    /// directory (recursively walked) or a git repository. Orthogonal to
+    /// `discover:`: datamk ingests business meaning from Ossie the same way
+    /// for an authored or a discovered cell. `datamk sync` snapshots it
+    /// into `.cell/semantic_model.json`; nothing else reads the source
+    /// directly.
+    #[serde(default)]
+    pub semantic_model: Option<crate::ossie::source::SemanticModelSource>,
+    /// The bound semantic model (ADR 0018 §5) — `Some` only when
+    /// `semantic_model:` is declared AND `.cell/semantic_model.json` is
+    /// fresh for this `cell.yaml`; set by `config::load`, after discovery
+    /// materializes `interface` (the same placement ADR 0016/0017 use for
+    /// `applies_to`). Never authored, never serialized back into
+    /// `cell.yaml`. A stale or absent record leaves this `None` and a
+    /// `tracing::warn!` naming `datamk sync` as the remedy — `verify`'s
+    /// semantic checks simply don't run, the same "measure what's fresh,
+    /// warn about what isn't" discipline ADR 0016 applies to discovery.
+    #[serde(skip)]
+    pub semantic: Option<crate::ossie::bind::SemanticIndex>,
     /// `definitions:` as authored (ADR 0017 §1) — the inline list, or one
     /// relative path to a file carrying the identical list. Resolved into
     /// `definitions`/`definitions_file` by `CellDef::load`
@@ -172,6 +191,10 @@ pub enum Origin {
     /// inline column comments SQLMesh itself treats as declarations.
     #[serde(rename = "sqlmesh")]
     Sqlmesh,
+    /// Ingested from an Apache Ossie document (ADR 0018) — never authored,
+    /// never evaluated; carried through unchanged.
+    #[serde(rename = "ossie")]
+    Ossie,
 }
 
 /// `{ <field>: <origin> }` on a record — names every field of that record

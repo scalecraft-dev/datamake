@@ -58,9 +58,22 @@ pub struct CellArtifact {
     /// 0016 §5) — the whole interface of a discovered cell; travels and
     /// rolls exactly like `source_check`.
     pub deployed_catalog: Option<ArtifactFile>,
+    /// `.cell/semantic_model.json` if a `datamk sync` record exists (ADR
+    /// 0018 §4) — the ingested Ossie document; travels and rolls exactly
+    /// like `deployed_catalog`. Deliberately outside the release meaning
+    /// digest (`release.rs`'s `descriptions` map only ever hashes
+    /// `Origin::CellYaml` fields): an upstream Ossie edit must never move
+    /// datamk's own release gate.
+    pub semantic_model: Option<ArtifactFile>,
+    /// `.cell/semantic_check.json` if a `datamk verify` record exists (ADR
+    /// 0018 §6) — sibling of `source_check` above, same "travels with the
+    /// content" reasoning: a deployed Server reads it at startup instead of
+    /// re-running plan-time checks it has no warehouse credentials for.
+    pub semantic_check: Option<ArtifactFile>,
     /// SHA-256 over (cell_yaml ++ sql ++ docs ++ published ++ source_check
-    /// ++ source_descriptions ++ deployed_catalog), each entry framed by its `rel_path`. A
-    /// stable content identity: re-releasing (a new pin), a new live-verify
+    /// ++ source_descriptions ++ deployed_catalog ++ semantic_model ++
+    /// semantic_check), each entry framed by its `rel_path`. A stable
+    /// content identity: re-releasing (a new pin), a new live-verify
     /// record, or editing a docs page changes it, which a target uses to
     /// roll the workload (ADR 0002, ADR 0013 §9, issue #16, issue #10).
     pub content_hash: String,
@@ -146,6 +159,8 @@ impl CellArtifact {
         let source_check = sidecar(".cell/source_check.json")?;
         let source_descriptions = sidecar(".cell/source_descriptions.json")?;
         let deployed_catalog = sidecar(".cell/deployed_catalog.json")?;
+        let semantic_model = sidecar(".cell/semantic_model.json")?;
+        let semantic_check = sidecar(".cell/semantic_check.json")?;
         let content_hash = content_hash(
             &cell_yaml,
             &sql,
@@ -154,6 +169,8 @@ impl CellArtifact {
             &source_check,
             &source_descriptions,
             &deployed_catalog,
+            &semantic_model,
+            &semantic_check,
         );
         Ok(CellArtifact {
             dir: dir.to_path_buf(),
@@ -164,6 +181,8 @@ impl CellArtifact {
             source_check,
             source_descriptions,
             deployed_catalog,
+            semantic_model,
+            semantic_check,
             content_hash,
         })
     }
@@ -179,6 +198,7 @@ fn read_artifact(dir: &Path, rel: &str) -> Result<ArtifactFile> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn content_hash(
     cell_yaml: &ArtifactFile,
     sql: &[ArtifactFile],
@@ -187,6 +207,8 @@ fn content_hash(
     source_check: &Option<ArtifactFile>,
     source_descriptions: &Option<ArtifactFile>,
     deployed_catalog: &Option<ArtifactFile>,
+    semantic_model: &Option<ArtifactFile>,
+    semantic_check: &Option<ArtifactFile>,
 ) -> String {
     let mut h = Sha256::new();
     feed(&mut h, cell_yaml);
@@ -206,6 +228,12 @@ fn content_hash(
         feed(&mut h, f);
     }
     if let Some(f) = deployed_catalog {
+        feed(&mut h, f);
+    }
+    if let Some(f) = semantic_model {
+        feed(&mut h, f);
+    }
+    if let Some(f) = semantic_check {
         feed(&mut h, f);
     }
     let mut out = String::with_capacity(64);
@@ -252,12 +280,12 @@ mod tests {
             bytes: b"x".to_vec(),
         };
         assert_eq!(
-            content_hash(&a, &[], &[], &None, &None, &None, &None),
-            content_hash(&a, &[], &[], &None, &None, &None, &None)
+            content_hash(&a, &[], &[], &None, &None, &None, &None, &None, &None),
+            content_hash(&a, &[], &[], &None, &None, &None, &None, &None, &None)
         );
         assert_ne!(
-            content_hash(&a, &[], &[], &None, &None, &None, &None),
-            content_hash(&b, &[], &[], &None, &None, &None, &None)
+            content_hash(&a, &[], &[], &None, &None, &None, &None, &None, &None),
+            content_hash(&b, &[], &[], &None, &None, &None, &None, &None, &None)
         );
     }
 

@@ -135,6 +135,18 @@ struct AppState {
     /// this deploy artifact. Startup-only, not poller-refreshed: see
     /// `build_state`'s doc comment for why.
     source_check: Option<crate::context::SourceCheck>,
+    /// ADR 0018 §7: the bound semantic model, precomputed once at startup
+    /// from `cell.def.semantic` — `?model=<name>`/`datamk://.../semantic/
+    /// <name>` build `SemanticModelDoc` from this without touching the cell
+    /// mutex or the filesystem on the request path. `None` without a bound
+    /// `semantic_model:`.
+    semantic_index: Option<crate::ossie::bind::SemanticIndex>,
+    /// The fresh `.cell/semantic_check.json` record (ADR 0018 §6/§7), read
+    /// once at startup exactly like `source_check` — never poller-refreshed,
+    /// for the same reason: it ships inside the same deploy artifact as
+    /// `cell.yaml`, so a new one only ever reaches a running pod through a
+    /// rollout.
+    semantic_check: Option<crate::ossie::record::SemanticCheckRecord>,
     /// H3: a short hash over `source_check`/`source_descriptions`,
     /// precomputed at startup exactly like `docs_bundle_sha12` — folded
     /// into every `/context` `ETag`, not just the `?include=docs` variant.
@@ -253,6 +265,7 @@ fn mount_single(
 ) -> Result<(Arc<AppState>, BannerRow)> {
     let cell = engine::open(file, profile, /* read_only */ true)?;
     refuse_stale_discovery(&cell)?;
+    refuse_stale_semantic_model(&cell, file)?;
     let cell_name = cell.def.cell.clone();
     // Single-cell mode mounts at the root (ADR 0014): nesting it would break
     // every deployed URL, every Kubernetes probe path, and every `mesh emit`
@@ -343,6 +356,7 @@ fn mount_project(
         // reviewable act.
         let cell = engine::open_with(&pc.file, &pc.profile, /* read_only */ true, &budget)
             .and_then(|c| refuse_stale_discovery(&c).map(|_| c))
+            .and_then(|c| refuse_stale_semantic_model(&c, &pc.file).map(|_| c))
             .with_context(|| {
                 format!(
                     "opening cells[{}] ({}, profile `{}`) declared in {} — every listed cell \
@@ -618,6 +632,25 @@ fn refuse_stale_discovery(cell: &engine::Cell) -> Result<()> {
     Ok(())
 }
 
+/// ADR 0018 §4: `cell.def.semantic` is `None` on a cell that declares
+/// `semantic_model:` iff `config::load` found no fresh
+/// `.cell/semantic_model.json` — same "start over an empty interface never
+/// happens silently" discipline as `refuse_stale_discovery`, applied to the
+/// Ossie half. `datamk context`, run as a separate process, warns and emits
+/// instead (`build_document_for`) — `serve` is the one door that refuses.
+fn refuse_stale_semantic_model(cell: &engine::Cell, file: &Path) -> Result<()> {
+    if cell.def.semantic_model.is_some() && cell.def.semantic.is_none() {
+        anyhow::bail!(
+            "cell '{}' declares `semantic_model:` but .cell/semantic_model.json is missing or \
+             stale (cell.yaml changed since the last sync) — run `datamk sync -f {}` and \
+             restart",
+            cell.def.cell,
+            file.display()
+        );
+    }
+    Ok(())
+}
+
 /// Build the serving state from an opened cell. Split from `run` so the
 /// in-process smoke tests can stand up the exact router `serve` binds,
 /// without a socket. Returns the store handle separately (published mode)
@@ -757,6 +790,23 @@ fn build_state(
     // recomputed on the request path, same discipline as `docs_bundle_sha12`.
     let observed_bundle_sha12 = observed_bundle_sha12(source_check.as_ref(), &source_descriptions);
 
+    // ADR 0018 §6/§7: same `fresh_for` gate as `source_check` above. Startup
+    // has already refused to run (`refuse_stale_semantic_model`) if
+    // `semantic_model:` is declared and `cell.def.semantic` is `None`, so
+    // reaching here with `semantic_index: Some` means the cell is bound.
+    //
+    // M1: restricted to `all_routes` (the same discoverable list the
+    // context document and OpenAPI already derive from) — this is the
+    // index `?model=`/the MCP resource read, so it must never carry a
+    // private export's route key the way `cell.def.semantic` (bound
+    // against the full interface) does.
+    let semantic_index = cell.def.semantic.as_ref().map(|idx| {
+        let route_keys: Vec<String> = all_routes.iter().map(|(r, _)| r.clone()).collect();
+        idx.restricted_to(&route_keys)
+    });
+    let semantic_check =
+        crate::ossie::record::SemanticCheckRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile);
+
     let state = Arc::new(AppState {
         // Under --no-data the OpenAPI paths are empty: the spec describes
         // the callable HTTP surface, and the data routes are not mounted.
@@ -768,6 +818,8 @@ fn build_state(
             if data_mounted { &mounted } else { &[] },
             &all_routes,
             &cell.def.definitions,
+            &interface.semantic_models,
+            &interface.semantic_lookup,
             &digest,
             base_path,
         ),
@@ -799,6 +851,8 @@ fn build_state(
         docs_fingerprints,
         docs_bundle_sha12,
         source_check,
+        semantic_index,
+        semantic_check,
         observed_bundle_sha12,
         base_path: base_path.to_string(),
         cell: Mutex::new(cell),
@@ -1303,25 +1357,34 @@ pub(crate) const INCLUDE_SECTIONS: &[&str] = &["docs"];
 /// `?terms=` cap (ADR 0017 §3) — the largest known estate at request time.
 const MAX_TERMS: usize = 64;
 
-/// The two query parameters `/context`/`/context/{route}` accept, already
+/// `?model=` grammar (ADR 0018 §7) — looser than `terms` (`.` and `-` are
+/// common in a modeling tool's model names) but still bounded and closed.
+const MODEL_TOKEN_MAX: usize = 128;
+
+/// The query parameters `/context`/`/context/{route}` accept, already
 /// validated against the closed grammar — deduplicated, insertion order.
 struct ContextQuery {
     include: Vec<String>,
     terms: Vec<String>,
+    model: Option<String>,
 }
 
-/// Validate `/context`'s query string against the closed `{include, terms}`
-/// grammar (ADR 0013 §4, extended by ADR 0017 §3): `include`'s value is a
-/// comma-separated list drawn from `INCLUDE_SECTIONS`; `terms`'s value is a
-/// comma-separated list of tokens matching `[A-Za-z0-9_.-]`, capped at
-/// `MAX_TERMS`. Any other parameter, an empty value, an empty segment, or
-/// an out-of-grammar token is a 400. Takes the raw pairs (not a `HashMap`)
-/// so repeated keys are seen rather than silently collapsed — the
-/// discipline `serve_export`'s `validate_params` already established.
+/// Validate `/context`'s query string against the closed `{include, terms,
+/// model}` grammar (ADR 0013 §4, extended by ADR 0017 §3 and ADR 0018 §7):
+/// `include`'s value is a comma-separated list drawn from
+/// `INCLUDE_SECTIONS`; `terms`'s value is a comma-separated list of tokens
+/// matching `[A-Za-z0-9_.-]`, capped at `MAX_TERMS`; `model`'s value is one
+/// token matching `[A-Za-z0-9_.-]{1,128}` — given more than once, a 400 (no
+/// comma-list semantics: a document names one model, not several). Any
+/// other parameter, an empty value, an empty segment, or an out-of-grammar
+/// token is a 400. Takes the raw pairs (not a `HashMap`) so repeated keys
+/// are seen rather than silently collapsed — the discipline
+/// `serve_export`'s `validate_params` already established.
 fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<ContextQuery, String> {
     let mut include: Vec<String> = Vec::new();
     let mut terms: Vec<String> = Vec::new();
     let mut terms_seen = 0usize;
+    let mut model: Option<String> = None;
     for (k, v) in pairs {
         match k.as_str() {
             "include" => {
@@ -1374,15 +1437,39 @@ fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<Con
                     }
                 }
             }
+            "model" => {
+                if model.is_some() {
+                    return Err("`model` can only be given once".to_string());
+                }
+                if v.is_empty() || v.len() > MODEL_TOKEN_MAX {
+                    return Err(format!(
+                        "`model` must be 1-{MODEL_TOKEN_MAX} characters matching \
+                         [A-Za-z0-9_.-]"
+                    ));
+                }
+                if !v
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+                {
+                    return Err(format!(
+                        "`model` value '{v}' has characters outside [A-Za-z0-9_.-]"
+                    ));
+                }
+                model = Some(v.clone());
+            }
             other => {
                 return Err(format!(
                     "unknown query parameter '{other}' — `/context` accepts `include` \
-                     (sections: docs) and `terms`"
+                     (sections: docs), `terms`, and `model`"
                 ));
             }
         }
     }
-    Ok(ContextQuery { include, terms })
+    Ok(ContextQuery {
+        include,
+        terms,
+        model,
+    })
 }
 
 /// Case-insensitive term/alias lookup over `s.interface.definitions`,
@@ -1411,7 +1498,59 @@ fn resolve_terms(s: &AppState, tokens: &[String]) -> Vec<String> {
             }
         }
     }
+    // ADR 0018 §7: fold in every Ossie hit too — a distinct, unambiguous key
+    // per hit (kind/model/dataset/field/token, `ossie:`-prefixed so it can
+    // never collide with a plain definition term) — so the ETag changes
+    // when the resolved Ossie objects change even though no `definitions:`
+    // term did. `context_etag`'s docs-variant sub-filter only ever matches
+    // `definition:<term>` page targets against this list, so these extra
+    // entries are inert there.
+    for m in crate::context::resolve_semantic_matches(tokens, &s.interface.semantic_lookup) {
+        matched.push(format!(
+            "ossie:{}:{}:{}:{}:{}",
+            m.kind,
+            m.model,
+            m.dataset.as_deref().unwrap_or("-"),
+            m.field.as_deref().unwrap_or("-"),
+            m.token
+        ));
+    }
     matched
+}
+
+/// `?model=<name>` (ADR 0018 §7): the resolved model's document, or the 404
+/// body naming the models that exist. Callers only invoke this when
+/// `query.model.is_some()`.
+#[allow(clippy::result_large_err)]
+fn resolve_model(
+    s: &AppState,
+    name: &str,
+) -> std::result::Result<crate::context::SemanticModelDoc, Response> {
+    let model = s.semantic_index.as_ref().and_then(|idx| {
+        idx.model(name)
+            .map(|m| crate::context::semantic_model_doc(m, idx, s.semantic_check.as_ref()))
+    });
+    model.ok_or_else(|| {
+        let mut known: Vec<&str> = s
+            .interface
+            .semantic_models
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        known.sort_unstable();
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no semantic model '{name}' — known models: {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ),
+        )
+            .into_response()
+    })
 }
 
 /// `GET /context` (ADR 0012, docs door: ADR 0013 §4). Same auth tier as the
@@ -1445,12 +1584,29 @@ async fn context_doc(
     // variant — `narrow_terms` reports it in `missing_terms`, never a 400.
     let terms = (!query.terms.is_empty()).then(|| resolve_terms(&s, &query.terms));
 
+    // ADR 0018 §7: resolved before the ETag (a 404 must never carry one),
+    // and reused below rather than re-resolved after `build_context_document`.
+    let semantic_model = match &query.model {
+        Some(name) => match resolve_model(&s, name) {
+            Ok(doc) => Some(doc),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+
     // The interface digest names the interface; the ETag names a
-    // representation of it (ADR 0013 §6, ADR 0017 §4) — every suffix below
-    // is either precomputed at startup or, for `~terms`/`~docs` under a
-    // filter, a bounded in-memory hash over data already resident in
-    // `AppState` (ADR 0017 §4) — never a filesystem, store, or DuckDB read.
-    let etag = context_etag(&s, want_docs, None, terms.as_deref());
+    // representation of it (ADR 0013 §6, ADR 0017 §4, ADR 0018 §7): every
+    // suffix below is either precomputed at startup or, for
+    // `~terms`/`~docs`/`~model` under a filter, a bounded in-memory hash (or
+    // a plain name) over data already resident in `AppState` — never a
+    // filesystem, store, or DuckDB read.
+    let etag = context_etag(
+        &s,
+        want_docs,
+        None,
+        terms.as_deref(),
+        query.model.as_deref(),
+    );
     if matches_etag(&headers, &etag) {
         return not_modified(etag);
     }
@@ -1461,6 +1617,7 @@ async fn context_doc(
         let all_docs = doc.docs.clone();
         doc.narrow_terms(&query.terms, &s.interface.definitions, &all_docs);
     }
+    doc.semantic_model = semantic_model;
     if want_docs {
         // Whatever `doc.docs` holds at this point (the full list, or the
         // `terms=`-selected subset) — inlining only ever adds `content` to
@@ -1493,12 +1650,23 @@ async fn context_export(
         Ok(q) => q,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
+    // ADR 0018 §7: `model` is a whole-cell view — composing it with a route
+    // is a 400, checked before the route lookup so a bad `?model=` on an
+    // unknown route still reads as "you asked for something incoherent,"
+    // not "no such export."
+    if query.model.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "`model` is a whole-cell view; use `/context?model=`",
+        )
+            .into_response();
+    }
     let want_docs = query.include.iter().any(|s| s == "docs");
     let terms = (!query.terms.is_empty()).then(|| resolve_terms(&s, &query.terms));
     if !s.routes.contains_key(&route) {
         return (StatusCode::NOT_FOUND, unknown_route_message(&s, &route)).into_response();
     }
-    let etag = context_etag(&s, want_docs, Some(&route), terms.as_deref());
+    let etag = context_etag(&s, want_docs, Some(&route), terms.as_deref(), None);
     if matches_etag(&headers, &etag) {
         return not_modified(etag);
     }
@@ -1549,14 +1717,17 @@ fn unknown_route_message(s: &AppState, route: &str) -> String {
 /// distinct tag by construction); `~docs.<sha12>` adds the docs-content
 /// bundle for `?include=docs`, computed over the *selected* pages' sha256s
 /// in declared order when `terms` narrows it, or `s.docs_bundle_sha12`
-/// (precomputed at startup) otherwise. A cell with neither observed input
-/// present and no `terms=` keeps the exact byte-identical default ETag it
-/// always had (mesh.rs copies this verbatim into `context_digest`).
+/// (precomputed at startup) otherwise; `~model.<name>` (ADR 0018 §7) names a
+/// `?model=` narrowing — the plain name, not a hash: bounded, closed
+/// grammar, no benefit to hashing it. A cell with neither observed input
+/// present and no `terms=`/`model=` keeps the exact byte-identical default
+/// ETag it always had (mesh.rs copies this verbatim into `context_digest`).
 fn context_etag(
     s: &AppState,
     want_docs: bool,
     export: Option<&str>,
     terms: Option<&[String]>,
+    model: Option<&str>,
 ) -> String {
     let mut etag = format!("\"{}", s.digest);
     if let Some(obs) = &s.observed_bundle_sha12 {
@@ -1564,6 +1735,9 @@ fn context_etag(
     }
     if let Some(route) = export {
         etag.push_str(&format!("~export.{route}"));
+    }
+    if let Some(name) = model {
+        etag.push_str(&format!("~model.{name}"));
     }
     match terms {
         Some(canonical) => {
@@ -1704,6 +1878,7 @@ fn build_context_document(s: &AppState) -> crate::context::ContextDocument {
         channels: s.channels.clone(),
         direct_attach: s.direct_attach,
         is_all_never: s.is_all_never,
+        semantic_check: s.semantic_check.clone(),
     });
     if !s.data_mounted {
         // The same engine-emitted sentence the unmounted routes' 404 body
@@ -4066,6 +4241,162 @@ pub(in crate::serve) mod smoke {
             );
             assert_ne!(etag4, etag1);
         });
+    }
+
+    // --- ADR 0018 §7: `?model=`/`?terms=` over a bound semantic model ------
+
+    /// `router_with`, plus a bound semantic model over the scaffold's own
+    /// `orders_daily@2` export — one model, `invoice`, one dataset bound by
+    /// name.
+    fn router_with_semantic() -> Router {
+        router_with(|cell| {
+            let routes = crate::context::discoverable_routes(&cell.def).unwrap();
+            let model = crate::ossie::SemanticModel {
+                name: "invoice".to_string(),
+                description: Some("Invoice-side facts.".to_string()),
+                ai_context: None,
+                datasets: vec![crate::ossie::Dataset {
+                    name: "orders_daily".to_string(),
+                    source: "orders_daily".to_string(),
+                    primary_key: vec![],
+                    unique_keys: vec![],
+                    description: None,
+                    ai_context: None,
+                    fields: vec![],
+                    custom_extensions: vec![],
+                }],
+                relationships: vec![],
+                metrics: vec![],
+                custom_extensions: vec![],
+            };
+            let record = crate::ossie::record::SemanticModelRecord {
+                datamk_version: "0.0.0".to_string(),
+                cell_yaml_digest: "d".to_string(),
+                synced_at: "2026-09-10T00:00:00Z".to_string(),
+                source: crate::ossie::source::SemanticModelSource::Dir {
+                    dir: "osi".to_string(),
+                },
+                resolved: crate::ossie::record::Resolved::Dir {
+                    dir: "/abs/osi".to_string(),
+                },
+                content_sha256: "abc123".to_string(),
+                files: vec!["invoice.yaml".to_string()],
+                model_files: indexmap::IndexMap::from([(
+                    "invoice".to_string(),
+                    "invoice.yaml".to_string(),
+                )]),
+                document: crate::ossie::Document {
+                    version: "0.1.1".to_string(),
+                    dialects: vec![],
+                    vendors: vec![],
+                    semantic_model: vec![model],
+                },
+            };
+            cell.def.semantic = Some(crate::ossie::bind::SemanticIndex::build(
+                record,
+                &routes.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+            ));
+        })
+    }
+
+    #[test]
+    fn model_query_param_returns_the_full_model_with_a_distinct_etag() {
+        let router = router_with_semantic();
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?model=invoice", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["semantic_model"]["name"], "invoice");
+            assert_eq!(
+                v["semantic_model"]["datasets"][0]["dataset"],
+                "orders_daily"
+            );
+            // `semantic_models[]` (the index) is unconditional.
+            assert_eq!(v["semantic_models"][0]["name"], "invoice");
+
+            let (_, h_plain, _) = get_with_headers(&router, "/context", &[]).await;
+            let (_, h_model, _) = get_with_headers(&router, "/context?model=invoice", &[]).await;
+            let etag_plain = h_plain
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let etag_model = h_model
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_ne!(etag_plain, etag_model);
+            assert!(etag_model.contains("~model.invoice"), "{etag_model}");
+
+            let (status, _, _) = get_with_headers(
+                &router,
+                "/context?model=invoice",
+                &[("if-none-match", &etag_model)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED);
+        });
+    }
+
+    #[test]
+    fn unknown_model_is_404_naming_the_known_ones() {
+        let router = router_with_semantic();
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?model=nope", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains("invoice"), "{body}");
+        });
+    }
+
+    #[test]
+    fn model_on_the_route_door_is_400() {
+        let router = router_with_semantic();
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context/orders_daily@2?model=invoice", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("whole-cell view"), "{body}");
+        });
+    }
+
+    #[test]
+    fn unknown_context_query_param_names_include_terms_and_model() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?bogus=1", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("`include`"), "{body}");
+            assert!(body.contains("`terms`"), "{body}");
+            assert!(body.contains("`model`"), "{body}");
+        });
+    }
+
+    /// ADR 0018 §4: `serve` refuses to start when `semantic_model:` is
+    /// declared and `cell.def.semantic` never bound (no fresh
+    /// `.cell/semantic_model.json`) — the sibling of
+    /// `refuse_stale_discovery`, checked directly rather than through a
+    /// full `mount_single` (which would need a real Ossie source on disk
+    /// just to be declared, never synced).
+    #[test]
+    fn refuse_stale_semantic_model_blocks_a_declared_but_unsynced_source() {
+        let scaffold = built_cell();
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell = engine::open(&cell_yaml, "local", true).expect("open built cell read-only");
+        cell.def.semantic_model = Some(crate::ossie::source::SemanticModelSource::Dir {
+            dir: "osi".to_string(),
+        });
+        // `cell.def.semantic` stays `None`: `config::load` never found a
+        // fresh sidecar record for this made-up declaration.
+        let err = refuse_stale_semantic_model(&cell, &cell_yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("semantic_model:"), "{msg}");
+        assert!(msg.contains("datamk sync"), "{msg}");
+
+        // A cell with no `semantic_model:` at all is unaffected.
+        cell.def.semantic_model = None;
+        assert!(refuse_stale_semantic_model(&cell, &cell_yaml).is_ok());
     }
 
     /// ADR 0013 §10: docs stay available under `--no-data` — the withheld

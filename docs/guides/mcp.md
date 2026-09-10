@@ -45,6 +45,7 @@ count. Follow `next.offset`.
 | `datamk://<mount>/context` | The context document. |
 | `datamk://<mount>/context/<route>` | One export, docs inlined. |
 | `datamk://<mount>/docs/<target>` | One docs page. Targets: `cell`, `<route>`, `definition:<term>`. |
+| `datamk://<mount>/semantic/<model>` | One Apache Ossie semantic model in full (ADR 0018) — the same document `?model=<name>` returns. One resource per bound model. |
 
 `<mount>` is the cell name, or the mount segment in a project.
 

@@ -54,10 +54,16 @@ pub enum Command {
     Init(InitArgs),
     /// Execute the transform pipeline, commit a snapshot, auto-verify (the Builder workload)
     Run(RunArgs),
-    /// Discover the interface from a modeling tool's deployed state and
-    /// record it (`discover:` cells, ADR 0016). Reads the tool's state store
-    /// and the warehouse — read-only — and writes .cell/deployed_catalog.json,
-    /// which `verify`, `context` and `serve` then read with no credentials.
+    /// Refresh a cell's external state: the discovered interface
+    /// (`discover:`, ADR 0016) and/or the ingested Apache Ossie semantic
+    /// model (`semantic_model:`, ADR 0018) — whichever the cell declares;
+    /// at least one is required. `discover:` reads the modeling tool's
+    /// state store and the warehouse (read-only) and writes
+    /// .cell/deployed_catalog.json; `semantic_model:` reads a directory or
+    /// a git ref and writes .cell/semantic_model.json. Both are
+    /// credential-light sidecars — `verify`, `context` and `serve` read
+    /// them, never the source directly. Needs no profile when the cell
+    /// declares `semantic_model:` only.
     Sync(SyncArgs),
     /// Machine-verify actual output against the declared interface
     Verify(FileArgs),
@@ -277,6 +283,11 @@ pub struct ContextArgs {
     /// be re-requested.
     #[arg(long, value_name = "TERMS", value_delimiter = ',')]
     pub terms: Option<Vec<String>>,
+    /// Narrow the document to one Apache Ossie semantic model in full (ADR
+    /// 0018 §7) — the portable twin of `GET /context?model=<name>`. A
+    /// whole-cell view: mutually exclusive with `--export`.
+    #[arg(long, value_name = "NAME")]
+    pub model: Option<String>,
 }
 
 #[derive(Args)]
