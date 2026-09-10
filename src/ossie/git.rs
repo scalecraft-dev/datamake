@@ -388,28 +388,57 @@ fn finalize_checkout(
     path: Option<&str>,
     opts: &FetchOptions,
 ) -> Result<()> {
+    // Cone-mode sparse checkout takes *directories*. A `path` naming a
+    // single file works on the first clone by accident (git records
+    // `<file>/` and the parent's non-recursive pattern happens to include
+    // the file) and fails on every refresh ("is not a directory"), so ask
+    // the object store what the path is first and sparse-checkout the
+    // narrowest directory that contains it. `<target>:<path>` is a
+    // revision expression, never a pathspec, so no `--` applies; `path`
+    // was validated by `validate_path` before any spawn.
     if let Some(p) = path {
-        run_git(
+        let kind = run_git(
             Some(checkout_dir),
             &[
-                "sparse-checkout".to_string(),
-                "init".to_string(),
-                "--cone".to_string(),
+                "cat-file".to_string(),
+                "-t".to_string(),
+                format!("{target}:{p}"),
             ],
             opts,
         )
-        .map_err(|e| generic_error("git sparse-checkout init", &e))?;
-        run_git(
-            Some(checkout_dir),
-            &[
-                "sparse-checkout".to_string(),
-                "set".to_string(),
-                "--".to_string(),
-                p.to_string(),
-            ],
-            opts,
-        )
-        .map_err(|e| generic_error("git sparse-checkout set", &e))?;
+        .map(|s| s.trim().to_string())
+        .map_err(|_| {
+            anyhow!(
+                "`semantic_model.path: {p}` does not exist in the repository at {} — check \
+                 the subpath (default: repo root) and `ref`.",
+                git_ref.unwrap_or("HEAD")
+            )
+        })?;
+        let sparse_dir = match kind.as_str() {
+            "tree" => Some(p.to_string()),
+            "blob" => Path::new(p)
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.to_string_lossy().to_string()),
+            other => bail!(
+                "`semantic_model.path: {p}` is a git {other}, not a directory or file — \
+                 point `path:` at a directory of Ossie files or one file."
+            ),
+        };
+        if let Some(dir) = sparse_dir {
+            run_git(
+                Some(checkout_dir),
+                &[
+                    "sparse-checkout".to_string(),
+                    "set".to_string(),
+                    "--cone".to_string(),
+                    "--".to_string(),
+                    dir,
+                ],
+                opts,
+            )
+            .map_err(|e| generic_error("git sparse-checkout set", &e))?;
+        }
     }
     // `target` is never attacker-controlled here — it's `fetch`'s own
     // literal `"HEAD"`/`"FETCH_HEAD"` or a sha already checked by
@@ -971,6 +1000,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
         let _ = std::fs::remove_dir_all(&cell_dir);
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A `path` naming one file (not a directory) must survive the refresh:
+    /// cone-mode sparse checkout takes directories, so the parent is what
+    /// gets sparse-checked-out, on the clone AND on the second sync.
+    #[test]
+    fn a_file_path_is_fetched_and_refreshed_via_its_parent_directory() {
+        let (bare, first_commit) = make_bare_repo();
+        let cell_dir = tempdir("cell-file-path");
+        let opts = FetchOptions {
+            allow_local: true,
+            timeout: Duration::from_secs(30),
+        };
+        let first = fetch(
+            &cell_dir,
+            bare.to_str().unwrap(),
+            Some("osi/model.yaml"),
+            Some("main"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(first.commit, first_commit);
+        assert!(
+            first.checkout_dir.is_file(),
+            "{}",
+            first.checkout_dir.display()
+        );
+
+        // Second call: the cache exists, so this is the refresh path that
+        // used to fail with "is not a directory".
+        let second = fetch(
+            &cell_dir,
+            bare.to_str().unwrap(),
+            Some("osi/model.yaml"),
+            Some("main"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(second.commit, first_commit);
+        assert!(second.checkout_dir.is_file());
+
+        // A path that is neither a tree nor a blob at that ref is named.
+        let err = fetch(
+            &cell_dir,
+            bare.to_str().unwrap(),
+            Some("osi/nope.yaml"),
+            Some("main"),
+            &opts,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist in the repository"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&cell_dir);
     }
 
     // --- M2: timeout kills the whole process group, never hangs -----------
