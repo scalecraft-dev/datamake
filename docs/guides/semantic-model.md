@@ -44,6 +44,12 @@ dot-files skipped) must be a valid Ossie document: `version` ∈ `0.1.1`,
 `semantic_model:` list. Semantic model names are unique across the walk;
 dataset names are unique within their model.
 
+Because `dir:` may leave the cell directory (e.g. `dir: ..`), the walk also
+skips any directory named `profiles` or `.cell` at any depth, and never
+reads a file named `cell.yaml` — a wide `dir:` must not pull in a sibling
+cell's environment config or echo `cell.yaml`'s own top-level keys into an
+"not an Ossie document" error.
+
 ## Sync
 
 ```bash

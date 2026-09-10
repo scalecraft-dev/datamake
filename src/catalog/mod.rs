@@ -305,7 +305,7 @@ fn sync_semantic(
                 r#ref.as_deref(),
                 &git::FetchOptions::default(),
             )
-            .with_context(|| format!("fetching `semantic_model.git: {url}`"))?;
+            .with_context(|| format!("fetching `semantic_model.git: {}`", git::redact_url(url)))?;
             let r = Resolved::Commit {
                 commit: fetched.commit.clone(),
             };

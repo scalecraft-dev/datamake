@@ -748,6 +748,29 @@ pub struct SemanticModelIndexDoc {
     pub metrics: usize,
 }
 
+/// The served/emitted form of `Resolved` (ADR 0018 §4/§7, M7):
+/// `{"commit": "…"}` for a git source, `{"dir": true}` for a directory
+/// source — never `Resolved::Dir`'s absolute path, which names a directory
+/// on the sync host and stays in the sidecar (`.cell/semantic_model.json`)
+/// only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ResolvedDoc {
+    Commit { commit: String },
+    Dir { dir: bool },
+}
+
+impl From<&crate::ossie::record::Resolved> for ResolvedDoc {
+    fn from(r: &crate::ossie::record::Resolved) -> Self {
+        match r {
+            crate::ossie::record::Resolved::Commit { commit } => ResolvedDoc::Commit {
+                commit: commit.clone(),
+            },
+            crate::ossie::record::Resolved::Dir { .. } => ResolvedDoc::Dir { dir: true },
+        }
+    }
+}
+
 /// The ingested semantic model's own provenance (ADR 0018 §4/§7) — a
 /// measurement, outside every digest. `synced_at`/`content_sha256`/
 /// `resolved`/`files` are `datamk sync`'s stamp; `checked_at` is `datamk
@@ -756,7 +779,7 @@ pub struct SemanticModelIndexDoc {
 pub struct SemanticBlock {
     pub synced_at: String,
     pub content_sha256: String,
-    pub resolved: crate::ossie::record::Resolved,
+    pub resolved: ResolvedDoc,
     pub files: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<String>,
@@ -890,10 +913,11 @@ pub struct SemanticModelDoc {
     pub metrics: Vec<MetricDoc>,
 }
 
-/// One `?terms=` hit against an Ossie name or synonym (ADR 0018 §7) —
-/// `kind` is `"dataset"`, `"field"`, `"metric"`, or `"synonym"`; a model
-/// name is not itself addressable (it names no one of those four). Every
-/// hit is returned, so a token colliding across two models lists both.
+/// One `?terms=` hit against an Ossie name or synonym (ADR 0018 §7, M8) —
+/// `kind` is `"model"`, `"dataset"`, `"field"`, `"metric"`, or `"synonym"`.
+/// `dataset`/`field` are `None` for a `"model"` hit (it names no one of
+/// those). Every hit is returned, so a token colliding across two models
+/// lists both.
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticMatch {
     pub token: String,
@@ -1021,6 +1045,16 @@ pub fn interface(
     routes: &[(String, Export)],
     source_descriptions: &IndexMap<String, IndexMap<String, String>>,
 ) -> Interface {
+    // M1: every consumer of this document reads the index restricted to
+    // `routes` (already the visibility-filtered list, ADR 0012 §4) — never
+    // `def.semantic` directly, which is bound against the full interface
+    // and would leak a private export's route key into `DatasetDoc.routes`
+    // and `semantic_models[].bound`.
+    let route_keys: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+    let semantic_index = def
+        .semantic
+        .as_ref()
+        .map(|idx| idx.restricted_to(&route_keys));
     let exports = routes
         .iter()
         .map(|(route, e)| {
@@ -1076,8 +1110,7 @@ pub fn interface(
                 deployed: e.discovered.as_ref().map(DeployedBlock::from),
                 probe: None,
                 check: None,
-                semantic: def
-                    .semantic
+                semantic: semantic_index
                     .as_ref()
                     .map(|index| route_semantic_docs(index, route))
                     .unwrap_or_default(),
@@ -1106,13 +1139,13 @@ pub fn interface(
         from.insert("description".to_string(), Origin::CellYaml);
     }
 
-    let (semantic_models, semantic, semantic_lookup) = match &def.semantic {
+    let (semantic_models, semantic, semantic_lookup) = match &semantic_index {
         Some(index) => (
             semantic_models_index(index),
             Some(SemanticBlock {
                 synced_at: index.synced_at().to_string(),
                 content_sha256: index.content_sha256().to_string(),
-                resolved: index.resolved().clone(),
+                resolved: ResolvedDoc::from(index.resolved()),
                 files: index.files().len(),
                 checked_at: None, // `assemble` overlays from a fresh semantic-check record
             }),
@@ -1348,7 +1381,7 @@ fn synonyms_of(ai: &Option<crate::ossie::AiContext>) -> &[String] {
 /// `[A-Za-z0-9_.-]{1,64}`. A synonym outside this grammar is kept in
 /// `semantic_model`'s prose but never indexed here — `datamk sync` warns
 /// about it at ingest time.
-fn is_addressable_token(s: &str) -> bool {
+pub(crate) fn is_addressable_token(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes()
@@ -1356,14 +1389,48 @@ fn is_addressable_token(s: &str) -> bool {
 }
 
 /// Every addressable Ossie name/synonym across the whole bound semantic
-/// model (ADR 0018 §7), indexed once: dataset and field names/synonyms
-/// point at their dataset; metric names/synonyms point at their metric. A
-/// model's own name/synonyms are not indexed — `kind` has no `"model"`
-/// variant, only `dataset`/`field`/`metric`/`synonym`.
+/// model (ADR 0018 §7, M6/M8), indexed once: dataset and field
+/// names/synonyms point at their dataset; metric names/synonyms point at
+/// their metric; a model's own name and `ai_context.synonyms` are indexed
+/// too, `kind: "model"`, `dataset`/`field` both `None` — `datamk sync`
+/// warns about a model-level synonym that fails the token grammar on the
+/// same premise as every other level (that it would otherwise be
+/// addressable), so it must actually be indexed here. `is_addressable_token`
+/// gates every name here, not just synonyms — a dataset/field/metric/model
+/// name with a space would otherwise reach `?terms=`'s lookup and the
+/// `model` OpenAPI enum and then 400 at the door; a non-addressable name
+/// stays in the document (`semantic_model`/`exports[].semantic`), just not
+/// in this index.
 fn semantic_lookup_entries(index: &crate::ossie::bind::SemanticIndex) -> Vec<SemanticLookupEntry> {
     let mut out = Vec::new();
     for model in index.models() {
+        if is_addressable_token(&model.name) {
+            out.push(SemanticLookupEntry {
+                token: model.name.clone(),
+                kind: "model".to_string(),
+                model: model.name.clone(),
+                dataset: None,
+                field: None,
+                description: model.description.clone(),
+            });
+        }
+        for syn in synonyms_of(&model.ai_context)
+            .iter()
+            .filter(|s| is_addressable_token(s))
+        {
+            out.push(SemanticLookupEntry {
+                token: syn.clone(),
+                kind: "synonym".to_string(),
+                model: model.name.clone(),
+                dataset: None,
+                field: None,
+                description: model.description.clone(),
+            });
+        }
         for ds in &model.datasets {
+            if !is_addressable_token(&ds.name) {
+                continue;
+            }
             out.push(SemanticLookupEntry {
                 token: ds.name.clone(),
                 kind: "dataset".to_string(),
@@ -1386,14 +1453,16 @@ fn semantic_lookup_entries(index: &crate::ossie::bind::SemanticIndex) -> Vec<Sem
                 });
             }
             for f in &ds.fields {
-                out.push(SemanticLookupEntry {
-                    token: f.name.clone(),
-                    kind: "field".to_string(),
-                    model: model.name.clone(),
-                    dataset: Some(ds.name.clone()),
-                    field: Some(f.name.clone()),
-                    description: f.description.clone(),
-                });
+                if is_addressable_token(&f.name) {
+                    out.push(SemanticLookupEntry {
+                        token: f.name.clone(),
+                        kind: "field".to_string(),
+                        model: model.name.clone(),
+                        dataset: Some(ds.name.clone()),
+                        field: Some(f.name.clone()),
+                        description: f.description.clone(),
+                    });
+                }
                 for syn in synonyms_of(&f.ai_context)
                     .iter()
                     .filter(|s| is_addressable_token(s))
@@ -1410,14 +1479,16 @@ fn semantic_lookup_entries(index: &crate::ossie::bind::SemanticIndex) -> Vec<Sem
             }
         }
         for m in &model.metrics {
-            out.push(SemanticLookupEntry {
-                token: m.name.clone(),
-                kind: "metric".to_string(),
-                model: model.name.clone(),
-                dataset: None,
-                field: None,
-                description: m.description.clone(),
-            });
+            if is_addressable_token(&m.name) {
+                out.push(SemanticLookupEntry {
+                    token: m.name.clone(),
+                    kind: "metric".to_string(),
+                    model: model.name.clone(),
+                    dataset: None,
+                    field: None,
+                    description: m.description.clone(),
+                });
+            }
             for syn in synonyms_of(&m.ai_context)
                 .iter()
                 .filter(|s| is_addressable_token(s))
@@ -2290,12 +2361,24 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
         docs: Vec<DocsProjection<'a>>,
         include_request: &'a str,
         data: &'a DataBlock,
-        // ADR 0018 §7: lookup keys only — sorted model, dataset, field, and
-        // metric names, plus addressable synonyms. Never prose (a
-        // description edit), never verification (a `datamk verify` re-run):
-        // this must change only when a *name* an agent could address
-        // appears, disappears, or is renamed.
-        semantic_keys: Vec<&'a str>,
+        // ADR 0018 §7/M3: lookup keys only — every addressable model,
+        // dataset, field, and metric name plus synonym, sorted as full
+        // `(kind, model, dataset, field, token)` tuples, never bare tokens
+        // — a bare-token set can't tell "field `amount` moved from dataset
+        // `a` to dataset `b`" from "nothing changed" when both datasets
+        // have a same-named field. Never prose (a description edit), never
+        // verification (a `datamk verify` re-run): this must change only
+        // when a *name* (or where it points) an agent could address
+        // appears, disappears, moves, or is renamed.
+        semantic_keys: Vec<SemanticKeyProjection<'a>>,
+    }
+    #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    struct SemanticKeyProjection<'a> {
+        kind: &'a str,
+        model: &'a str,
+        dataset: &'a str,
+        field: &'a str,
+        token: &'a str,
     }
     #[derive(Serialize)]
     struct ExportProjection<'a> {
@@ -2402,13 +2485,21 @@ pub fn interface_digest(cell: &str, interface: &Interface, data: &DataBlock) -> 
         include_request: &interface.include_request,
         data,
         semantic_keys: {
-            let mut keys: Vec<&str> = interface
-                .semantic_models
+            // `semantic_lookup` already carries a `"model"`-kind entry for
+            // every addressable model name/synonym (M8) — nothing further
+            // needs folding in from `semantic_models[]`.
+            let mut keys: Vec<SemanticKeyProjection> = interface
+                .semantic_lookup
                 .iter()
-                .map(|m| m.name.as_str())
-                .chain(interface.semantic_lookup.iter().map(|e| e.token.as_str()))
+                .map(|e| SemanticKeyProjection {
+                    kind: e.kind.as_str(),
+                    model: e.model.as_str(),
+                    dataset: e.dataset.as_deref().unwrap_or(""),
+                    field: e.field.as_deref().unwrap_or(""),
+                    token: e.token.as_str(),
+                })
                 .collect();
-            keys.sort_unstable();
+            keys.sort();
             keys.dedup();
             keys
         },
@@ -2714,9 +2805,18 @@ pub fn build_document_for(
     // with `--export` (checked at the top of this function), and errors
     // naming the known models — the `--terms` precedent.
     if let Some(name) = model {
-        let index = loaded.def.semantic.as_ref();
-        let found =
-            index.is_some_and(|idx| doc.with_semantic_model(idx, name, semantic_check.as_ref()));
+        // M1: `--model` must never show a private export's route key —
+        // restrict to the same discoverable route list `interface` (and
+        // `doc` itself) was built from.
+        let route_keys: Vec<String> = routes.iter().map(|(r, _)| r.clone()).collect();
+        let index = loaded
+            .def
+            .semantic
+            .as_ref()
+            .map(|idx| idx.restricted_to(&route_keys));
+        let found = index
+            .as_ref()
+            .is_some_and(|idx| doc.with_semantic_model(idx, name, semantic_check.as_ref()));
         if !found {
             anyhow::bail!(
                 "no semantic model '{name}' — known models: {}",
@@ -3035,6 +3135,97 @@ interface:
         assert!(!json.contains("internal"), "leaked private export: {json}");
     }
 
+    /// M1: an Ossie dataset bound (by name) to two majors of one export —
+    /// `orders@2` discoverable, `orders@1` private — must show only the
+    /// discoverable route once the index is narrowed the way `interface`
+    /// (every server/emitter) narrows it; `SemanticIndex::build`'s own
+    /// output (bound against the full interface) still carries both, which
+    /// is exactly the shape `restricted_to` exists to fix before a
+    /// document is built from it.
+    #[test]
+    fn interface_never_leaks_a_private_majors_route_through_semantic_routes() {
+        let def: CellDef = serde_yaml::from_str(
+            r#"
+cell: t
+interface:
+  - name: orders
+    version: 2.0.0
+    schema:
+      id: integer
+  - name: orders
+    version: 1.0.0
+    visibility: private
+    schema:
+      id: integer
+"#,
+        )
+        .unwrap();
+
+        let model = crate::ossie::SemanticModel {
+            name: "m".to_string(),
+            description: None,
+            ai_context: None,
+            datasets: vec![crate::ossie::Dataset {
+                name: "orders_ds".to_string(),
+                source: "orders".to_string(),
+                primary_key: vec![],
+                unique_keys: vec![],
+                description: None,
+                ai_context: None,
+                fields: vec![ossie_field("id", "id")],
+                custom_extensions: vec![],
+            }],
+            relationships: vec![],
+            metrics: vec![],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: IndexMap::from([("m".to_string(), "m.yaml".to_string())]),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        let full_index = crate::ossie::bind::SemanticIndex::build(record, &def.interface);
+        // Sanity: the un-narrowed index (what `config::load` produces) does
+        // bind to both majors — the leak this test guards against is real
+        // absent `interface`'s own narrowing.
+        assert_eq!(
+            full_index.route_for("m", "orders_ds"),
+            ["orders@2", "orders@1"]
+        );
+
+        let mut def = def;
+        def.semantic = Some(full_index);
+
+        let routes = discoverable_routes(&def).unwrap();
+        assert_eq!(routes.len(), 1, "only orders@2 is discoverable");
+        let iface = interface(&def, &routes, &IndexMap::new());
+
+        let export = iface
+            .exports
+            .iter()
+            .find(|e| e.route == "orders@2")
+            .unwrap();
+        assert_eq!(export.semantic.len(), 1);
+        assert_eq!(export.semantic[0].routes, vec!["orders@2".to_string()]);
+
+        assert_eq!(iface.semantic_models[0].bound, 1);
+    }
+
     /// ADR 0012 §8: the serialization guard — a fully-populated document
     /// from a cell with raw/cell sources must carry nothing
     /// credentials- or URI-shaped. `Resolved*` types never derive
@@ -3060,6 +3251,40 @@ interface:
                 "context document leaked `{banned}`-shaped content: {json}"
             );
         }
+    }
+
+    /// M7: the served/emitted `semantic.resolved` carries `{"dir": true}`
+    /// for a directory source, never the sync host's absolute path
+    /// (`sample_semantic_index`'s record resolves to `/abs/osi`).
+    #[test]
+    fn semantic_block_resolved_never_carries_the_sync_hosts_absolute_path() {
+        let def = sample_def_with_semantic();
+        let routes = discoverable_routes(&def).unwrap();
+        let iface = interface(&def, &routes, &IndexMap::new());
+        let semantic = iface.semantic.expect("semantic block present");
+        assert_eq!(semantic.resolved, ResolvedDoc::Dir { dir: true });
+
+        let json = serde_json::to_string(&semantic).unwrap();
+        assert!(!json.contains("/abs/osi"), "{json}");
+        assert!(json.contains("\"dir\":true"), "{json}");
+    }
+
+    #[test]
+    fn resolved_doc_serializes_commit_and_dir_shapes() {
+        let commit = ResolvedDoc::from(&crate::ossie::record::Resolved::Commit {
+            commit: "4f2a91c".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(&commit).unwrap(),
+            serde_json::json!({"commit": "4f2a91c"})
+        );
+        let dir = ResolvedDoc::from(&crate::ossie::record::Resolved::Dir {
+            dir: "/abs/osi".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_value(&dir).unwrap(),
+            serde_json::json!({"dir": true})
+        );
     }
 
     /// ADR 0012 §5: the upstream edge is nominal — `{ref, version}` only,
@@ -4899,6 +5124,71 @@ interface:
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, "synonym");
         assert_eq!(hits[0].field.as_deref(), Some("revenue_field"));
+
+        // M8: a model's own name is indexed too, `kind: "model"`, with
+        // `dataset`/`field` both absent.
+        let hits = resolve_semantic_matches(&["invoice".to_string()], &lookup);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, "model");
+        assert_eq!(hits[0].model, "invoice");
+        assert!(hits[0].dataset.is_none());
+        assert!(hits[0].field.is_none());
+    }
+
+    /// M6: a name outside the addressable token grammar
+    /// (`[A-Za-z0-9_.-]{1,64}`) is not indexed for `?terms=`/the OpenAPI
+    /// enums — it still exists in the document (`semantic_model`/
+    /// `exports[].semantic`), just not in the lookup — mirroring what
+    /// already applied to synonyms before this fix reached dataset/field/
+    /// metric/model names too.
+    #[test]
+    fn non_addressable_names_are_not_indexed_but_still_appear_in_the_document() {
+        let mut ds = ossie_dataset("has space", "orders_daily", &[], vec![]);
+        ds.fields.push(ossie_field("also bad", "id"));
+        let model = crate::ossie::SemanticModel {
+            name: "model with space".to_string(),
+            description: None,
+            ai_context: None,
+            datasets: vec![ds],
+            relationships: vec![],
+            metrics: vec![crate::ossie::Metric {
+                name: "metric bad".to_string(),
+                expression: ansi("COUNT(*)"),
+                description: None,
+                datatype: None,
+                ai_context: None,
+                custom_extensions: vec![],
+            }],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: IndexMap::from([("model with space".to_string(), "m.yaml".to_string())]),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        let index = crate::ossie::bind::SemanticIndex::build(record, &[]);
+        let lookup = semantic_lookup_entries(&index);
+        assert!(lookup.is_empty(), "{lookup:?}");
+
+        // Still present in the model listing itself — not dropped, just
+        // not addressable.
+        assert_eq!(index.models()[0].name, "model with space");
+        assert_eq!(index.models()[0].datasets[0].name, "has space");
     }
 
     #[test]
@@ -5060,6 +5350,65 @@ interface:
             digest_of(&base),
             digest_of(&with_new_dataset),
             "a new addressable dataset name must move the digest"
+        );
+    }
+
+    /// M3: a bare token set can't distinguish "field `revenue_field` moved
+    /// from `orders_daily` to `advertisers`" from "nothing changed" — the
+    /// token itself is present before and after. The digest must move
+    /// anyway, because `interface_digest` projects `(kind, model, dataset,
+    /// field, token)` tuples, not bare tokens.
+    #[test]
+    fn semantic_digest_moves_when_a_field_moves_between_datasets_with_the_same_token() {
+        let def = sample_def();
+        let routes = discoverable_routes(&def).unwrap();
+
+        let mut def_base = def.clone();
+        def_base.semantic = Some(index_with_invoice_edit(&def, |_| {}));
+        let base = build(
+            &def_base,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+
+        let mut def_moved = def.clone();
+        def_moved.semantic = Some(index_with_invoice_edit(&def, |datasets| {
+            // `datasets[0]` is `orders_daily` (fields: order_date,
+            // revenue_field); `datasets[1]` is `advertisers` (field: name)
+            // — move `revenue_field` across, same field name, new dataset.
+            let moved = datasets[0].fields.remove(1);
+            assert_eq!(moved.name, "revenue_field");
+            datasets[1].fields.push(moved);
+        }));
+        let with_moved = build(
+            &def_moved,
+            &routes,
+            None,
+            None,
+            None,
+            Vec::new(),
+            IndexMap::new(),
+            IndexMap::new(),
+            true,
+            false,
+            false,
+            None,
+        );
+
+        assert_ne!(
+            digest_of(&base),
+            digest_of(&with_moved),
+            "a field moving to a different dataset must move the digest, even though the token \
+             set is unchanged"
         );
     }
 

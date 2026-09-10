@@ -88,6 +88,80 @@ fn describe_plan(conn: &Connection, sql: &str) -> std::result::Result<(), duckdb
 const NOTHING_EXECUTED: &str =
     "Nothing was executed: this is a plan-time check, no rows were read.";
 
+/// H2: what `assert_scalar_or_aggregate_shape` refuses — a foreign
+/// expression interpolated raw into `DESCRIBE SELECT <expr> FROM …` binds
+/// (not merely parses) whatever it names, so a subquery or table function
+/// would be *executed enough* to read or sniff a file
+/// (`read_csv('/etc/passwd')`, `read_parquet('s3://…')`) at plan-check time.
+const NOT_SCALAR_OR_AGGREGATE: &str = "expressions are scalar or aggregate over the dataset's \
+     columns; subqueries and table functions are refused";
+
+/// A shape gate applied to every field/metric `ANSI_SQL` expression
+/// *before* it is interpolated into `DESCRIBE SELECT <expr> FROM …` (H2):
+/// refuses `;` (multiple statements — belt-and-braces; `describe_plan`'s
+/// own `conn.prepare` already rejects multi-statement text, see
+/// `verify::tests::duckdb_prepare_rejects_multi_statement_text`), the
+/// keywords `SELECT`/`FROM`/`WITH` as standalone tokens, and a call
+/// (identifier immediately followed by `(`) to any function whose name
+/// starts with `read_`, `sniff_`, `parquet_`, `glob`, `query`, `httpfs`, or
+/// ends with `_scan`. Token-based, not a real SQL parse — `describe_plan`
+/// is still the check that resolves identifiers and types; this only
+/// refuses shapes that must never reach DuckDB's binder in the first place.
+fn assert_scalar_or_aggregate_shape(expr: &str) -> Result<()> {
+    const REFUSED_KEYWORDS: [&str; 3] = ["select", "from", "with"];
+    const REFUSED_FUNCTION_PREFIXES: [&str; 6] =
+        ["read_", "sniff_", "parquet_", "glob", "query", "httpfs"];
+    const REFUSED_FUNCTION_SUFFIX: &str = "_scan";
+
+    if expr.contains(';') {
+        bail!("{NOT_SCALAR_OR_AGGREGATE} (found ';').");
+    }
+
+    let chars: Vec<(usize, char)> = expr.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (start, c) = chars[i];
+        if c.is_ascii_alphabetic() || c == '_' {
+            let mut j = i + 1;
+            while j < chars.len() {
+                let (_, c) = chars[j];
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let end = if j < chars.len() {
+                chars[j].0
+            } else {
+                expr.len()
+            };
+            let token = &expr[start..end];
+            let lower = token.to_ascii_lowercase();
+            if REFUSED_KEYWORDS.contains(&lower.as_str()) {
+                bail!("{NOT_SCALAR_OR_AGGREGATE} (found `{token}`).");
+            }
+            let mut k = j;
+            while k < chars.len() && chars[k].1.is_whitespace() {
+                k += 1;
+            }
+            if k < chars.len() && chars[k].1 == '(' {
+                let is_refused = REFUSED_FUNCTION_PREFIXES
+                    .iter()
+                    .any(|p| lower.starts_with(p))
+                    || lower.ends_with(REFUSED_FUNCTION_SUFFIX);
+                if is_refused {
+                    bail!("{NOT_SCALAR_OR_AGGREGATE} (found a call to `{token}(…)`).");
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 /// The trimmed expression, if (and only if) it is a bare identifier —
 /// unquoted (`^[A-Za-z_][A-Za-z0-9_]*$`) or a single `"..."`-quoted token
 /// with `""` as its only permitted embedded quote. Anything else (a
@@ -193,6 +267,13 @@ pub fn check_export(
                     );
                 }
             } else {
+                if let Err(e) = assert_scalar_or_aggregate_shape(expr) {
+                    bail!(
+                        "model '{model_name}' dataset '{}' field '{}': `{expr}` — {e}",
+                        ds.name,
+                        field.name
+                    );
+                }
                 let sql = format!("DESCRIBE SELECT {expr} FROM {source}");
                 if let Err(e) = describe_plan(conn, &sql) {
                     bail!(
@@ -329,12 +410,20 @@ pub fn check_relationships(
 }
 
 /// ADR 0018 §6, metrics: every metric of `model`, once — `DESCRIBE SELECT
-/// <expr> FROM (SELECT * FROM <src>) AS "<dataset>", … `over every bound
-/// dataset of the model (never just the ones the expression names), so a
-/// metric that qualifies a column by a dataset alias resolves the same way
-/// it would in Ossie. No join is synthesized (ADR 0018, "Refused") — the
-/// cross product is there so identifiers resolve, not so the query means
-/// anything if it were ever run, which it never is.
+/// <expr> FROM (SELECT * FROM <src>) AS "<dataset>", … ` over the datasets
+/// `expr` textually qualifies (`referenced_datasets`), so a metric that
+/// qualifies a column by a dataset alias resolves the same way it would in
+/// Ossie (H3: never every bound dataset of the model — cross-joining
+/// datasets the expression never names manufactures a spurious "ambiguous
+/// column" the moment two of them happen to share a name). An expression
+/// that qualifies no dataset (`COUNT(*)`) is checked against the model's
+/// one bound dataset when there is exactly one; with more than one it's
+/// genuinely unknown which dataset an unqualified column belongs to, so
+/// it's recorded `unverified:ambiguous` rather than guessed — the same
+/// outcome a DuckDB binder error mentioning "ambiguous" gets, never a hard
+/// `run`-failing error. No join is synthesized (ADR 0018, "Refused") — the
+/// cross product (when there is one) is there so identifiers resolve, not
+/// so the query means anything if it were ever run, which it never is.
 pub fn check_metrics(
     conn: &Connection,
     model: &SemanticModel,
@@ -348,6 +437,13 @@ pub fn check_metrics(
             continue;
         };
         let expr = expr.trim();
+        if let Err(e) = assert_scalar_or_aggregate_shape(expr) {
+            bail!(
+                "model '{}' metric '{}': `{expr}` — {e}",
+                model.name,
+                metric.name
+            );
+        }
 
         let referenced: Vec<&Dataset> = referenced_datasets(model, expr);
         let all_referenced_bound = referenced
@@ -358,18 +454,40 @@ pub fn check_metrics(
             continue;
         }
 
-        let bound_datasets: Vec<&Dataset> = model
-            .datasets
-            .iter()
-            .filter(|ds| !index.route_for(&model.name, &ds.name).is_empty())
-            .collect();
-        if bound_datasets.is_empty() {
-            out.insert(metric.name.clone(), "unverified:unbound".to_string());
-            continue;
-        }
+        // H3: FROM only the datasets `expr` actually qualifies. An
+        // unqualified expression is checked against the model's single
+        // bound dataset when there's exactly one; with more than one,
+        // which dataset it belongs to is unknown — record, don't guess.
+        let from_datasets: Vec<&Dataset> = if !referenced.is_empty() {
+            referenced
+        } else {
+            let bound_datasets: Vec<&Dataset> = model
+                .datasets
+                .iter()
+                .filter(|ds| !index.route_for(&model.name, &ds.name).is_empty())
+                .collect();
+            match bound_datasets.len() {
+                0 => {
+                    out.insert(metric.name.clone(), "unverified:unbound".to_string());
+                    continue;
+                }
+                1 => bound_datasets,
+                _ => {
+                    tracing::warn!(
+                        model = %model.name,
+                        metric = %metric.name,
+                        "metric expression qualifies no dataset by name and more than one \
+                         dataset of the model is bound — recorded unverified:ambiguous, not \
+                         plan-checked"
+                    );
+                    out.insert(metric.name.clone(), "unverified:ambiguous".to_string());
+                    continue;
+                }
+            }
+        };
 
-        let mut froms = Vec::with_capacity(bound_datasets.len());
-        for ds in &bound_datasets {
+        let mut froms = Vec::with_capacity(from_datasets.len());
+        for ds in &from_datasets {
             let route = &index.route_for(&model.name, &ds.name)[0];
             let Some(export) = export_by_route(def, route) else {
                 continue;
@@ -387,6 +505,16 @@ pub fn check_metrics(
         match describe_plan(conn, &sql) {
             Ok(()) => {
                 out.insert(metric.name.clone(), "verified".to_string());
+            }
+            Err(e) if e.to_string().to_ascii_lowercase().contains("ambiguous") => {
+                tracing::warn!(
+                    model = %model.name,
+                    metric = %metric.name,
+                    error = %e,
+                    "DuckDB reported an ambiguous reference — recorded unverified:ambiguous, \
+                     not a hard error"
+                );
+                out.insert(metric.name.clone(), "unverified:ambiguous".to_string());
             }
             Err(e) => {
                 bail!(
@@ -806,5 +934,217 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Nothing was executed"), "{err}");
+    }
+
+    // --- H2: no subquery/table function reaches DESCRIBE -------------------
+
+    #[test]
+    fn duckdb_prepare_does_not_reject_multi_statement_text_the_semicolon_gate_is_load_bearing() {
+        // H2 asked us to confirm duckdb-rs's own `prepare` already refuses
+        // multi-statement text, on the theory that the `;` refusal in
+        // `assert_scalar_or_aggregate_shape` would then be belt-and-braces.
+        // It does not: `Connection::prepare` on multi-statement SQL
+        // executes every statement but the last as a side effect of
+        // preparing, and hands back a prepared statement for the last one
+        // only — `describe_plan` here reports success (`Ok(())`) for
+        // `DESCRIBE SELECT id FROM a_tbl; DROP TABLE a_tbl`, and the table
+        // is gone. The `;` gate in `assert_scalar_or_aggregate_shape` is
+        // therefore the *only* defense against this, not a redundant one —
+        // it must run, and does, before any expression reaches
+        // `describe_plan` in `check_export`/`check_metrics`.
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
+        let result = describe_plan(&conn, "DESCRIBE SELECT id FROM a_tbl; DROP TABLE a_tbl");
+        assert!(result.is_ok(), "{result:?}");
+        let still_there = conn
+            .prepare("SELECT count(*) FROM a_tbl")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)));
+        assert!(
+            still_there.is_err(),
+            "expected the DROP TABLE after ';' to have run: {still_there:?}"
+        );
+    }
+
+    #[test]
+    fn field_expression_with_semicolon_is_refused_before_describe() {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
+        let ds = dataset(
+            "dsa",
+            "dsa",
+            &[],
+            vec![field("bad", "id; DROP TABLE a_tbl")],
+        );
+        let idx = SemanticIndex::build(
+            record_with(vec![model("m", vec![ds], vec![], vec![])]),
+            &[export("dsa", "a_tbl", &["id"], &[])],
+        );
+        let exp = export("dsa", "a_tbl", &["id"], &[]);
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("subqueries and table functions are refused"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn field_expression_with_a_subquery_keyword_is_refused() {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
+        let ds = dataset(
+            "dsa",
+            "dsa",
+            &[],
+            vec![field("bad", "(SELECT id FROM a_tbl WHERE id = 1)")],
+        );
+        let idx = SemanticIndex::build(
+            record_with(vec![model("m", vec![ds], vec![], vec![])]),
+            &[export("dsa", "a_tbl", &["id"], &[])],
+        );
+        let exp = export("dsa", "a_tbl", &["id"], &[]);
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("subqueries and table functions are refused"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn field_expression_calling_read_csv_is_refused() {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
+        let ds = dataset(
+            "dsa",
+            "dsa",
+            &[],
+            vec![field("bad", "(SELECT * FROM read_csv('/etc/passwd'))")],
+        );
+        let idx = SemanticIndex::build(
+            record_with(vec![model("m", vec![ds], vec![], vec![])]),
+            &[export("dsa", "a_tbl", &["id"], &[])],
+        );
+        let exp = export("dsa", "a_tbl", &["id"], &[]);
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("subqueries and table functions are refused"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn field_expression_calling_a_scan_suffixed_function_is_refused() {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
+        let ds = dataset(
+            "dsa",
+            "dsa",
+            &[],
+            vec![field(
+                "bad",
+                "(SELECT * FROM parquet_scan('s3://x/y.parquet'))",
+            )],
+        );
+        let idx = SemanticIndex::build(
+            record_with(vec![model("m", vec![ds], vec![], vec![])]),
+            &[export("dsa", "a_tbl", &["id"], &[])],
+        );
+        let exp = export("dsa", "a_tbl", &["id"], &[]);
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("subqueries and table functions are refused"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ordinary_computed_field_expression_is_unaffected_by_the_shape_gate() {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id, 2 AS selection_flag;");
+        // `selection_flag` contains "select" as a substring but is not the
+        // standalone token `SELECT` — must not be refused.
+        let ds = dataset(
+            "dsa",
+            "dsa",
+            &[],
+            vec![field("plus_one", "id + selection_flag")],
+        );
+        let idx = SemanticIndex::build(
+            record_with(vec![model("m", vec![ds], vec![], vec![])]),
+            &[export("dsa", "a_tbl", &["id"], &[])],
+        );
+        let exp = export("dsa", "a_tbl", &["id"], &[]);
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        assert!(checks[0].fields["plus_one"].verified);
+    }
+
+    #[test]
+    fn metric_expression_calling_read_parquet_is_refused() {
+        let (conn, def, mut model) = two_dataset_model(vec![], vec![]);
+        model.metrics.push(metric(
+            "total",
+            "(SELECT count(*) FROM read_parquet('s3://bucket/x.parquet'))",
+        ));
+        let idx = index_for(&def, &model);
+        let err = check_metrics(&conn, &model, &idx, &def)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("subqueries and table functions are refused"),
+            "{err}"
+        );
+    }
+
+    // --- H3: unqualified/ambiguous metrics never hard-fail -----------------
+
+    #[test]
+    fn metric_qualifying_no_dataset_with_two_bound_datasets_is_unverified_ambiguous() {
+        let (conn, def, mut model) = two_dataset_model(vec![], vec![]);
+        // Neither `dsa.` nor `dsb.` appears — `referenced_datasets` returns
+        // none, and more than one dataset is bound.
+        model.metrics.push(metric("total", "COUNT(*)"));
+        let idx = index_for(&def, &model);
+        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        assert_eq!(out["total"], "unverified:ambiguous");
+    }
+
+    #[test]
+    fn metric_qualifying_no_dataset_with_exactly_one_bound_dataset_is_verified() {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id, 10 AS val;");
+        let exp_a = export("dsa", "a_tbl", &["id", "val"], &["id"]);
+        let mut def: CellDef = serde_yaml::from_str("cell: t\n").unwrap();
+        def.interface = vec![exp_a];
+        let ds_a = dataset("dsa", "dsa", &["id"], vec![field("id", "id")]);
+        let model = model("m", vec![ds_a], vec![], vec![metric("total", "SUM(val)")]);
+        let idx = index_for(&def, &model);
+        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        assert_eq!(out["total"], "verified");
+    }
+
+    #[test]
+    fn metric_hitting_a_genuine_duckdb_ambiguous_column_is_unverified_ambiguous_not_a_hard_error() {
+        let conn = conn_with(
+            "CREATE TABLE a_tbl AS SELECT 1 AS id, 10 AS amount; \
+             CREATE TABLE b_tbl AS SELECT 1 AS id, 20 AS amount;",
+        );
+        let exp_a = export("dsa", "a_tbl", &["id", "amount"], &["id"]);
+        let exp_b = export("dsb", "b_tbl", &["id", "amount"], &["id"]);
+        let mut def: CellDef = serde_yaml::from_str("cell: t\n").unwrap();
+        def.interface = vec![exp_a, exp_b];
+        let ds_a = dataset("dsa", "dsa", &["id"], vec![field("id", "id")]);
+        let ds_b = dataset("dsb", "dsb", &["id"], vec![field("id", "id")]);
+        // Both sides qualified (so `referenced_datasets` is non-empty and
+        // both are FROM'd), but `amount` itself is left unqualified —
+        // DuckDB's binder reports it ambiguous against the two-table FROM.
+        let model = model(
+            "m",
+            vec![ds_a, ds_b],
+            vec![],
+            vec![metric("total", "SUM(dsa.id) + SUM(dsb.id) + SUM(amount)")],
+        );
+        let idx = index_for(&def, &model);
+        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        assert_eq!(out["total"], "unverified:ambiguous");
     }
 }

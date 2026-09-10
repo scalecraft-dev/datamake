@@ -50,6 +50,15 @@ pub fn fetch(
     opts: &FetchOptions,
 ) -> Result<Fetched> {
     validate_url(url, opts.allow_local)?;
+    // C1/C2: `ref`/`path` are validated before `git` is ever spawned, not
+    // merely before the argument that carries them — a later call site
+    // re-checking would still have let an earlier one shell out first.
+    if let Some(r) = git_ref {
+        validate_ref(r)?;
+    }
+    if let Some(p) = path {
+        validate_path(p)?;
+    }
 
     let cache_root = cell_dir.join(".cell").join("semantic");
     std::fs::create_dir_all(&cache_root)
@@ -57,12 +66,30 @@ pub fn fetch(
     let key = &sha256_hex(url.as_bytes())[..16];
     let checkout_dir = cache_root.join(key);
 
-    if checkout_dir.join(".git").is_dir() {
+    // H1: `clone`'s and `refresh`'s non-sha checkout target differ. `git
+    // clone` (even `--no-checkout`) leaves `HEAD` pointed at the branch it
+    // just cloned — correct to check out directly, and it writes no
+    // `FETCH_HEAD` to check out instead. `git fetch` (what `refresh` runs
+    // on a cached checkout) is the opposite: it writes `FETCH_HEAD` but
+    // never touches the local `HEAD`, so checking out `HEAD` after a
+    // refresh re-checks-out whatever was there *before* the fetch — a
+    // moving branch would never advance. A sha ref is unaffected either
+    // way: it's checked out by content, which `fetch_by_sha`'s real `git
+    // fetch` always makes available.
+    let target = if checkout_dir.join(".git").is_dir() {
         refresh(&checkout_dir, url, git_ref, opts)?;
+        match git_ref.filter(|r| is_full_sha(r)) {
+            Some(sha) => sha.to_string(),
+            None => "FETCH_HEAD".to_string(),
+        }
     } else {
         clone(&checkout_dir, url, git_ref, opts)?;
-    }
-    finalize_checkout(&checkout_dir, git_ref, path, opts)?;
+        match git_ref.filter(|r| is_full_sha(r)) {
+            Some(sha) => sha.to_string(),
+            None => "HEAD".to_string(),
+        }
+    };
+    finalize_checkout(&checkout_dir, &target, git_ref, path, opts)?;
     let commit = rev_parse_head(&checkout_dir, opts)?;
 
     let resolved_dir = match path {
@@ -79,6 +106,95 @@ fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// `semantic_model.ref` (ADR 0018 §3, C1): a branch, tag, or commit sha —
+/// `^[A-Za-z0-9._/-]{1,255}$`, no leading `-` (argv injection: `git fetch
+/// origin --upload-pack=...` executes a command), no `..` anywhere (a
+/// path-traversal-shaped ref name). Checked before `git` is ever spawned,
+/// not merely before the argument that carries it.
+fn validate_ref(r: &str) -> Result<()> {
+    if r.starts_with('-') {
+        bail!(
+            "`semantic_model.ref: {r}` must not start with '-' — refused (it would be read as \
+             a git option, not a ref)."
+        );
+    }
+    let shape_ok = !r.is_empty()
+        && r.len() <= 255
+        && r.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'));
+    if !shape_ok || r.contains("..") {
+        bail!(
+            "`semantic_model.ref: {r}` is not a valid git ref — refused (expected \
+             [A-Za-z0-9._/-]{{1,255}}, no leading '-', no '..')."
+        );
+    }
+    Ok(())
+}
+
+/// `semantic_model.path` (ADR 0018 §3, C2): `^[A-Za-z0-9._/-]{1,512}$`, no
+/// leading `-` (`sparse-checkout set --no-cone` flips cone mode instead of
+/// naming a path) or `/` (must be relative inside the repo), no `..`.
+fn validate_path(p: &str) -> Result<()> {
+    if p.starts_with('-') {
+        bail!(
+            "`semantic_model.path: {p}` must not start with '-' — refused (it would be read as \
+             a git option, e.g. `--no-cone`)."
+        );
+    }
+    if p.starts_with('/') {
+        bail!("`semantic_model.path: {p}` must be a relative path inside the repository.");
+    }
+    let shape_ok = !p.is_empty()
+        && p.len() <= 512
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'));
+    if !shape_ok || p.contains("..") {
+        bail!(
+            "`semantic_model.path: {p}` is not a valid path — refused (expected \
+             [A-Za-z0-9._/-]{{1,512}}, no leading '-' or '/', no '..')."
+        );
+    }
+    Ok(())
+}
+
+/// `url`, redacted to scheme+host+path for embedding in any error message
+/// (ADR 0018 §3/M5): userinfo (`user:token@`), query, and fragment are
+/// stripped — an operator's credential must never round-trip into a log
+/// line or an `anyhow::Context`.
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // scp form (`user@host:path`) or an already-rejected shape — drop
+        // anything before the last `@` (the "userinfo"-shaped part), keep
+        // the rest verbatim.
+        return match url.rfind('@') {
+            Some(at) => url[at + 1..].to_string(),
+            None => url.to_string(),
+        };
+    };
+    let host_start = rest.rfind('@').map(|i| i + 1).unwrap_or(0);
+    let no_userinfo = &rest[host_start..];
+    let path_start = no_userinfo.find('/').unwrap_or(no_userinfo.len());
+    let host = &no_userinfo[..path_start];
+    let path = no_userinfo[path_start..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    format!("{scheme}://{host}{path}")
+}
+
+/// Whether `url`'s authority (the part between `scheme://` and the first
+/// `/`) carries userinfo (`user[:pass]@host`) — refused outright for
+/// `https://` (M5): a credential in `cell.yaml` would round-trip into every
+/// log line and the sync sidecar. Not applied to `ssh://`, where
+/// `user@host` (almost always `git@host`) names the login user, not a
+/// secret — the same syntax the scp form (`git@host:path`) already accepts.
+fn has_url_userinfo(url: &str) -> bool {
+    match url.split_once("://") {
+        Some((_, rest)) => rest.split('/').next().unwrap_or(rest).contains('@'),
+        None => false,
+    }
+}
+
 /// `https://`, `ssh://`, or `git@host:path` (scp form) only. Refuses
 /// `ext::`/any remote-helper prefix (`::` anywhere), `file://`, `git://`,
 /// and a leading `-` (argv injection) — all before `git` is ever invoked.
@@ -87,18 +203,29 @@ fn is_full_sha(s: &str) -> bool {
 fn validate_url(url: &str, allow_local: bool) -> Result<()> {
     if url.starts_with('-') {
         bail!(
-            "`semantic_model.git: {url}` must not start with '-' — refused (it would be read \
-             as a git option, not a URL)."
+            "`semantic_model.git: {}` must not start with '-' — refused (it would be read as a \
+             git option, not a URL).",
+            redact_url(url)
         );
     }
     if url.contains("::") {
         bail!(
-            "`semantic_model.git: {url}` contains '::' (a git remote-helper prefix, e.g. \
-             `ext::`) — refused; only a plain `https://`, `ssh://`, or `git@host:path` URL is \
-             accepted."
+            "`semantic_model.git: {}` contains '::' (a git remote-helper prefix, e.g. `ext::`) \
+             — refused; only a plain `https://`, `ssh://`, or `git@host:path` URL is accepted.",
+            redact_url(url)
         );
     }
-    if url.starts_with("https://") || url.starts_with("ssh://") {
+    if url.starts_with("https://") {
+        if has_url_userinfo(url) {
+            bail!(
+                "`semantic_model.git: {}` carries a credential in the URL (userinfo) — refused; \
+                 use a credential helper instead.",
+                redact_url(url)
+            );
+        }
+        return Ok(());
+    }
+    if url.starts_with("ssh://") {
         return Ok(());
     }
     if is_scp_form(url) {
@@ -110,9 +237,10 @@ fn validate_url(url: &str, allow_local: bool) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "`semantic_model.git: {url}` is not an allowed URL — only `https://`, `ssh://`, or \
+        "`semantic_model.git: {}` is not an allowed URL — only `https://`, `ssh://`, or \
          `git@host:path` (scp form) are accepted; `file://`, `git://`, and remote-helper \
-         prefixes are refused (meaning must not vary by an untrusted transport)."
+         prefixes are refused (meaning must not vary by an untrusted transport).",
+        redact_url(url)
     );
 }
 
@@ -200,6 +328,7 @@ fn refresh(
                     "1".to_string(),
                     "--filter=blob:none".to_string(),
                     "origin".to_string(),
+                    "--".to_string(),
                     target.to_string(),
                 ],
                 opts,
@@ -210,7 +339,7 @@ fn refresh(
     }
 }
 
-/// `git fetch --depth 1 origin <sha>`; falls back to a full (unshallowed)
+/// `git fetch --depth 1 origin -- <sha>`; falls back to a full (unshallowed)
 /// fetch of that ref if the server refuses shallow-by-sha (ADR 0018 §3).
 fn fetch_by_sha(checkout_dir: &Path, url: &str, sha: &str, opts: &FetchOptions) -> Result<()> {
     let shallow = run_git(
@@ -221,6 +350,7 @@ fn fetch_by_sha(checkout_dir: &Path, url: &str, sha: &str, opts: &FetchOptions) 
             "1".to_string(),
             "--filter=blob:none".to_string(),
             "origin".to_string(),
+            "--".to_string(),
             sha.to_string(),
         ],
         opts,
@@ -230,15 +360,30 @@ fn fetch_by_sha(checkout_dir: &Path, url: &str, sha: &str, opts: &FetchOptions) 
     }
     run_git(
         Some(checkout_dir),
-        &["fetch".to_string(), "origin".to_string(), sha.to_string()],
+        &[
+            "fetch".to_string(),
+            "origin".to_string(),
+            "--".to_string(),
+            sha.to_string(),
+        ],
         opts,
     )
     .map(|_| ())
     .map_err(|e| classify_error(&e, url, Some(sha)))
 }
 
+/// H1: `target` is `fetch`'s pick between `HEAD` (fresh `clone`, which
+/// leaves `HEAD` pointed at the branch it just cloned and writes no
+/// `FETCH_HEAD`) and `FETCH_HEAD` (`refresh`'s `git fetch`, which is the
+/// opposite: it writes `FETCH_HEAD` but never touches the local `HEAD`, so
+/// checking out `HEAD` after a refresh would re-check-out whatever was
+/// there *before* the fetch and a moving branch would never advance) — or a
+/// sha, checked out by content either way. `git_ref` is threaded through
+/// only for `classify_error`'s message, not the checkout command itself.
+/// `--detach` so this never creates or advances a local branch.
 fn finalize_checkout(
     checkout_dir: &Path,
+    target: &str,
     git_ref: Option<&str>,
     path: Option<&str>,
     opts: &FetchOptions,
@@ -259,18 +404,28 @@ fn finalize_checkout(
             &[
                 "sparse-checkout".to_string(),
                 "set".to_string(),
+                "--".to_string(),
                 p.to_string(),
             ],
             opts,
         )
         .map_err(|e| generic_error("git sparse-checkout set", &e))?;
     }
-    let target = match git_ref.filter(|r| is_full_sha(r)) {
-        Some(sha) => sha.to_string(),
-        None => "HEAD".to_string(),
-    };
-    run_git(Some(checkout_dir), &["checkout".to_string(), target], opts)
-        .map_err(|e| classify_error(&e, "", git_ref))?;
+    // `target` is never attacker-controlled here — it's `fetch`'s own
+    // literal `"HEAD"`/`"FETCH_HEAD"` or a sha already checked by
+    // `is_full_sha` — so no `--` is needed (and `git checkout --detach --`
+    // refuses a path argument; `--` forces pathspec interpretation, which a
+    // tree-ish is not).
+    run_git(
+        Some(checkout_dir),
+        &[
+            "checkout".to_string(),
+            "--detach".to_string(),
+            target.to_string(),
+        ],
+        opts,
+    )
+    .map_err(|e| classify_error(&e, "", git_ref))?;
     Ok(())
 }
 
@@ -312,6 +467,13 @@ struct GitFailure {
     stderr: String,
 }
 
+/// The bound every reader thread gets to hand its buffer back once `git`'s
+/// process (group) has been killed and its pipes have gone EOF — past this,
+/// `run_git` gives up on the read and reports the timeout without it
+/// (M2): a reader can still be blocked on a grandchild (`ssh`,
+/// `git-remote-https`) that outlived a plain `child.kill()`.
+const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Run `git` with the hardening config/env ADR 0018 §3 lists, an explicit
 /// argv (never a joined string), and a hard wall-clock timeout.
 fn run_git(cwd: Option<&Path>, args: &[String], opts: &FetchOptions) -> Result<String, GitFailure> {
@@ -325,6 +487,10 @@ fn run_git(cwd: Option<&Path>, args: &[String], opts: &FetchOptions) -> Result<S
         "protocol.ssh.allow=always",
         "-c",
         "core.hooksPath=/dev/null",
+        // L1: never follow a submodule into another repository, regardless
+        // of what the fetched tree declares.
+        "-c",
+        "submodule.recurse=false",
     ]);
     if opts.allow_local {
         cmd.args(["-c", "protocol.file.allow=always"]);
@@ -341,20 +507,34 @@ fn run_git(cwd: Option<&Path>, args: &[String], opts: &FetchOptions) -> Result<S
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // M2: run `git` in its own process group so a timeout can kill the
+    // whole tree (`ssh`, `git-remote-https`) it may have spawned, not just
+    // the direct child — `child.kill()` alone leaves those holding the
+    // stdout/stderr pipes open, and the reader threads below block forever
+    // joining on them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+
     let mut child = cmd.spawn().map_err(|e| GitFailure {
         stderr: format!("failed to run git: {e}"),
     })?;
+    let pid = child.id();
     let mut stdout_pipe = child.stdout.take().expect("piped stdout");
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-    let stdout_handle = std::thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    let _stdout_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stdout_tx.send(buf);
     });
-    let stderr_handle = std::thread::spawn(move || {
+    let _stderr_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stderr_tx.send(buf);
     });
 
     let start = Instant::now();
@@ -363,10 +543,14 @@ fn run_git(cwd: Option<&Path>, args: &[String], opts: &FetchOptions) -> Result<S
             Ok(Some(s)) => break s,
             Ok(None) => {
                 if start.elapsed() > opts.timeout {
-                    let _ = child.kill();
+                    kill_process_tree(&mut child, pid);
                     let _ = child.wait();
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
+                    // Bounded, not `.join()`: a reader can still be parked
+                    // on a grandchild's pipe if the kill above didn't reach
+                    // it (non-unix, or a race). Drop the handle rather than
+                    // block `run_git`'s caller on it forever.
+                    let _ = stdout_rx.recv_timeout(READER_JOIN_GRACE);
+                    let _ = stderr_rx.recv_timeout(READER_JOIN_GRACE);
                     return Err(GitFailure {
                         stderr: format!(
                             "git {} timed out after {:?}",
@@ -384,8 +568,12 @@ fn run_git(cwd: Option<&Path>, args: &[String], opts: &FetchOptions) -> Result<S
             }
         }
     };
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    let stdout = stdout_rx
+        .recv_timeout(READER_JOIN_GRACE)
+        .unwrap_or_default();
+    let stderr = stderr_rx
+        .recv_timeout(READER_JOIN_GRACE)
+        .unwrap_or_default();
     if !status.success() {
         return Err(GitFailure {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -394,9 +582,29 @@ fn run_git(cwd: Option<&Path>, args: &[String], opts: &FetchOptions) -> Result<S
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
+/// Kill `child` and, on unix, its whole process group (`run_git` put it in
+/// its own group via `process_group(0)`) — `ssh`/`git-remote-https` survive
+/// a plain `child.kill()` otherwise. Best-effort: a failure here still
+/// leaves `child.wait()` (called by the caller right after) to reap
+/// whatever did die.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn kill_process_tree(child: &mut std::process::Child, pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", "--", &format!("-{pid}")])
+            .status();
+    }
+    let _ = child.kill();
+}
+
 /// Classify a failed clone/fetch by its stderr (ADR 0018 §3): auth, ref not
 /// found, or generic (git's stderr tail included).
 fn classify_error(fail: &GitFailure, url: &str, git_ref: Option<&str>) -> anyhow::Error {
+    // M5: `url` is echoed into every message below — scheme+host+path only,
+    // never the raw string, in case it carries userinfo `validate_url`
+    // didn't catch (e.g. a git config credential helper rewrite).
+    let url = redact_url(url);
     let stderr = &fail.stderr;
     let is_auth = [
         "Authentication failed",
@@ -449,8 +657,15 @@ mod tests {
     use super::*;
 
     fn tempdir(tag: &str) -> PathBuf {
+        // A counter on top of pid+nanos: tests in this module run
+        // concurrently (`cargo test` parallelizes within one process), and
+        // two calls landing in the same timer tick collided in practice
+        // (`git clone --bare` into an already-populated directory) once the
+        // suite grew enough tests to make that likely.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "datamk-ossie-git-{tag}-{}-{}",
+            "datamk-ossie-git-{tag}-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -604,5 +819,301 @@ mod tests {
     fn url_allowlist_refuses_local_absolute_path_without_allow_local() {
         assert!(validate_url("/tmp/some/repo", false).is_err());
         assert!(validate_url("/tmp/some/repo", true).is_ok());
+    }
+
+    // --- C1: `semantic_model.ref` validation --------------------------------
+
+    #[test]
+    fn ref_validation_accepts_ordinary_branch_tag_and_sha() {
+        assert!(validate_ref("main").is_ok());
+        assert!(validate_ref("release/v1.2.0").is_ok());
+        assert!(validate_ref("a".repeat(40).as_str()).is_ok());
+    }
+
+    #[test]
+    fn ref_validation_refuses_leading_dash_argv_injection() {
+        let err = validate_ref("--upload-pack=touch x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not start with '-'"), "{err}");
+    }
+
+    #[test]
+    fn ref_validation_refuses_dotdot_and_bad_characters() {
+        assert!(validate_ref("../../etc/passwd").is_err());
+        assert!(validate_ref("has space").is_err());
+        assert!(validate_ref("semicolon;here").is_err());
+        assert!(validate_ref("").is_err());
+        assert!(validate_ref(&"x".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn fetch_refuses_an_injection_shaped_ref_before_spawning_git() {
+        let cell_dir = tempdir("cell-ref-injection");
+        let opts = FetchOptions {
+            allow_local: true,
+            timeout: Duration::from_secs(30),
+        };
+        let err = fetch(
+            &cell_dir,
+            "/nonexistent/repo/does/not/matter",
+            None,
+            Some("--upload-pack=touch /tmp/datamk-ref-injection-pwned"),
+            &opts,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"));
+        // Refused before any `git` invocation (and before the cache
+        // directory `git` would run in is even created).
+        assert!(!cell_dir.join(".cell").join("semantic").exists());
+        let _ = std::fs::remove_dir_all(&cell_dir);
+    }
+
+    // --- C2: `semantic_model.path` validation -------------------------------
+
+    #[test]
+    fn path_validation_accepts_ordinary_relative_paths() {
+        assert!(validate_path("osi").is_ok());
+        assert!(validate_path("osi/sub-dir").is_ok());
+    }
+
+    #[test]
+    fn path_validation_refuses_leading_dash_option_injection() {
+        let err = validate_path("--no-cone").unwrap_err().to_string();
+        assert!(err.contains("must not start with '-'"), "{err}");
+    }
+
+    #[test]
+    fn path_validation_refuses_leading_slash_and_dotdot() {
+        assert!(validate_path("/etc/passwd").is_err());
+        assert!(validate_path("../escape").is_err());
+        assert!(validate_path("osi/../../escape").is_err());
+    }
+
+    #[test]
+    fn fetch_refuses_an_injection_shaped_path_before_spawning_git() {
+        let cell_dir = tempdir("cell-path-injection");
+        let opts = FetchOptions {
+            allow_local: true,
+            timeout: Duration::from_secs(30),
+        };
+        let err = fetch(
+            &cell_dir,
+            "/nonexistent/repo/does/not/matter",
+            Some("--no-cone"),
+            None,
+            &opts,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"));
+        let _ = std::fs::remove_dir_all(&cell_dir);
+    }
+
+    // --- H1: refresh must advance a moving branch ---------------------------
+
+    #[test]
+    fn refresh_by_branch_ref_advances_when_upstream_moves() {
+        let (bare, first_commit) = make_bare_repo();
+        let cell_dir = tempdir("cell-refresh-branch");
+        let opts = FetchOptions {
+            allow_local: true,
+            timeout: Duration::from_secs(30),
+        };
+
+        let first = fetch(
+            &cell_dir,
+            bare.to_str().unwrap(),
+            Some("osi"),
+            Some("main"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(first.commit, first_commit);
+
+        // Advance the bare repo's `main` past the seed commit by cloning
+        // it, committing, and pushing back — the same shape a real upstream
+        // edit takes.
+        let work = tempdir("refresh-work");
+        run(&work, &["clone", "-q", bare.to_str().unwrap(), "."]);
+        std::fs::write(
+            work.join("osi/model.yaml"),
+            "version: 0.1.1\nsemantic_model:\n  - name: m2\n    datasets:\n      - name: d\n        source: s\n",
+        )
+        .unwrap();
+        run(&work, &["add", "."]);
+        run(&work, &["commit", "-q", "-m", "advance"]);
+        run(&work, &["push", "-q", "origin", "main"]);
+        let second_commit_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        let second_commit = String::from_utf8_lossy(&second_commit_out.stdout)
+            .trim()
+            .to_string();
+        assert_ne!(second_commit, first_commit);
+
+        // `fetch` reuses the cache dir from the first call — a refresh, not
+        // a clone — and must land on the new tip.
+        let second = fetch(
+            &cell_dir,
+            bare.to_str().unwrap(),
+            Some("osi"),
+            Some("main"),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(second.commit, second_commit);
+        assert_ne!(second.commit, first_commit);
+        let content = std::fs::read_to_string(second.checkout_dir.join("model.yaml")).unwrap();
+        assert!(content.contains("m2"), "{content}");
+
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&cell_dir);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // --- M2: timeout kills the whole process group, never hangs -----------
+
+    #[test]
+    fn run_git_timeout_returns_promptly_instead_of_hanging_on_pipes() {
+        // `git ls-remote` against a repo path that doesn't exist still
+        // spawns and exits fast on its own; what this test actually
+        // exercises is that a near-zero timeout takes the timeout branch
+        // (kill + bounded reader join) and returns within a small bound
+        // rather than hanging on `stdout_handle.join()`/`stderr_handle.
+        // join()` the way the pre-fix code could.
+        let opts = FetchOptions {
+            allow_local: true,
+            timeout: Duration::from_millis(1),
+        };
+        let start = Instant::now();
+        let err = run_git(
+            None,
+            &[
+                "ls-remote".to_string(),
+                "https://github.com/apache/ossie.git".to_string(),
+            ],
+            &opts,
+        )
+        .unwrap_err();
+        assert!(err.stderr.contains("timed out"), "{}", err.stderr);
+        // Generous bound (READER_JOIN_GRACE is 2s each for stdout/stderr);
+        // well under what an actual hang would look like (the test
+        // timeout).
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    // --- M5: no credential in the URL, ever echoed in full -----------------
+
+    #[test]
+    fn https_url_with_userinfo_is_refused() {
+        let err = validate_url("https://user:s3cr3t@example.com/x.git", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credential"), "{err}");
+        assert!(!err.contains("s3cr3t"), "{err}");
+    }
+
+    #[test]
+    fn ssh_url_with_login_user_is_not_treated_as_a_credential() {
+        // `ssh://git@host/...` is ordinary syntax naming the login user,
+        // not a secret — only `https://` userinfo is refused.
+        assert!(validate_url("ssh://git@example.com/x.git", false).is_ok());
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_url("https://user:s3cr3t@example.com/acme/x.git?x=1#y"),
+            "https://example.com/acme/x.git"
+        );
+        assert_eq!(
+            redact_url("ssh://git@example.com/acme/x.git"),
+            "ssh://example.com/acme/x.git"
+        );
+    }
+
+    #[test]
+    fn classify_error_never_prints_a_credential_from_the_url() {
+        let fail = GitFailure {
+            stderr: "fatal: Authentication failed for 'https://example.com/x.git'".to_string(),
+        };
+        let err = classify_error(&fail, "https://user:s3cr3t@example.com/x.git", Some("main"))
+            .to_string();
+        assert!(!err.contains("s3cr3t"), "{err}");
+        assert!(err.contains("example.com"), "{err}");
+    }
+
+    // --- L1: submodules are never followed ----------------------------------
+
+    #[test]
+    fn fetch_never_recurses_into_a_submodule() {
+        // A trap submodule: if `finalize_checkout`'s `git checkout` ever
+        // recursed into it (submodule.recurse=true), the submodule's own
+        // content would land in the checkout; with submodule.recurse=false
+        // it stays an uninitialized, empty directory.
+        let sub_work = tempdir("submodule-inner");
+        run(&sub_work, &["init", "-q", "-b", "main"]);
+        std::fs::write(sub_work.join("PWNED"), "should never be fetched").unwrap();
+        run(&sub_work, &["add", "."]);
+        run(&sub_work, &["commit", "-q", "-m", "inner"]);
+        let sub_bare = tempdir("submodule-bare");
+        std::fs::remove_dir_all(&sub_bare).unwrap();
+        run(
+            &sub_work,
+            &["clone", "-q", "--bare", ".", sub_bare.to_str().unwrap()],
+        );
+
+        let work = tempdir("submodule-outer");
+        run(&work, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(work.join("osi")).unwrap();
+        std::fs::write(
+            work.join("osi/model.yaml"),
+            "version: 0.1.1\nsemantic_model:\n  - name: m\n    datasets:\n      - name: d\n        source: s\n",
+        )
+        .unwrap();
+        run(
+            &work,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub_bare.to_str().unwrap(),
+                "trap",
+            ],
+        );
+        run(&work, &["add", "."]);
+        run(&work, &["commit", "-q", "-m", "outer with submodule"]);
+        let bare = tempdir("submodule-outer-bare");
+        std::fs::remove_dir_all(&bare).unwrap();
+        run(
+            &work,
+            &["clone", "-q", "--bare", ".", bare.to_str().unwrap()],
+        );
+
+        let cell_dir = tempdir("cell-no-submodule");
+        let opts = FetchOptions {
+            allow_local: true,
+            timeout: Duration::from_secs(30),
+        };
+        let fetched = fetch(&cell_dir, bare.to_str().unwrap(), None, None, &opts).unwrap();
+        assert!(fetched.checkout_dir.join("osi/model.yaml").exists());
+        assert!(
+            !fetched.checkout_dir.join("trap/PWNED").exists(),
+            "submodule content was fetched despite submodule.recurse=false"
+        );
+
+        let _ = std::fs::remove_dir_all(&sub_work);
+        let _ = std::fs::remove_dir_all(&sub_bare);
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&cell_dir);
     }
 }

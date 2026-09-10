@@ -60,7 +60,15 @@ pub fn generate_with_all(
     base_path: &str,
 ) -> Value {
     let terms_vocabulary = terms_vocabulary(definitions, semantic_lookup);
-    let model_vocabulary: Vec<Value> = semantic_models.iter().map(|m| json!(m.name)).collect();
+    // M6: a model name outside the addressable token grammar
+    // ([A-Za-z0-9_.-]{1,64}) still lists in the document's `semantic_
+    // models[]`, but must not enter this enum — it would 400 at the door
+    // the moment a caller tried the value the enum itself offered.
+    let model_vocabulary: Vec<Value> = semantic_models
+        .iter()
+        .filter(|m| crate::context::is_addressable_token(&m.name))
+        .map(|m| json!(m.name))
+        .collect();
     let mut paths = Map::new();
     paths.insert("/".to_string(), health_path_item());
     paths.insert(
@@ -324,7 +332,9 @@ fn context_schema() -> Value {
                     "synced_at": { "type": "string", "format": "date-time" },
                     "content_sha256": { "type": "string" },
                     "resolved": { "type": "object",
-                        "description": "`{dir}` or `{commit}` — where the source resolved to." },
+                        "description": "`{\"dir\": true}` or `{\"commit\": \"...\"}` — never \
+                                        the sync host's absolute directory path, which stays \
+                                        in the sidecar only." },
                     "files": { "type": "integer" },
                     "checked_at": { "type": "string", "format": "date-time" }
                 }},
@@ -342,15 +352,15 @@ fn context_schema() -> Value {
                     "metrics": { "type": "array", "items": semantic_metric_schema() }
                 }},
             "semantic_matches": { "type": "array",
-                "description": "`?terms=` hits against an Ossie dataset, field, metric, or \
-                                synonym (ADR 0018 §7) — always present. Every hit is \
+                "description": "`?terms=` hits against an Ossie model, dataset, field, metric, \
+                                or synonym (ADR 0018 §7) — always present. Every hit is \
                                 returned; a token colliding across two models lists both.",
                 "items": { "type": "object",
                     "required": ["token", "kind", "model"],
                     "properties": {
                         "token": { "type": "string" },
                         "kind": { "type": "string",
-                            "enum": ["dataset", "field", "metric", "synonym"] },
+                            "enum": ["model", "dataset", "field", "metric", "synonym"] },
                         "model": { "type": "string" },
                         "dataset": { "type": "string" },
                         "field": { "type": "string" },

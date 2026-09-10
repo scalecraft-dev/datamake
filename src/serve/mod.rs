@@ -794,7 +794,16 @@ fn build_state(
     // has already refused to run (`refuse_stale_semantic_model`) if
     // `semantic_model:` is declared and `cell.def.semantic` is `None`, so
     // reaching here with `semantic_index: Some` means the cell is bound.
-    let semantic_index = cell.def.semantic.clone();
+    //
+    // M1: restricted to `all_routes` (the same discoverable list the
+    // context document and OpenAPI already derive from) — this is the
+    // index `?model=`/the MCP resource read, so it must never carry a
+    // private export's route key the way `cell.def.semantic` (bound
+    // against the full interface) does.
+    let semantic_index = cell.def.semantic.as_ref().map(|idx| {
+        let route_keys: Vec<String> = all_routes.iter().map(|(r, _)| r.clone()).collect();
+        idx.restricted_to(&route_keys)
+    });
     let semantic_check =
         crate::ossie::record::SemanticCheckRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile);
 

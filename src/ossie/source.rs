@@ -186,7 +186,26 @@ pub fn walk(root: &Path) -> Result<Vec<(String, Vec<u8>)>> {
                 .map(|m| m.is_dir())
                 .unwrap_or(false);
             if is_dir {
+                // M4: `semantic_model.dir` is allowed to leave the cell
+                // directory (ADR 0018 §1) — a `dir: ..` (or any ancestor)
+                // walk would otherwise cross back into `profiles/` (a
+                // sibling or the cell's own environment config) or `.cell/`
+                // (datamk's private state) at whatever depth they turn up,
+                // not just when `dir:` resolves directly into one of them
+                // (`resolve_dir`'s own check). `.cell` is also a
+                // dot-directory (skipped above already); named here too so
+                // the rule doesn't quietly depend on that coincidence.
+                if name_str == "profiles" || name_str == ".cell" {
+                    continue;
+                }
                 stack.push(path);
+                continue;
+            }
+            // M4: never treat a `cell.yaml` as an Ossie file — it has a
+            // `.yaml` extension and would otherwise match below, echoing
+            // the contract's own top-level keys into a "not an Ossie
+            // document" error when a `dir:` walk crosses one.
+            if name_str == "cell.yaml" {
                 continue;
             }
             let ext = path
@@ -431,6 +450,31 @@ mod tests {
         let found = walk(&dir).unwrap();
         let names: Vec<&str> = found.iter().map(|(rel, _)| rel.as_str()).collect();
         assert_eq!(names, vec!["a.yml", "b.yaml", "sub/c.json"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_skips_profiles_and_dotcell_at_any_depth_and_never_reads_cell_yaml() {
+        // The shape a `dir: ..` (or any wide `dir:`) produces: the cell's
+        // own `cell.yaml`, `profiles/`, and `.cell/` sitting next to the
+        // Ossie source, plus a nested `sub/profiles` — none of it should be
+        // walked.
+        let dir = tempdir("wide-dir");
+        std::fs::write(dir.join("cell.yaml"), "cell: t\ndiscover:\n  never: true\n").unwrap();
+        std::fs::write(dir.join("osi.yaml"), "osi").unwrap();
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("profiles/prod.yaml"), "warehouse: prod").unwrap();
+        std::fs::create_dir_all(dir.join(".cell")).unwrap();
+        std::fs::write(dir.join(".cell/semantic_model.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("sub/profiles")).unwrap();
+        std::fs::write(dir.join("sub/profiles/dev.yaml"), "warehouse: dev").unwrap();
+        std::fs::create_dir_all(dir.join("sub/.cell")).unwrap();
+        std::fs::write(dir.join("sub/.cell/leak.yaml"), "leak").unwrap();
+
+        let found = walk(&dir).unwrap();
+        let names: Vec<&str> = found.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(names, vec!["osi.yaml"], "{names:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -123,6 +123,42 @@ impl SemanticIndex {
     pub fn model_files(&self) -> &indexmap::IndexMap<String, String> {
         &self.record.model_files
     }
+
+    /// A view of `self` narrowed to `routes` (M1): every binding to a route
+    /// outside this set is dropped, so a dataset bound to two majors (one
+    /// discoverable, one private) keeps only the discoverable one, and a
+    /// dataset bound to nothing discoverable becomes unbound. Every
+    /// consumer that *serves or emits a document* — `context::interface`,
+    /// `?model=`/`--model`, the MCP `datamk://.../semantic/<model>`
+    /// resource — must call this with the discoverable route list
+    /// (`context::discoverable_routes`) before reading the index, or a
+    /// private export's route key rides along in `DatasetDoc.routes`/the
+    /// bound-count. `datamk verify` is the one exception: it checks every
+    /// bound dataset regardless of visibility, so it keeps the index
+    /// `config::load` built against the full interface.
+    pub fn restricted_to(&self, routes: &[String]) -> SemanticIndex {
+        let allow: std::collections::HashSet<&str> = routes.iter().map(String::as_str).collect();
+        let bindings = self
+            .bindings
+            .iter()
+            .filter_map(|(key, bound_routes)| {
+                let kept: Vec<String> = bound_routes
+                    .iter()
+                    .filter(|r| allow.contains(r.as_str()))
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    None
+                } else {
+                    Some((key.clone(), kept))
+                }
+            })
+            .collect();
+        SemanticIndex {
+            record: self.record.clone(),
+            bindings,
+        }
+    }
 }
 
 /// ADR 0018 §5: split `source` on `.`, respecting quotes (a dot inside a
@@ -337,5 +373,52 @@ mod tests {
         );
         let routes = idx.route_for("invoice", "flight_spend");
         assert_eq!(routes, ["flight_spend@1", "flight_spend@2"]);
+    }
+
+    // --- M1: restricted_to --------------------------------------------------
+
+    #[test]
+    fn restricted_to_keeps_only_the_allowed_route_of_a_dataset_bound_to_two_majors() {
+        let rec = record(vec![model(
+            "invoice",
+            vec![dataset("flight_spend", "flight_spend")],
+        )]);
+        let idx = SemanticIndex::build(
+            rec,
+            &[
+                export("flight_spend", "1.0.0"),
+                export("flight_spend", "2.0.0"),
+            ],
+        );
+        assert_eq!(
+            idx.route_for("invoice", "flight_spend"),
+            ["flight_spend@1", "flight_spend@2"]
+        );
+
+        // Only `@1` is discoverable (`@2` stands in for a private major).
+        let restricted = idx.restricted_to(&["flight_spend@1".to_string()]);
+        assert_eq!(
+            restricted.route_for("invoice", "flight_spend"),
+            ["flight_spend@1"]
+        );
+        assert_eq!(
+            idx.route_for("invoice", "flight_spend"),
+            ["flight_spend@1", "flight_spend@2"],
+            "the original index must be untouched"
+        );
+    }
+
+    #[test]
+    fn restricted_to_makes_a_dataset_bound_only_to_a_disallowed_route_fully_unbound() {
+        let rec = record(vec![model(
+            "invoice",
+            vec![dataset("flight_spend", "flight_spend@1")],
+        )]);
+        let idx = SemanticIndex::build(rec, &[export("flight_spend", "1.0.0")]);
+        assert_eq!(idx.route_for("invoice", "flight_spend"), ["flight_spend@1"]);
+
+        let restricted = idx.restricted_to(&[]);
+        assert!(restricted.route_for("invoice", "flight_spend").is_empty());
+        assert!(restricted.datasets_for_route("flight_spend@1").is_empty());
     }
 }
