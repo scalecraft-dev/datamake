@@ -15,9 +15,11 @@
 //! simply absent (`None`) on a 0.1.1 document. One struct set reads both
 //! supported versions rather than one per version.
 
+pub mod bind;
 pub mod git;
 pub mod record;
 pub mod source;
+pub mod verify;
 
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};

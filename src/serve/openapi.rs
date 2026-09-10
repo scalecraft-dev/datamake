@@ -708,6 +708,7 @@ mod tests {
             discover: None,
             discovered_from: None,
             semantic_model: None,
+            semantic: None,
             definitions_source: None,
             definitions: Vec::new(),
             definitions_file: None,
@@ -877,6 +878,7 @@ mod tests {
             discover: None,
             discovered_from: None,
             semantic_model: None,
+            semantic: None,
             definitions_source: None,
             definitions: Vec::new(),
             definitions_file: None,
@@ -962,6 +964,7 @@ mod tests {
             discover: None,
             discovered_from: None,
             semantic_model: None,
+            semantic: None,
             definitions_source: None,
             definitions: vec![
                 serde_yaml::from_str(

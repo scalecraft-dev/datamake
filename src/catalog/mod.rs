@@ -359,6 +359,7 @@ fn sync_semantic(
             resolved,
             content_sha256: merged.content_sha256,
             files: merged.files,
+            model_files: merged.model_files,
             document: merged.document,
         };
         record.save(dir)?;

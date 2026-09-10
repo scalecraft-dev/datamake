@@ -145,6 +145,33 @@ pub fn load(file: &Path, profile: &str) -> Result<LoadedCell> {
             }
         }
     };
+
+    // ADR 0018 §5: bind Ossie datasets to exports now that `def.interface`
+    // is final (materialized above for a discovered cell, authored
+    // otherwise) — the same seam ADR 0016/0017 use for `applies_to`. Only a
+    // FRESH record binds; a stale or absent one when `semantic_model:` is
+    // declared leaves `def.semantic` `None` rather than fail the load — the
+    // same "warn, don't refuse" discipline `Discovery::Stale` applies to a
+    // discovered interface (`serve`'s refusal is a later phase, ADR 0018 §4).
+    if def.semantic_model.is_some() {
+        let digest = crate::context::cell_yaml_digest_of(file)?;
+        match crate::ossie::record::SemanticModelRecord::fresh_for(&dir, &digest) {
+            Some(record) => {
+                def.semantic = Some(crate::ossie::bind::SemanticIndex::build(
+                    record,
+                    &def.interface,
+                ));
+            }
+            None => {
+                tracing::warn!(
+                    "cell declares `semantic_model:` but .cell/semantic_model.json is missing \
+                     or stale — datasets are not bound to exports and `datamk verify` runs no \
+                     semantic checks; run `datamk sync` to refresh it."
+                );
+            }
+        }
+    }
+
     let mut bindings = resolve(&def, &raw)?;
     // A relative `type: duckdb` connection path resolves against the cell
     // directory, like every other profile path.

@@ -7,10 +7,13 @@
 //! profile for the semantic part."
 
 use anyhow::{Context as _, Result};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::source::SemanticModelSource;
+use super::verify::DatasetCheck;
 use super::Document;
 
 /// Where the source resolved to at sync time — a local directory (absolute
@@ -36,6 +39,14 @@ pub struct SemanticModelRecord {
     /// sha256 over the sorted, merged file bytes (`source::merge`).
     pub content_sha256: String,
     pub files: Vec<String>,
+    /// semantic model name -> the relative file it was defined in
+    /// (`source::merge`'s `Merged::model_files`) — carried onto the record
+    /// so a later phase (ADR 0018 §7's `semantic_matches[]`) can name which
+    /// file a model/dataset/field came from without re-walking the source.
+    /// `#[serde(default)]`: a record written before this field existed
+    /// still parses, as empty.
+    #[serde(default)]
+    pub model_files: IndexMap<String, String>,
     pub document: Document,
 }
 
@@ -70,6 +81,85 @@ impl SemanticModelRecord {
                 "found .cell/semantic_model.json but its digest no longer matches cell.yaml — \
                  the config changed since the last `datamk sync`; omitting the semantic model \
                  (re-run `datamk sync` for a current one)"
+            );
+            return None;
+        }
+        Some(r)
+    }
+}
+
+/// The `datamk verify` semantic-check record (ADR 0018 §6):
+/// `.cell/semantic_check.json`, sibling of `.cell/source_check.json`
+/// (`manifest::SourceCheckRecord`) and written under the identical
+/// discipline — `cell_yaml_digest` and `profile` are both freshness gates
+/// (`fresh_for`), since `verify` and a later `context`/`serve` phase run as
+/// separate processes. `content_sha256` is the semantic model record's own
+/// (`SemanticIndex::content_sha256`), not a hash of this file — it lets a
+/// consumer tell "the Ossie source changed since this was checked" without
+/// re-reading `semantic_model.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticCheckRecord {
+    pub datamk_version: String,
+    pub cell_yaml_digest: String,
+    pub profile: String,
+    pub checked_at: String,
+    pub content_sha256: String,
+    /// "model/dataset" -> what verify measured, bound and unbound datasets
+    /// alike (ADR 0018 §5: an unbound dataset is kept, never dropped).
+    pub datasets: BTreeMap<String, DatasetCheck>,
+    /// "model/relationship name" -> `"verified"` or `"unbound"`.
+    pub relationships: BTreeMap<String, String>,
+    /// "model/metric name" -> `"verified"`, `"unverified:dialect"`, or
+    /// `"unverified:unbound"`.
+    pub metrics: BTreeMap<String, String>,
+}
+
+impl SemanticCheckRecord {
+    pub fn path(dir: &Path) -> PathBuf {
+        dir.join(".cell").join("semantic_check.json")
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<PathBuf> {
+        let path = Self::path(dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Unread today — phase 3 (`context`/`serve`) is the consumer, the same
+    /// deferred wiring `SemanticModelRecord` itself shipped with in phase 1.
+    #[allow(dead_code)]
+    pub fn load(dir: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::path(dir)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// `load`, gated on digest AND profile matching — the `SourceCheckRecord
+    /// ::fresh_for` pattern (`manifest.rs`): a check under one profile must
+    /// not attest another, and a `cell.yaml` edit since the last `datamk
+    /// verify` must silently drop the record rather than let a stale check
+    /// ride along as current. Unread today, same phase-3 deferral as `load`.
+    #[allow(dead_code)]
+    pub fn fresh_for(dir: &Path, cell_yaml_digest: &str, profile: &str) -> Option<Self> {
+        let r = Self::load(dir)?;
+        if r.cell_yaml_digest != cell_yaml_digest {
+            tracing::info!(
+                "found .cell/semantic_check.json but its digest no longer matches cell.yaml — \
+                 the config changed since the last `datamk verify`; omitting semantic_check \
+                 (re-run `datamk verify` for a current one)"
+            );
+            return None;
+        }
+        if r.profile != profile {
+            tracing::info!(
+                profile = %profile,
+                record_profile = %r.profile,
+                "found .cell/semantic_check.json but it was written under a different profile — \
+                 omitting semantic_check (re-run `datamk verify -p {profile}` for a current one)"
             );
             return None;
         }
@@ -120,6 +210,54 @@ pub fn check_release_pinned(dir: &Path, file: &Path, def: &crate::config::CellDe
 mod tests {
     use super::*;
 
+    fn semantic_check_sample(digest: &str, profile: &str) -> SemanticCheckRecord {
+        SemanticCheckRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: digest.to_string(),
+            profile: profile.to_string(),
+            checked_at: "2026-09-10T00:00:00Z".to_string(),
+            content_sha256: "abc".to_string(),
+            datasets: BTreeMap::from([(
+                "invoice/flight_spend".to_string(),
+                DatasetCheck {
+                    model: "invoice".to_string(),
+                    dataset: "flight_spend".to_string(),
+                    route: Some("flight_spend@1".to_string()),
+                    primary_key: "matches".to_string(),
+                    fields: BTreeMap::new(),
+                },
+            )]),
+            relationships: BTreeMap::from([("invoice/r".to_string(), "verified".to_string())]),
+            metrics: BTreeMap::from([("invoice/total".to_string(), "verified".to_string())]),
+        }
+    }
+
+    #[test]
+    fn semantic_check_record_round_trips_through_save_and_load() {
+        let dir = tempdir("semantic-check-roundtrip");
+        let rec = semantic_check_sample("d1", "local");
+        rec.save(&dir).unwrap();
+        let loaded = SemanticCheckRecord::load(&dir).unwrap();
+        assert_eq!(loaded.cell_yaml_digest, "d1");
+        assert_eq!(
+            loaded.datasets["invoice/flight_spend"].route.as_deref(),
+            Some("flight_spend@1")
+        );
+        assert_eq!(loaded.relationships["invoice/r"], "verified");
+        assert_eq!(loaded.metrics["invoice/total"], "verified");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_check_record_fresh_for_gates_on_digest_and_profile() {
+        let dir = tempdir("semantic-check-fresh");
+        semantic_check_sample("d1", "local").save(&dir).unwrap();
+        assert!(SemanticCheckRecord::fresh_for(&dir, "d1", "local").is_some());
+        assert!(SemanticCheckRecord::fresh_for(&dir, "d2", "local").is_none());
+        assert!(SemanticCheckRecord::fresh_for(&dir, "d1", "prod").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "datamk-ossie-record-{tag}-{}-{}",
@@ -146,6 +284,7 @@ mod tests {
             },
             content_sha256: "abc".to_string(),
             files: vec!["m.yaml".to_string()],
+            model_files: IndexMap::new(),
             document: Document {
                 version: "0.1.1".to_string(),
                 dialects: vec![],
@@ -192,6 +331,7 @@ mod tests {
             resolved,
             content_sha256: "abc".to_string(),
             files: vec!["m.yaml".to_string()],
+            model_files: IndexMap::new(),
             document: Document {
                 version: "0.1.1".to_string(),
                 dialects: vec![],
