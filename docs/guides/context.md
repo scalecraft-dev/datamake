@@ -13,15 +13,18 @@ curl -H "Authorization: Bearer $TOKEN" https://orders.data.internal/context
 curl -H "Authorization: Bearer $TOKEN" "https://orders.data.internal/context?include=docs"
 curl -H "Authorization: Bearer $TOKEN" "https://orders.data.internal/context/orders_daily@2"
 curl -H "Authorization: Bearer $TOKEN" "https://orders.data.internal/context?terms=net_revenue,nr"
+curl -H "Authorization: Bearer $TOKEN" "https://orders.data.internal/context?model=invoice"
 
 # Portable (no server, no token). Inlines docs by default.
 datamk context -f cell.yaml [-p prod] [--out context.json] [--no-docs] \
-                [--export orders_daily@2] [--terms net_revenue,nr]
+                [--export orders_daily@2] [--terms net_revenue,nr] [--model invoice]
 ```
 
-Query params on `/context` and `/context/<route>` are a closed set: `include`
-(`docs` only) and `terms`. Anything else is 400. An unknown `<route>` is 404
-naming the routes that exist.
+Query params on `/context` are a closed set: `include` (`docs` only),
+`terms`, and `model`. `/context/<route>` accepts `include` and `terms` only
+— `model` there is 400 (`model` is a whole-cell view). Anything else is 400.
+An unknown `<route>` is 404 naming the routes that exist; an unknown `model`
+is 404 naming the models that exist.
 
 Every data-route response (200 and 404) carries:
 
@@ -59,8 +62,13 @@ Flat document. A record with `from` is a **claim** (origin per field:
 | `included` | Section names inlined (`[]` or `["docs"]`). Absent means the server predates docs pages. |
 | `include_request` | Relative URL to fetch the docs variant. |
 | `definitions[]`, `missing_terms` | Glossary (always present) and unmatched `terms=` tokens. |
+| `semantic_models[]` | Apache Ossie index (always present, `[]` without a bound `semantic_model:`): `name`, `description`, `file`, `datasets`, `bound`, `metrics` counts. |
+| `semantic` | Ossie provenance, a measurement outside every digest: `synced_at`, `content_sha256`, `resolved`, `files`; `checked_at` once `datamk verify` has run. Present iff `semantic_model:` is declared and fresh. |
+| `semantic_model` | One semantic model in full, `?model=`/`--model` only: `name`, `description`, `ai_context`, `file`, `datasets[]` (unbound ones carry `routes: []`), `relationships[]`, `metrics[]`. |
+| `semantic_matches[]` | `?terms=`/`--terms` hits against an Ossie dataset, field, metric, or synonym: `token`, `kind`, `model`, `dataset`, `field`, `description`. Every hit returned — a token colliding across two models lists both. |
+| `exports[].semantic[]` | Every Ossie dataset bound to this route: fields (with `verified`/`reason` once checked), `primary_key`/`primary_key_check`, relationships touching it, metrics fully checkable from this route alone plus `metric_refs` pointers to the rest. |
 | `data` | `served_here`, `channels`. |
-| `notes` | Engine notes, e.g. why status is `draft`. |
+| `notes` | Engine notes, e.g. why status is `draft`, or that a bound semantic model is stale. |
 
 `sample_request`, `example_request`, and `include_request` are relative to
 the document's own URL (RFC 3986), so mounts in a multi-cell server work.
@@ -98,6 +106,27 @@ definitions:                                       # or: definitions: definition
 | `docs` | One relative path per level. ≤64 KiB per page, ≤256 KiB per cell. Empty, non-UTF-8, or oversized is a parse error. No `/docs/:name` route. |
 | `definitions` | Inline list or one file path. Lookup by term or alias, case-insensitive, exact only. |
 | `terms=` | Narrows `definitions[]` and `docs[]` to those terms' pages. Served: unknown term is 200 with `missing_terms`. `datamk context --terms`: unknown term exits non-zero. |
+
+## Semantic models (Apache Ossie)
+
+`semantic_model:` ingests business meaning — field semantics, synonyms,
+metric definitions, join relationships — from
+[Apache Ossie](https://github.com/apache/ossie) documents authored outside
+datamake (a `dir:` or a `git:` source). datamake never authors Ossie, never
+evaluates a metric, never synthesizes a join; it snapshots (`datamk sync`),
+plan-checks every claim it can against the built tables (`datamk verify`,
+`DESCRIBE`, never a row read), and serves the result through four tiers —
+see [semantic-model.md](semantic-model.md) for authoring, sync, and verify.
+
+| Door | Returns |
+|---|---|
+| `/context` | `semantic_models[]` — name, description, file, dataset/bound/metric counts. |
+| `/context/<route>` | `exports[].semantic[]` — every dataset bound to the route, in full. |
+| `/context?model=<name>` | `semantic_model` — one model in full, composable with `terms`. |
+| `/context?terms=<t>` | `semantic_matches[]` — Ossie dataset/field/metric names and synonyms join the `definitions:` lookup. |
+
+`datamk mcp` adds a resource per model, `datamk://<mount>/semantic/<model>`
+(the same document `?model=` returns).
 
 ## Meaning without rows: `--no-data`
 
@@ -161,4 +190,5 @@ description, exports, and `context_digest`. Static file; never served by
 Design rationale: [ADR 0012](../adr/0012-cell-context-document.md),
 [ADR 0013](../adr/0013-long-form-docs-pages.md),
 [ADR 0015](../adr/0015-flat-context-document.md),
-[ADR 0017](../adr/0017-definitions.md).
+[ADR 0017](../adr/0017-definitions.md),
+[ADR 0018](../adr/0018-ossie-ingest.md).

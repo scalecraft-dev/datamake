@@ -6,6 +6,45 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added: `semantic_model:` — Apache Ossie ingest (ADR 0018)
+
+datamake ingests business meaning it does not author: `semantic_model:`
+names a directory or a git repository of [Apache Ossie](https://github.com/apache/ossie)
+documents (field semantics, synonyms, metric definitions, join
+relationships), `datamk sync` snapshots them to `.cell/semantic_model.json`,
+and `datamk verify` plan-checks every claim it can against the built tables
+— an identity field expression against the declared schema, any other
+`ANSI_SQL` expression via `DESCRIBE`, `primary_key` against the export's
+grain, relationship columns, and metric expressions across a cross product
+of bound datasets — never executing a row read, never joining, never
+evaluating a metric. A dataset binds to an export by its `source` matching
+the export's discovered model name, route key, or name; an unbound dataset
+is kept and excluded from route context, so one `osi/` can serve every cell
+cut from a shared repo.
+
+The context document serves the result through four tiers, additive under
+`datamk_context: 4`: `semantic_models[]` (always present, the whole-cell
+index), `exports[].semantic[]` (every dataset bound to a route, in full),
+`?model=<name>`/`--model` (`semantic_model`, one model in full, composable
+with `terms`), and `?terms=`/`--terms` (Ossie dataset/field/metric names
+and synonyms join the `definitions:` lookup as `semantic_matches[]`).
+`datamk mcp` adds a `datamk://<mount>/semantic/<model>` resource per model.
+`interface_digest` folds in lookup keys only — model/dataset/field/metric
+names and addressable synonyms — never prose or verification.
+
+Staleness follows the `discover:` sidecar's regime: `serve` refuses to
+start when `semantic_model:` is declared and no fresh
+`.cell/semantic_model.json` binds; `datamk context` warns on stderr and
+notes it in the document instead. `datamk context` (never `serve`) also
+re-walks a `dir:` source and notes drift since the last sync; a `git:`
+source is never re-checked over the network. See
+[docs/guides/semantic-model.md](docs/guides/semantic-model.md).
+
+The golden context fixture (`test/fixtures/context_v4_golden.json`) gained
+`semantic_models: []` and `semantic_matches: []` — both always-present,
+empty on a cell with no `semantic_model:` — a deliberate, additive
+re-baseline; every other new field is omitted when absent.
+
 ### Added: the column census on bound exports, and prose the data contradicts
 
 `verify` now measures every declared column of a bound export (`bind:`,

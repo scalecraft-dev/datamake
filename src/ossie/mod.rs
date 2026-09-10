@@ -138,6 +138,25 @@ pub enum Dialect {
     Thoughtspot,
 }
 
+impl Dialect {
+    /// The wire token, matching each variant's `#[serde(rename)]` exactly —
+    /// the context document's `fields[].dialects` (ADR 0018 §7) needs this
+    /// as a plain `&str` without a serde round-trip through `serde_json`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Dialect::AnsiSql => "ANSI_SQL",
+            Dialect::Snowflake => "SNOWFLAKE",
+            Dialect::Mdx => "MDX",
+            Dialect::Tableau => "TABLEAU",
+            Dialect::Databricks => "DATABRICKS",
+            Dialect::Maql => "MAQL",
+            Dialect::Bigquery => "BIGQUERY",
+            Dialect::Sigma => "SIGMA",
+            Dialect::Thoughtspot => "THOUGHTSPOT",
+        }
+    }
+}
+
 /// 0.2.0.dev0 only; simply absent on a 0.1.1 document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {

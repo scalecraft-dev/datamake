@@ -25,27 +25,48 @@ pub fn generate(
     version: &str,
     base_path: &str,
 ) -> Value {
-    generate_with_all(cell, description, routes, routes, &[], version, base_path)
+    generate_with_all(
+        cell,
+        description,
+        routes,
+        routes,
+        &[],
+        &[],
+        &[],
+        version,
+        base_path,
+    )
 }
 
 /// `generate`, with the data routes (`routes`, what is mounted) and the
 /// discoverable routes (`all_routes`, every export `/context/{route}` can
 /// name — bound ones included) given separately. `definitions` is the
 /// cell's glossary (ADR 0017 §6) — `terms`'s documented `enum` is
-/// generated from it, term then alias, in declared order.
+/// generated from it, term then alias, in declared order, with every
+/// addressable Ossie dataset/field/metric name or synonym appended
+/// (`semantic_lookup`, ADR 0018 §7). `semantic_models` names `/context`'s
+/// `model` parameter's enum — the same index the document's own
+/// `semantic_models[]` carries.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_with_all(
     cell: &str,
     description: Option<&str>,
     routes: &[(String, Export)],
     all_routes: &[(String, Export)],
     definitions: &[Definition],
+    semantic_models: &[crate::context::SemanticModelIndexDoc],
+    semantic_lookup: &[crate::context::SemanticLookupEntry],
     version: &str,
     base_path: &str,
 ) -> Value {
-    let terms_vocabulary = terms_vocabulary(definitions);
+    let terms_vocabulary = terms_vocabulary(definitions, semantic_lookup);
+    let model_vocabulary: Vec<Value> = semantic_models.iter().map(|m| json!(m.name)).collect();
     let mut paths = Map::new();
     paths.insert("/".to_string(), health_path_item());
-    paths.insert("/context".to_string(), context_path_item(&terms_vocabulary));
+    paths.insert(
+        "/context".to_string(),
+        context_path_item(&terms_vocabulary, &model_vocabulary),
+    );
     paths.insert(
         "/context/{route}".to_string(),
         context_export_path_item(all_routes, &terms_vocabulary),
@@ -90,7 +111,10 @@ fn health_path_item() -> Value {
 /// enumeration precedent, generated from the same list the handler
 /// (`serve::resolve_terms`) matches against, so a change to the glossary is
 /// a compile-visible change here too.
-fn terms_vocabulary(definitions: &[Definition]) -> Vec<Value> {
+fn terms_vocabulary(
+    definitions: &[Definition],
+    semantic_lookup: &[crate::context::SemanticLookupEntry],
+) -> Vec<Value> {
     let mut v = Vec::new();
     for d in definitions {
         v.push(json!(d.term));
@@ -98,15 +122,22 @@ fn terms_vocabulary(definitions: &[Definition]) -> Vec<Value> {
             v.push(json!(a));
         }
     }
+    // ADR 0018 §7: every addressable Ossie dataset/field/metric name or
+    // synonym joins the same lookup index — `resolve_terms`'s Ossie half
+    // matches against the identical list.
+    for e in semantic_lookup {
+        v.push(json!(e.token));
+    }
     v
 }
 
-/// `/context`'s `include` and `terms` parameters, documented from
-/// `INCLUDE_SECTIONS` (`serve::INCLUDE_SECTIONS`) and the cell's own
-/// glossary respectively — the exact vocabularies `validate_context_query`/
-/// `resolve_terms` enforce, so neither can drift from what's generated here
-/// (ADR 0013 §8, ADR 0017 §6).
-fn context_path_item(terms_vocabulary: &[Value]) -> Value {
+/// `/context`'s `include`, `terms`, and `model` parameters, documented from
+/// `INCLUDE_SECTIONS` (`serve::INCLUDE_SECTIONS`), the cell's glossary plus
+/// Ossie lookup, and the bound semantic model index respectively — the
+/// exact vocabularies `validate_context_query`/`resolve_terms`/
+/// `resolve_model` enforce, so none can drift from what's generated here
+/// (ADR 0013 §8, ADR 0017 §6, ADR 0018 §7).
+fn context_path_item(terms_vocabulary: &[Value], model_vocabulary: &[Value]) -> Value {
     let sections: Vec<Value> = super::INCLUDE_SECTIONS.iter().map(|s| json!(s)).collect();
     json!({
         "get": {
@@ -142,6 +173,16 @@ fn context_path_item(terms_vocabulary: &[Value]) -> Value {
                                     `missing_terms`, never a 400 or 404.",
                     "schema": { "type": "array", "items": { "type": "string",
                                                               "enum": terms_vocabulary } }
+                },
+                {
+                    "name": "model",
+                    "in": "query",
+                    "required": false,
+                    "description": "One Apache Ossie semantic model name (ADR 0018 §7) — \
+                                    returns that model in full as `semantic_model`, composable \
+                                    with `terms`. A whole-cell view: not accepted on \
+                                    `/context/{route}` (400).",
+                    "schema": { "type": "string", "enum": model_vocabulary }
                 }
             ],
             "responses": {
@@ -152,12 +193,14 @@ fn context_path_item(terms_vocabulary: &[Value]) -> Value {
                 "304": { "description": "not modified (If-None-Match matched the current ETag \
                                           for the requested variant)" },
                 "400": { "description": "unknown query parameter; an unrecognized/empty \
-                                          `include` section; or a `terms` token that's empty, \
-                                          has characters outside [A-Za-z0-9_.-], or exceeds \
-                                          the token cap" },
+                                          `include` section; or a `terms`/`model` token that's \
+                                          empty, out of grammar, or (terms) exceeds the token \
+                                          cap" },
                 "401": { "description": "missing or unknown bearer token (cell has access.roles)" },
                 "403": { "description": "cell is not shareable, or the token's roles do not \
-                                          include an allowed role" }
+                                          include an allowed role" },
+                "404": { "description": "unknown `model=` — the response names the models \
+                                          that exist" }
             }
         }
     })
@@ -257,6 +300,62 @@ fn context_schema() -> Value {
                         "description": "Present only when `included` contains `docs`." }
                 }}},
             "include_request": { "type": "string" },
+            "semantic_models": { "type": "array",
+                "description": "Apache Ossie semantic-model index (ADR 0018 §7) — always \
+                                present, `[]` without a bound `semantic_model:`. Full detail \
+                                is `?model=`'s `semantic_model`, or per-route in \
+                                `exports[].semantic`.",
+                "items": { "type": "object",
+                    "required": ["name", "file", "datasets", "bound", "metrics"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "file": { "type": "string" },
+                        "datasets": { "type": "integer" },
+                        "bound": { "type": "integer" },
+                        "metrics": { "type": "integer" }
+                    }}},
+            "semantic": { "type": "object",
+                "description": "The bound semantic model's own provenance — a measurement, \
+                                outside every digest. Present iff `semantic_model:` is \
+                                declared and fresh; `checked_at` additionally requires a \
+                                fresh `datamk verify` record.",
+                "properties": {
+                    "synced_at": { "type": "string", "format": "date-time" },
+                    "content_sha256": { "type": "string" },
+                    "resolved": { "type": "object",
+                        "description": "`{dir}` or `{commit}` — where the source resolved to." },
+                    "files": { "type": "integer" },
+                    "checked_at": { "type": "string", "format": "date-time" }
+                }},
+            "semantic_model": { "type": "object",
+                "description": "One Apache Ossie semantic model in full — `?model=` only. \
+                                `datasets[]` includes unbound datasets (`routes: []`).",
+                "required": ["name", "file", "datasets"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "ai_context": {},
+                    "file": { "type": "string" },
+                    "datasets": { "type": "array", "items": semantic_dataset_schema() },
+                    "relationships": { "type": "array", "items": semantic_relationship_schema() },
+                    "metrics": { "type": "array", "items": semantic_metric_schema() }
+                }},
+            "semantic_matches": { "type": "array",
+                "description": "`?terms=` hits against an Ossie dataset, field, metric, or \
+                                synonym (ADR 0018 §7) — always present. Every hit is \
+                                returned; a token colliding across two models lists both.",
+                "items": { "type": "object",
+                    "required": ["token", "kind", "model"],
+                    "properties": {
+                        "token": { "type": "string" },
+                        "kind": { "type": "string",
+                            "enum": ["dataset", "field", "metric", "synonym"] },
+                        "model": { "type": "string" },
+                        "dataset": { "type": "string" },
+                        "field": { "type": "string" },
+                        "description": { "type": "string" }
+                    }}},
             "build": {
                 "type": "object",
                 "description": "Provenance of the published execution behind this document. \
@@ -444,7 +543,89 @@ fn export_schema() -> Value {
                         "additionalProperties": { "type": "integer" }
                     }
                 }
-            }
+            },
+            "semantic": { "type": "array", "items": semantic_dataset_schema(),
+                "description": "Every Apache Ossie dataset bound to this route (ADR 0018 §7) \
+                                — `[]` without a bound semantic model, or when nothing binds \
+                                to this route." }
+        }
+    })
+}
+
+/// One Ossie dataset (ADR 0018 §7) — shared by `exports[].semantic[]` and
+/// `semantic_model.datasets[]`.
+fn semantic_dataset_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["model", "dataset", "source"],
+        "properties": {
+            "model": { "type": "string" },
+            "dataset": { "type": "string" },
+            "source": { "type": "string" },
+            "description": { "type": "string" },
+            "ai_context": {},
+            "from": from_schema("description, ai_context, fields"),
+            "primary_key": { "type": "array", "items": { "type": "string" } },
+            "primary_key_check": { "type": "string",
+                "enum": ["matches", "no_grain", "absent"],
+                "description": "From a fresh `datamk verify` record; absent when none stands." },
+            "routes": { "type": "array", "items": { "type": "string" },
+                "description": "Every route bound; `[]` for a dataset `semantic_model` lists \
+                                but nothing binds." },
+            "fields": { "type": "array", "items": { "type": "object",
+                "required": ["name", "dialects"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "expression": { "type": ["string", "null"],
+                        "description": "The `ANSI_SQL` variant only; null without one." },
+                    "dialects": { "type": "array", "items": { "type": "string" } },
+                    "datatype": { "type": "string" },
+                    "is_time": { "type": "boolean" },
+                    "description": { "type": "string" },
+                    "ai_context": {},
+                    "verified": { "type": "boolean",
+                        "description": "From a fresh check; absent when none stands." },
+                    "reason": { "type": "string", "enum": ["dialect"] }
+                }}},
+            "relationships": { "type": "array", "items": semantic_relationship_schema() },
+            "metrics": { "type": "array", "items": semantic_metric_schema() },
+            "metric_refs": { "type": "array", "items": { "type": "object",
+                "required": ["name", "model"],
+                "properties": { "name": { "type": "string" }, "model": { "type": "string" } } } }
+        }
+    })
+}
+
+fn semantic_relationship_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["name", "from", "to", "from_columns", "to_columns"],
+        "properties": {
+            "name": { "type": "string" },
+            "from": { "type": "string" },
+            "to": { "type": "string" },
+            "from_columns": { "type": "array", "items": { "type": "string" } },
+            "to_columns": { "type": "array", "items": { "type": "string" } },
+            "from_route": { "type": "string" },
+            "to_route": { "type": "string" },
+            "status": { "type": "string", "enum": ["verified", "unbound"] }
+        }
+    })
+}
+
+fn semantic_metric_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+            "name": { "type": "string" },
+            "expression": { "type": ["string", "null"],
+                "description": "The `ANSI_SQL` variant only; null without one." },
+            "datatype": { "type": "string" },
+            "description": { "type": "string" },
+            "ai_context": {},
+            "status": { "type": "string",
+                "enum": ["verified", "unverified:dialect", "unverified:unbound"] }
         }
     })
 }
@@ -788,6 +969,8 @@ mod tests {
             "definitions_request",
             "docs",
             "include_request",
+            "semantic_models",
+            "semantic_matches",
             "build",
             "source_check",
             "freshness",
@@ -860,6 +1043,81 @@ mod tests {
         assert!(include_desc.contains("ON THE RECORDS"), "{include_desc}");
     }
 
+    /// ADR 0018 §7: the Ossie context-document schema pieces, the `model`
+    /// query parameter (and its 404), and the extended `terms` vocabulary —
+    /// pinned the same way `context_schema_names_every_top_level_document_key`
+    /// pins the rest of the shape.
+    #[test]
+    fn semantic_schema_and_model_param_are_documented() {
+        let models = vec![crate::context::SemanticModelIndexDoc {
+            name: "invoice".to_string(),
+            description: None,
+            file: "invoice.yaml".to_string(),
+            datasets: 1,
+            bound: 1,
+            metrics: 0,
+        }];
+        let lookup = vec![crate::context::SemanticLookupEntry {
+            token: "flight_spend".to_string(),
+            kind: "dataset".to_string(),
+            model: "invoice".to_string(),
+            dataset: Some("flight_spend".to_string()),
+            field: None,
+            description: None,
+        }];
+        let doc = generate_with_all(
+            "orders",
+            None,
+            &[],
+            &[],
+            &[],
+            &models,
+            &lookup,
+            "digest123",
+            "",
+        );
+
+        let schema = &doc["paths"]["/context"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        let props = schema["properties"].as_object().unwrap();
+        for key in [
+            "semantic_models",
+            "semantic",
+            "semantic_model",
+            "semantic_matches",
+        ] {
+            assert!(props.contains_key(key), "undocumented top-level key {key}");
+        }
+        let export_semantic = &props["exports"]["items"]["properties"]["semantic"];
+        assert_eq!(export_semantic["type"], "array");
+
+        let params = doc["paths"]["/context"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let model_param = params.iter().find(|p| p["name"] == "model").unwrap();
+        assert_eq!(model_param["schema"]["enum"], json!(["invoice"]));
+
+        let responses = &doc["paths"]["/context"]["get"]["responses"];
+        assert!(responses.get("404").is_some(), "unknown model must 404");
+
+        // `terms`'s enum picks up the Ossie lookup token alongside any
+        // `definitions:` vocabulary.
+        let terms_param = params.iter().find(|p| p["name"] == "terms").unwrap();
+        let enumerated: Vec<&str> = terms_param["schema"]["items"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(enumerated.contains(&"flight_spend"), "{enumerated:?}");
+
+        // `/context/{route}` never accepts `model=`.
+        let route_params = doc["paths"]["/context/{route}"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        assert!(!route_params.iter().any(|p| p["name"] == "model"));
+    }
+
     /// Version and contract used to exist only as prose inside `summary`.
     #[test]
     fn data_path_items_carry_version_and_contract_as_extensions() {
@@ -929,7 +1187,7 @@ mod tests {
         let params = doc["paths"]["/context"]["get"]["parameters"]
             .as_array()
             .unwrap();
-        assert_eq!(params.len(), 2, "{params:?}");
+        assert_eq!(params.len(), 3, "{params:?}");
         let include = &params[0];
         assert_eq!(include["name"], "include");
         assert_eq!(include["style"], "form");
@@ -941,9 +1199,10 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(enumerated, super::super::INCLUDE_SECTIONS.to_vec());
+        assert_eq!(params[2]["name"], "model");
 
         let responses = &doc["paths"]["/context"]["get"]["responses"];
-        for code in ["200", "304", "400", "401", "403"] {
+        for code in ["200", "304", "400", "401", "403", "404"] {
             assert!(responses.get(code).is_some(), "missing response {code}");
         }
     }
@@ -975,7 +1234,17 @@ mod tests {
             ],
             definitions_file: None,
         };
-        let doc = generate_with_all(&def.cell, None, &[], &[], &def.definitions, "digest123", "");
+        let doc = generate_with_all(
+            &def.cell,
+            None,
+            &[],
+            &[],
+            &def.definitions,
+            &[],
+            &[],
+            "digest123",
+            "",
+        );
         let params = doc["paths"]["/context"]["get"]["parameters"]
             .as_array()
             .unwrap();

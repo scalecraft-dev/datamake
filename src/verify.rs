@@ -736,7 +736,9 @@ pub fn check(
         // exactly like the declared-schema checks above.
         if let Some(index) = &def.semantic {
             for dc in crate::ossie::verify::check_export(conn, export, &route, source, index)? {
-                semantic_datasets.insert(format!("{}/{}", dc.model, dc.dataset), dc);
+                let key =
+                    crate::ossie::verify::dataset_key(&dc.model, &dc.dataset, dc.route.as_deref());
+                semantic_datasets.insert(key, dc);
             }
         }
 
@@ -758,10 +760,20 @@ pub fn check(
             }
             // ADR 0018 §5: a dataset that binds to nothing is kept, marked
             // unbound — never dropped from the record just because no
-            // export claimed it.
+            // export claimed it. A bound dataset already has one
+            // "model/dataset@route" entry per route from `check_export`
+            // above; only a dataset with zero routes gets the unbound
+            // backstop entry here.
             for ds in &model.datasets {
+                if !index.route_for(&model.name, &ds.name).is_empty() {
+                    continue;
+                }
                 semantic_datasets
-                    .entry(format!("{}/{}", model.name, ds.name))
+                    .entry(crate::ossie::verify::dataset_key(
+                        &model.name,
+                        &ds.name,
+                        None,
+                    ))
                     .or_insert_with(|| crate::ossie::verify::DatasetCheck {
                         model: model.name.clone(),
                         dataset: ds.name.clone(),
@@ -3022,13 +3034,124 @@ interface:
 
         let record = crate::ossie::record::SemanticCheckRecord::load(&dir)
             .expect(".cell/semantic_check.json must exist after a passing verify");
-        let dc = &record.datasets["invoice/flight_spend"];
+        let dc = &record.datasets["invoice/flight_spend@flight_spend@1"];
         assert_eq!(dc.route.as_deref(), Some("flight_spend@1"));
         assert_eq!(dc.primary_key, "matches");
         assert_eq!(dc.fields.len(), 3);
         assert!(dc.fields.values().all(|f| f.verified));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dataset bound to two majors of one export name (ADR 0018 §5) must
+    /// record one `semantic_check.json` entry per route — the phase-2 bug
+    /// this re-keying fixes: `"model/dataset"` alone let the second route's
+    /// check silently overwrite the first's.
+    #[test]
+    fn a_dataset_bound_to_two_majors_records_one_entry_per_route() {
+        use crate::config::Export;
+        use crate::ossie::bind::SemanticIndex;
+        use crate::ossie::record::{Resolved, SemanticModelRecord};
+        use crate::ossie::source::SemanticModelSource;
+        use crate::ossie::{
+            Dataset, DialectExpression, Document, Expression, Field, SemanticModel,
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE a_tbl AS SELECT 1 AS id; CREATE TABLE b_tbl AS SELECT 1 AS id;",
+        )
+        .unwrap();
+
+        let field_id = Field {
+            name: "id".to_string(),
+            expression: Expression {
+                dialects: vec![DialectExpression {
+                    dialect: crate::ossie::Dialect::AnsiSql,
+                    expression: "id".to_string(),
+                }],
+            },
+            dimension: None,
+            label: None,
+            description: None,
+            datatype: None,
+            ai_context: None,
+            custom_extensions: vec![],
+        };
+        let ds = Dataset {
+            name: "flight_spend".to_string(),
+            source: "flight_spend".to_string(),
+            primary_key: vec![],
+            unique_keys: vec![],
+            description: None,
+            ai_context: None,
+            fields: vec![field_id],
+            custom_extensions: vec![],
+        };
+        let model = SemanticModel {
+            name: "invoice".to_string(),
+            description: None,
+            ai_context: None,
+            datasets: vec![ds],
+            relationships: vec![],
+            metrics: vec![],
+            custom_extensions: vec![],
+        };
+        let record = SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: indexmap::IndexMap::new(),
+            document: Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+
+        let mut exp_v1: Export =
+            serde_yaml::from_str("name: flight_spend\nversion: 1.0.0\nbind: a_tbl\n").unwrap();
+        exp_v1.schema =
+            IndexMap::from([("id".to_string(), crate::config::ColumnSpec::bare("integer"))]);
+        let mut exp_v2: Export =
+            serde_yaml::from_str("name: flight_spend\nversion: 2.0.0\nbind: b_tbl\n").unwrap();
+        exp_v2.schema =
+            IndexMap::from([("id".to_string(), crate::config::ColumnSpec::bare("integer"))]);
+
+        let mut def: CellDef = serde_yaml::from_str("cell: t\n").unwrap();
+        def.interface = vec![exp_v1, exp_v2];
+        def.semantic = Some(SemanticIndex::build(record, &def.interface));
+
+        let outcome = check(&conn, &def, &HashMap::new()).unwrap();
+        let semantic = outcome.semantic.expect("bound semantic model");
+        assert_eq!(
+            semantic.datasets.keys().collect::<Vec<_>>(),
+            vec![
+                "invoice/flight_spend@flight_spend@1",
+                "invoice/flight_spend@flight_spend@2"
+            ]
+        );
+        assert_eq!(
+            semantic.datasets["invoice/flight_spend@flight_spend@1"]
+                .route
+                .as_deref(),
+            Some("flight_spend@1")
+        );
+        assert_eq!(
+            semantic.datasets["invoice/flight_spend@flight_spend@2"]
+                .route
+                .as_deref(),
+            Some("flight_spend@2")
+        );
     }
 
     // --- ADR 0008 decision 5: the no-grain warning as the removed-entry -----

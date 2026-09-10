@@ -85,10 +85,9 @@ impl SemanticIndex {
             .unwrap_or(&[])
     }
 
-    /// Not read by `verify` (which iterates `models()`) — a lookup phase 3's
-    /// `?model=<name>` door needs (ADR 0018 §7); kept here rather than
+    /// Not read by `verify` (which iterates `models()`) — the lookup
+    /// `?model=<name>`/`--model` (ADR 0018 §7) needs; kept here rather than
     /// invented there so both consumers share the same binding.
-    #[allow(dead_code)]
     pub fn model(&self, name: &str) -> Option<&SemanticModel> {
         self.record
             .document
@@ -109,9 +108,8 @@ impl SemanticIndex {
         &self.record.content_sha256
     }
 
-    /// Unread today — phase 3's `/context` `semantic_models[]` summary (ADR
-    /// 0018 §7) surfaces the source's resolved commit/dir.
-    #[allow(dead_code)]
+    /// The `/context` `semantic` block's `resolved` (ADR 0018 §7) — the
+    /// source's resolved commit/dir.
     pub fn resolved(&self) -> &Resolved {
         &self.record.resolved
     }
@@ -120,9 +118,8 @@ impl SemanticIndex {
         &self.record.files
     }
 
-    /// Unread today — phase 3's `semantic_matches[]` (ADR 0018 §7) names
-    /// which file a model/dataset/field came from.
-    #[allow(dead_code)]
+    /// `semantic_models[].file`/`semantic_model.file` (ADR 0018 §7): which
+    /// file a model was defined in.
     pub fn model_files(&self) -> &indexmap::IndexMap<String, String> {
         &self.record.model_files
     }

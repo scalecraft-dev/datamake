@@ -747,9 +747,15 @@ mod tests {
             \x20   schemas: [sqlmesh_example]\n";
         let dir = scaffold("stale-defs", cell);
         // No sync ran: the record is missing, discovery is stale.
-        let doc =
-            crate::context::build_document_for(&dir.join("cell.yaml"), "local", true, None, None)
-                .expect("the portable door still emits on a stale record");
+        let doc = crate::context::build_document_for(
+            &dir.join("cell.yaml"),
+            "local",
+            true,
+            None,
+            None,
+            None,
+        )
+        .expect("the portable door still emits on a stale record");
         assert!(doc.exports.is_empty());
         let terms: Vec<&str> = doc.definitions.iter().map(|d| d.term.as_str()).collect();
         assert_eq!(terms, vec!["net_revenue", "fiscal_year"]);

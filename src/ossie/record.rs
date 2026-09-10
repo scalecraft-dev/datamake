@@ -104,8 +104,10 @@ pub struct SemanticCheckRecord {
     pub profile: String,
     pub checked_at: String,
     pub content_sha256: String,
-    /// "model/dataset" -> what verify measured, bound and unbound datasets
-    /// alike (ADR 0018 §5: an unbound dataset is kept, never dropped).
+    /// "model/dataset@route" (one entry per bound route; "model/dataset"
+    /// with no suffix when unbound) -> what verify measured, bound and
+    /// unbound datasets alike (ADR 0018 §5: an unbound dataset is kept,
+    /// never dropped; a dataset bound to two routes gets two entries).
     pub datasets: BTreeMap<String, DatasetCheck>,
     /// "model/relationship name" -> `"verified"` or `"unbound"`.
     pub relationships: BTreeMap<String, String>,
@@ -130,9 +132,6 @@ impl SemanticCheckRecord {
         Ok(path)
     }
 
-    /// Unread today — phase 3 (`context`/`serve`) is the consumer, the same
-    /// deferred wiring `SemanticModelRecord` itself shipped with in phase 1.
-    #[allow(dead_code)]
     pub fn load(dir: &Path) -> Option<Self> {
         let raw = std::fs::read_to_string(Self::path(dir)).ok()?;
         serde_json::from_str(&raw).ok()
@@ -142,8 +141,7 @@ impl SemanticCheckRecord {
     /// ::fresh_for` pattern (`manifest.rs`): a check under one profile must
     /// not attest another, and a `cell.yaml` edit since the last `datamk
     /// verify` must silently drop the record rather than let a stale check
-    /// ride along as current. Unread today, same phase-3 deferral as `load`.
-    #[allow(dead_code)]
+    /// ride along as current.
     pub fn fresh_for(dir: &Path, cell_yaml_digest: &str, profile: &str) -> Option<Self> {
         let r = Self::load(dir)?;
         if r.cell_yaml_digest != cell_yaml_digest {
@@ -218,7 +216,7 @@ mod tests {
             checked_at: "2026-09-10T00:00:00Z".to_string(),
             content_sha256: "abc".to_string(),
             datasets: BTreeMap::from([(
-                "invoice/flight_spend".to_string(),
+                "invoice/flight_spend@flight_spend@1".to_string(),
                 DatasetCheck {
                     model: "invoice".to_string(),
                     dataset: "flight_spend".to_string(),
@@ -240,7 +238,9 @@ mod tests {
         let loaded = SemanticCheckRecord::load(&dir).unwrap();
         assert_eq!(loaded.cell_yaml_digest, "d1");
         assert_eq!(
-            loaded.datasets["invoice/flight_spend"].route.as_deref(),
+            loaded.datasets["invoice/flight_spend@flight_spend@1"]
+                .route
+                .as_deref(),
             Some("flight_spend@1")
         );
         assert_eq!(loaded.relationships["invoice/r"], "verified");

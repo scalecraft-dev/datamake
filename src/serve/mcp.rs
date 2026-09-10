@@ -479,6 +479,21 @@ impl McpServer {
                     "mimeType": p.media_type,
                 }));
             }
+            // ADR 0018 §7: one resource per Apache Ossie semantic model, the
+            // full-model document `?model=<name>` returns — listed only for
+            // a bound `semantic_model:` (`m.state.semantic_index`).
+            if let Some(index) = &m.state.semantic_index {
+                for model in index.models() {
+                    out.push(json!({
+                        "uri": format!("datamk://{}/semantic/{}", m.name, model.name),
+                        "name": format!("{} semantic model: {}", doc.cell, model.name),
+                        "description": model.description.clone().unwrap_or_else(|| {
+                            format!("The Apache Ossie semantic model `{}` in full", model.name)
+                        }),
+                        "mimeType": "application/json",
+                    }));
+                }
+            }
         }
         out
     }
@@ -536,9 +551,37 @@ impl McpServer {
                     "text": page.content.as_ref(),
                 }]
             }));
+        } else if let Some(name) = path.strip_prefix("semantic/") {
+            // ADR 0018 §7: the same document `?model=<name>` returns.
+            let index =
+                m.state.semantic_index.as_ref().ok_or_else(|| {
+                    not_found("this cell has no bound `semantic_model:`".to_string())
+                })?;
+            let model = index.model(name).ok_or_else(|| {
+                let mut known: Vec<&str> = m
+                    .state
+                    .interface
+                    .semantic_models
+                    .iter()
+                    .map(|sm| sm.name.as_str())
+                    .collect();
+                known.sort_unstable();
+                not_found(format!(
+                    "known models: {}",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ))
+            })?;
+            let doc =
+                crate::context::semantic_model_doc(model, index, m.state.semantic_check.as_ref());
+            serde_json::to_string(&doc)
         } else {
             return Err(not_found(
-                "paths are `context`, `context/<route>`, `docs/<target>`".to_string(),
+                "paths are `context`, `context/<route>`, `docs/<target>`, `semantic/<model>`"
+                    .to_string(),
             ));
         }
         .map_err(|e| (-32603, e.to_string()))?;
@@ -1052,6 +1095,120 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("mounted cells: smoke"));
+    }
+
+    /// `single()`, plus a bound semantic model — one model (`invoice`), one
+    /// dataset bound by name to `orders_daily@2`. The same construction
+    /// `serve::smoke::router_with_semantic` uses for the REST door's
+    /// `?model=` tests.
+    fn single_with_semantic() -> McpServer {
+        let scaffold = built_cell();
+        let cell_yaml = scaffold.dir.join("cell.yaml");
+        let mut cell = crate::engine::open(&cell_yaml, "local", true).expect("open built cell");
+        let routes = crate::context::discoverable_routes(&cell.def).unwrap();
+        let model = crate::ossie::SemanticModel {
+            name: "invoice".to_string(),
+            description: Some("Invoice-side facts.".to_string()),
+            ai_context: None,
+            datasets: vec![crate::ossie::Dataset {
+                name: "orders_daily".to_string(),
+                source: "orders_daily".to_string(),
+                primary_key: vec![],
+                unique_keys: vec![],
+                description: None,
+                ai_context: None,
+                fields: vec![],
+                custom_extensions: vec![],
+            }],
+            relationships: vec![],
+            metrics: vec![],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc123".to_string(),
+            files: vec!["invoice.yaml".to_string()],
+            model_files: indexmap::IndexMap::from([(
+                "invoice".to_string(),
+                "invoice.yaml".to_string(),
+            )]),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        cell.def.semantic = Some(crate::ossie::bind::SemanticIndex::build(
+            record,
+            &routes.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+        ));
+        let (state, _store) =
+            build_state(cell, false, &cell_yaml, "local", "").expect("build state");
+        McpServer::single(state)
+    }
+
+    /// ADR 0018 §7: `datamk://<mount>/semantic/<model>` — listed for every
+    /// bound model, readable as the same document `?model=<name>` returns,
+    /// and named in the not-found message alongside `context`/`docs`.
+    #[tokio::test]
+    async fn semantic_resource_is_listed_readable_and_named_in_the_not_found_message() {
+        let s = single_with_semantic();
+        let v = call(&s, 1, "resources/list", Value::Null).await;
+        let uris: Vec<&str> = v["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert!(
+            uris.contains(&"datamk://smoke/semantic/invoice"),
+            "{uris:?}"
+        );
+
+        let v = call(
+            &s,
+            1,
+            "resources/read",
+            json!({ "uri": "datamk://smoke/semantic/invoice" }),
+        )
+        .await;
+        let c = &v["result"]["contents"][0];
+        assert_eq!(c["mimeType"], "application/json");
+        let doc: Value = serde_json::from_str(c["text"].as_str().unwrap()).unwrap();
+        assert_eq!(doc["name"], "invoice");
+        assert_eq!(doc["datasets"][0]["dataset"], "orders_daily");
+
+        let v = call(
+            &s,
+            1,
+            "resources/read",
+            json!({ "uri": "datamk://smoke/semantic/nope" }),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], -32002);
+        assert!(v["error"]["message"].as_str().unwrap().contains("invoice"));
+
+        let v = call(
+            &s,
+            1,
+            "resources/read",
+            json!({ "uri": "datamk://smoke/bogus" }),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], -32002);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("semantic/<model>"));
     }
 
     /// Project mode (ADR 0014): routes are qualified by mount on every tool,

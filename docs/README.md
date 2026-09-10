@@ -5,10 +5,11 @@
 - [Incremental loading](guides/incremental.md): `incremental:` and `materialize:`
 - [Postgres setup](guides/postgres.md) · [Snowflake setup](guides/snowflake.md)
 - [Discovered cells](guides/discover.md): interface from a SQLMesh project
+- [Semantic models](guides/semantic-model.md): business meaning ingested from Apache Ossie
 
 **Serve**
 - [Serving](guides/serving.md): query grammar, status codes, multi-cell projects
-- [Context document](guides/context.md): schema with meaning, docs pages, definitions
+- [Context document](guides/context.md): schema with meaning, docs pages, definitions, semantic models
 - [MCP server](guides/mcp.md): the same interface over stdio
 
 **Deploy**

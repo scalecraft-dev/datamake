@@ -14,11 +14,15 @@ use super::bind::SemanticIndex;
 use super::{Dataset, Dialect, SemanticModel};
 use crate::config::{CellDef, Export};
 
-/// One dataset's check, keyed `"model/dataset"` in `SemanticCheckRecord::
-/// datasets` (`record.rs`). `model`/`dataset` are not part of the wire
-/// shape — the map key already carries them — but `check_export` needs
-/// somewhere to put them so `verify::check` can build that key without a
-/// second lookup.
+/// One dataset's check, keyed `"model/dataset@route"` (or `"model/dataset"`
+/// when unbound — `route` is `None`, `dataset_key` omits the suffix) in
+/// `SemanticCheckRecord::datasets` (`record.rs`). A dataset bound to two
+/// routes (two majors of one export name) produces two entries, one per
+/// route — keying on `"model/dataset"` alone would let the second binding's
+/// check silently overwrite the first's. `model`/`dataset` are not part of
+/// the wire shape — the map key already carries them — but `check_export`
+/// needs somewhere to put them so `verify::check` can build that key
+/// without a second lookup.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DatasetCheck {
     #[serde(skip)]
@@ -31,6 +35,17 @@ pub struct DatasetCheck {
     /// `"unbound"` when `route` is `None` — nothing was compared.
     pub primary_key: String,
     pub fields: BTreeMap<String, FieldCheck>,
+}
+
+/// The `SemanticCheckRecord::datasets` key for one binding of `model/dataset`
+/// — one entry per bound route, so a dataset bound to two majors records
+/// both (ADR 0018 §5). `route: None` (unbound, kept per §5) omits the
+/// suffix, matching the model-level key shape `relationships`/`metrics` use.
+pub fn dataset_key(model: &str, dataset: &str, route: Option<&str>) -> String {
+    match route {
+        Some(r) => format!("{model}/{dataset}@{r}"),
+        None => format!("{model}/{dataset}"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,11 +118,33 @@ fn bare_identifier(expr: &str) -> Option<String> {
     Some(e.to_string())
 }
 
-fn ansi_sql(expr: &super::Expression) -> Option<&str> {
+/// The `ANSI_SQL` dialect variant of an expression, when one exists — the
+/// only dialect datamk ever plan-checks (ADR 0018 §6) or surfaces as
+/// `fields[].expression`/`metrics[].expression` in the context document
+/// (ADR 0018 §7).
+pub fn ansi_sql(expr: &super::Expression) -> Option<&str> {
     expr.dialects
         .iter()
         .find(|d| d.dialect == Dialect::AnsiSql)
         .map(|d| d.expression.as_str())
+}
+
+/// Datasets of `model` literally qualified in `expr` by a `<name>.` or
+/// `"<name>".` prefix — the same textual detection `check_metrics` uses to
+/// decide which bound datasets a metric's cross-product join must include,
+/// reused by the context document (ADR 0018 §7) to decide which route(s) a
+/// metric's "full" placement belongs under. Never a real SQL parse: a
+/// metric that doesn't qualify any dataset (e.g. `COUNT(*)`) returns an
+/// empty list, meaning "every bound dataset of the model", not "none" — see
+/// both call sites for how they treat that case.
+pub fn referenced_datasets<'a>(model: &'a SemanticModel, expr: &str) -> Vec<&'a Dataset> {
+    model
+        .datasets
+        .iter()
+        .filter(|ds| {
+            expr.contains(&format!("{}.", ds.name)) || expr.contains(&format!("\"{}\".", ds.name))
+        })
+        .collect()
 }
 
 /// ADR 0018 §6, fields + `primary_key`: every dataset bound to `route`,
@@ -312,14 +349,7 @@ pub fn check_metrics(
         };
         let expr = expr.trim();
 
-        let referenced: Vec<&Dataset> = model
-            .datasets
-            .iter()
-            .filter(|ds| {
-                expr.contains(&format!("{}.", ds.name))
-                    || expr.contains(&format!("\"{}\".", ds.name))
-            })
-            .collect();
+        let referenced: Vec<&Dataset> = referenced_datasets(model, expr);
         let all_referenced_bound = referenced
             .iter()
             .all(|ds| !index.route_for(&model.name, &ds.name).is_empty());

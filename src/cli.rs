@@ -283,6 +283,11 @@ pub struct ContextArgs {
     /// be re-requested.
     #[arg(long, value_name = "TERMS", value_delimiter = ',')]
     pub terms: Option<Vec<String>>,
+    /// Narrow the document to one Apache Ossie semantic model in full (ADR
+    /// 0018 §7) — the portable twin of `GET /context?model=<name>`. A
+    /// whole-cell view: mutually exclusive with `--export`.
+    #[arg(long, value_name = "NAME")]
+    pub model: Option<String>,
 }
 
 #[derive(Args)]
