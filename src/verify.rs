@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use duckdb::Connection;
+use indexmap::IndexMap;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -369,7 +370,7 @@ fn write_source_check_record(
     file: &Path,
     dir: &Path,
     profile: &str,
-    exports: BTreeMap<String, crate::manifest::GrainMeasurement>,
+    exports: BTreeMap<String, crate::manifest::ExportMeasurement>,
 ) -> Result<()> {
     let path = dir.join(".cell").join("source_check.json");
     if let Some(parent) = path.parent() {
@@ -425,7 +426,7 @@ pub fn check(
     conn: &Connection,
     def: &CellDef,
     warehouse_columns: &HashMap<String, crate::engine::SourceWarehouseColumns>,
-) -> Result<BTreeMap<String, crate::manifest::GrainMeasurement>> {
+) -> Result<BTreeMap<String, crate::manifest::ExportMeasurement>> {
     // ADR 0005 §1: `__datamk_` is a reserved, enforced namespace — a table
     // matching it other than the watermark table itself is refused before
     // publish.
@@ -512,6 +513,15 @@ pub fn check(
             }
         }
 
+        // The column census, bound exports only: the rows datamk never
+        // stores are the ones nothing else measures, so prose about them
+        // ("currently NULL") is otherwise never contradicted by anything.
+        let census = if export.is_bound() {
+            Some(column_census(conn, source, &export.schema, &export.grain)?)
+        } else {
+            None
+        };
+
         if !export.grain.is_empty() {
             let GrainCounts {
                 total,
@@ -571,14 +581,45 @@ pub fn check(
             }
             measurements.insert(
                 export.route()?,
-                crate::manifest::GrainMeasurement {
+                crate::manifest::ExportMeasurement {
                     check: "grain_unique".to_string(),
                     grain: export.grain.clone(),
                     rows: total,
-                    distinct_grain: distinct,
+                    distinct_grain: Some(distinct),
                     null_rows,
+                    columns: census.map(|c| c.columns).unwrap_or_default(),
                 },
             );
+        } else if let Some(census) = census {
+            // No grain, so no uniqueness check ran, but the schema check
+            // above did and the census is a measurement of its own: a
+            // grainless bound export (most discovered models) would
+            // otherwise carry no `check` at all.
+            measurements.insert(
+                export.route()?,
+                crate::manifest::ExportMeasurement {
+                    check: "schema".to_string(),
+                    grain: Vec::new(),
+                    rows: census.rows,
+                    distinct_grain: None,
+                    null_rows: BTreeMap::new(),
+                    columns: census.columns,
+                },
+            );
+        }
+
+        // Prose that says a column is empty, beside a census that says it
+        // is not. A warning, never a failure: the census cannot tell a
+        // stale sentence from a broken backfill, only that the two
+        // disagree. The same finding lands in the document's `notes[]`
+        // (`context::assemble`) so an agent reading the prose sees it too.
+        let route = export.route()?;
+        if let Some(m) = measurements.get(&route) {
+            let warehouse_descriptions = warehouse.map(|wc| &wc.descriptions);
+            let claims = empty_claims_for(export, &route, warehouse_descriptions, &def.definitions);
+            for c in empty_claim_contradictions(&route, &claims, m.rows, &m.columns) {
+                tracing::warn!(export = %export.name, column = %c.column, "{c}");
+            }
         }
 
         tracing::info!(export = %export.name, version = %export.version, "interface ok");
@@ -918,6 +959,270 @@ fn describe_null_rows(grain: &[String], null_rows: &BTreeMap<String, i64>) -> Op
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// What `column_census` measured: the row count and every declared column.
+struct ColumnCensus {
+    rows: i64,
+    columns: BTreeMap<String, crate::manifest::ColumnMeasurement>,
+}
+
+/// The distinct-count ceiling above which a column's values are not listed:
+/// the probe's `LIMIT 51` rule (ADR 0012 §5), so both measurements draw the
+/// low-cardinality line in the same place.
+const CENSUS_DISTINCT_MAX: i64 = 50;
+/// How many of a low-cardinality column's values the census lists.
+const CENSUS_TOP_VALUES: usize = 5;
+
+/// Two passes, bounded by construction. One aggregate over the source reads
+/// the row count and, per declared column, the NULL count and an
+/// approximate distinct count (a single scan however wide the table). Only
+/// columns that pass may be low-cardinality get a second, exact pass:
+/// `GROUP BY` with the probe's `LIMIT 51` on the output. An id-like column
+/// costs the shared scan and nothing more, and never has its values listed.
+/// The approximation is used only to skip the exact pass, with a 2x margin,
+/// so a column of at most 50 distinct values is always counted exactly.
+/// Result columns are read positionally and identifiers are quoted, as the
+/// declared names come from the warehouse on a discovered cell.
+fn column_census(
+    conn: &Connection,
+    source: &str,
+    schema: &IndexMap<String, crate::config::ColumnSpec>,
+    grain: &[String],
+) -> Result<ColumnCensus> {
+    let quoted: Vec<String> = schema.keys().map(|c| quote_ident(c)).collect();
+    let exprs = quoted
+        .iter()
+        .map(|q| format!(", count(*) - count({q}), approx_count_distinct({q})"))
+        .collect::<String>();
+    let mut stmt = conn
+        .prepare(&format!("SELECT count(*){exprs} FROM {source}"))
+        .context("preparing the column census")?;
+    let (rows, per_column): (i64, Vec<(i64, i64)>) = stmt
+        .query_row([], |r| {
+            let rows = r.get::<_, i64>(0)?;
+            let mut per_column = Vec::with_capacity(quoted.len());
+            for i in 0..quoted.len() {
+                per_column.push((r.get::<_, i64>(1 + 2 * i)?, r.get::<_, i64>(2 + 2 * i)?));
+            }
+            Ok((rows, per_column))
+        })
+        .context("running the column census")?;
+
+    let mut columns = BTreeMap::new();
+    for ((col, q), (null_rows, approx_distinct)) in schema.keys().zip(&quoted).zip(per_column) {
+        let mut m = crate::manifest::ColumnMeasurement {
+            null_rows,
+            distinct: None,
+            distinct_over_50: false,
+            top_values: Vec::new(),
+        };
+        let is_grain = grain.iter().any(|g| g.eq_ignore_ascii_case(col));
+        if !is_grain && null_rows < rows {
+            if approx_distinct > 2 * CENSUS_DISTINCT_MAX {
+                m.distinct_over_50 = true;
+            } else {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT CAST({q} AS VARCHAR), count(*) FROM {source} WHERE {q} IS NOT NULL \
+                     GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT {}",
+                    CENSUS_DISTINCT_MAX + 1
+                ))?;
+                let groups: Vec<crate::manifest::ValueRows> = stmt
+                    .query_map([], |r| {
+                        Ok(crate::manifest::ValueRows {
+                            value: r.get::<_, String>(0)?,
+                            rows: r.get::<_, i64>(1)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<_, _>>()
+                    .with_context(|| format!("counting the values of column '{col}'"))?;
+                if groups.len() as i64 > CENSUS_DISTINCT_MAX {
+                    m.distinct_over_50 = true;
+                } else {
+                    m.distinct = Some(groups.len() as i64);
+                    m.top_values = groups.into_iter().take(CENSUS_TOP_VALUES).collect();
+                }
+            }
+        }
+        columns.insert(col.clone(), m);
+    }
+    Ok(ColumnCensus { rows, columns })
+}
+
+/// Double-quote an identifier, escaping any embedded `"` (the
+/// `engine::quote_ident` rule, repeated here rather than exported: that one
+/// is the transform SQL build site's, this one the census's).
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Phrases that assert a column holds nothing. Deliberately small and
+/// literal: each names a *state of the data* that one NULL count can
+/// contradict outright, and nothing else. A longer list ("sparse",
+/// "rarely set", "optional") would need a judgment the census cannot make,
+/// and a warning that fires on a true sentence teaches authors to ignore
+/// it. Matched case-insensitively as whole words over whitespace-collapsed
+/// prose. Grow it only for a phrase seen in real prose that the census
+/// can falsify with certainty.
+pub(crate) const EMPTY_CLAIM_PHRASES: &[&str] = &[
+    "currently null",
+    "backfill pending",
+    "not yet populated",
+    "not populated",
+    "always null",
+    "empty",
+];
+
+/// One piece of prose about one column: what an agent reads before it
+/// decides whether to use the column.
+pub(crate) struct EmptyClaim<'a> {
+    pub column: &'a str,
+    /// `"description"`, or `"definition '<term>'"`.
+    pub claimed_by: String,
+    pub text: &'a str,
+}
+
+/// A claim of emptiness the census contradicts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmptyClaimContradiction {
+    pub route: String,
+    pub column: String,
+    pub claimed_by: String,
+    pub phrase: &'static str,
+    pub rows: i64,
+    pub null_rows: i64,
+}
+
+impl std::fmt::Display for EmptyClaimContradiction {
+    /// The one sentence both channels use (stderr at verify and release,
+    /// `notes[]` in the document). It quotes only the matched phrase, a
+    /// constant, never the author's text, which stays data.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "export '{}' column '{}': the {} says \"{}\", but verify measured {} of {} rows \
+             populated ({} NULL); the prose contradicts the data",
+            self.route,
+            self.column,
+            self.claimed_by,
+            self.phrase,
+            self.rows - self.null_rows,
+            self.rows,
+            self.null_rows
+        )
+    }
+}
+
+/// The prose an agent reads about each of `export`'s columns, in the
+/// precedence the document applies: the export's own column description
+/// (authored, or discovered from the tool), else the warehouse's comment
+/// (`.cell/source_descriptions.json` on a hand-authored bound export), and
+/// every definition whose `applies_to` names `route.column`.
+pub(crate) fn empty_claims_for<'a>(
+    export: &'a crate::config::Export,
+    route: &str,
+    warehouse_descriptions: Option<&'a IndexMap<String, String>>,
+    definitions: &'a [crate::config::Definition],
+) -> Vec<EmptyClaim<'a>> {
+    let mut claims = Vec::new();
+    for (col, spec) in &export.schema {
+        let text = spec.description.as_deref().or_else(|| {
+            warehouse_descriptions
+                .and_then(|w| w.get(col))
+                .map(String::as_str)
+                .filter(|t| !t.trim().is_empty())
+        });
+        if let Some(text) = text {
+            claims.push(EmptyClaim {
+                column: col,
+                claimed_by: "description".to_string(),
+                text,
+            });
+        }
+        for d in definitions {
+            let names_column = d
+                .applies_to
+                .iter()
+                .any(|entry| entry == &format!("{route}.{col}"));
+            if names_column {
+                claims.push(EmptyClaim {
+                    column: col,
+                    claimed_by: format!("definition '{}'", d.term),
+                    text: &d.description,
+                });
+            }
+        }
+    }
+    claims
+}
+
+/// Whether normalized `prose` asserts `phrase` rather than its negation:
+/// a whole-word match not immediately preceded by `non-`, `not ` or
+/// `never ` ("non-empty for paid rows" claims the opposite). The one
+/// concession to judgment the matcher makes; anything subtler belongs in
+/// the phrase list's own restraint.
+fn claims_emptiness(prose: &str, phrase: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(offset) = prose[from..].find(phrase) {
+        let start = from + offset;
+        let end = start + phrase.len();
+        let before = &prose[..start];
+        let bounded = before.chars().next_back().is_none_or(|c| !is_ident(c))
+            && prose[end..].chars().next().is_none_or(|c| !is_ident(c));
+        let negated = ["non-", "not ", "never "]
+            .iter()
+            .any(|neg| before.ends_with(neg));
+        if bounded && !negated {
+            return true;
+        }
+        from = start + 1;
+        if from >= prose.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Every claim whose column the census measured as populated. Pure, so the
+/// document builder and the two CLI verbs share one rule; a column absent
+/// from the census (a materialized export, a record written before it was
+/// measured) contradicts nothing.
+pub(crate) fn empty_claim_contradictions(
+    route: &str,
+    claims: &[EmptyClaim<'_>],
+    rows: i64,
+    columns: &BTreeMap<String, crate::manifest::ColumnMeasurement>,
+) -> Vec<EmptyClaimContradiction> {
+    let mut out = Vec::new();
+    for claim in claims {
+        let Some(c) = columns.get(claim.column) else {
+            continue;
+        };
+        if rows == 0 || c.null_rows >= rows {
+            continue;
+        }
+        let prose = claim
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        if let Some(phrase) = EMPTY_CLAIM_PHRASES
+            .iter()
+            .find(|p| claims_emptiness(&prose, p))
+        {
+            out.push(EmptyClaimContradiction {
+                route: route.to_string(),
+                column: claim.column.to_string(),
+                claimed_by: claim.claimed_by.clone(),
+                phrase,
+                rows,
+                null_rows: c.null_rows,
+            });
+        }
+    }
+    out
 }
 
 /// Whether a declared column's type matches its actual type, and which type
@@ -1472,7 +1777,7 @@ interface:
         let m = check(&conn, &null_grain_cell(false), &HashMap::new())
             .expect("a NULL grain value alone never fails verify");
         let m = &m["t@1"];
-        assert_eq!((m.rows, m.distinct_grain), (3, 3));
+        assert_eq!((m.rows, m.distinct_grain), (3, Some(3)));
         assert_eq!(
             m.null_rows,
             BTreeMap::from([("campaign".to_string(), 2), ("month".to_string(), 0)])
@@ -1496,11 +1801,15 @@ interface:
             serde_json::json!({ "campaign": 0, "month": 0 })
         );
 
-        let old: crate::manifest::GrainMeasurement = serde_json::from_value(serde_json::json!({
+        let old: crate::manifest::ExportMeasurement = serde_json::from_value(serde_json::json!({
             "check": "grain_unique", "grain": ["month"], "rows": 2, "distinct_grain": 2
         }))
         .expect("a pre-#10 record must still load");
         assert!(old.null_rows.is_empty());
+        assert!(old.columns.is_empty(), "no census on an old record");
+        assert_eq!(old.distinct_grain, Some(2));
+        // A materialized export never carries a census.
+        assert!(m["t@1"].columns.is_empty());
     }
 
     #[test]
@@ -1521,6 +1830,222 @@ interface:
         );
         let none = BTreeMap::from([("month".to_string(), 0)]);
         assert_eq!(describe_null_rows(&grain, &none), None);
+    }
+
+    // --- the column census on bound exports, and prose it contradicts ------
+
+    /// A bound export over `events` (60 rows): `status` is 'a' x30, 'b' x15,
+    /// NULL x15; `code` is 60 distinct values; `id` is the grain when one is
+    /// declared. The description on `status` is the design partner's
+    /// sentence.
+    fn census_cell(grain: bool) -> CellDef {
+        let grain = if grain { "\n    grain: [id]" } else { "" };
+        let mut def: CellDef = serde_yaml::from_str(&format!(
+            r#"
+cell: c
+sources:
+  events: ./events.csv
+interface:
+  - name: t
+    version: 1.0.0
+    bind: events{grain}
+    schema:
+      id: integer
+      status:
+        type: string
+        description: Currently NULL / backfill pending.
+      code:
+        type: string
+        description: Non-empty for every row.
+"#
+        ))
+        .unwrap();
+        // `definitions:` resolves at `CellDef::load`, not at parse.
+        def.definitions = serde_yaml::from_str(
+            "- term: status\n  description: Not yet populated; lands with the Q4 backfill.\n  \
+             applies_to: [t@1.status]\n- term: code\n  description: Never empty; every row \
+             carries one.\n  applies_to: [t@1.code]\n",
+        )
+        .unwrap();
+        def
+    }
+
+    fn census_events(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE events AS SELECT i::INTEGER AS id, \
+               CASE WHEN i % 4 = 0 THEN NULL WHEN i % 4 = 1 THEN 'b' ELSE 'a' END AS status, \
+               'c' || i AS code FROM range(1, 61) t(i);",
+        )
+        .unwrap();
+    }
+
+    /// Every declared column gets a NULL count; a low-cardinality non-grain
+    /// column gets its exact distinct count and the most frequent values;
+    /// a wide one is flagged and lists nothing; the grain column carries
+    /// its NULL count only.
+    #[test]
+    fn census_measures_every_declared_column_of_a_bound_export() {
+        let (conn, _dir) = attach_lake("census");
+        census_events(&conn);
+        let m = check(&conn, &census_cell(true), &HashMap::new()).unwrap();
+        let m = &m["t@1"];
+        assert_eq!(m.check, "grain_unique");
+        assert_eq!((m.rows, m.distinct_grain), (60, Some(60)));
+        assert_eq!(m.columns.len(), 3, "{:?}", m.columns);
+
+        let status = &m.columns["status"];
+        assert_eq!(status.null_rows, 15);
+        assert_eq!(status.distinct, Some(2));
+        assert!(!status.distinct_over_50);
+        assert_eq!(
+            status.top_values,
+            vec![
+                crate::manifest::ValueRows {
+                    value: "a".to_string(),
+                    rows: 30
+                },
+                crate::manifest::ValueRows {
+                    value: "b".to_string(),
+                    rows: 15
+                },
+            ]
+        );
+
+        let code = &m.columns["code"];
+        assert_eq!(code.null_rows, 0);
+        assert!(code.distinct_over_50, "60 distinct values is over the line");
+        assert!(code.distinct.is_none() && code.top_values.is_empty());
+
+        let id = &m.columns["id"];
+        assert_eq!(id.null_rows, 0);
+        assert!(
+            id.distinct.is_none() && !id.distinct_over_50 && id.top_values.is_empty(),
+            "a grain column's value set is not the census's to list: {id:?}"
+        );
+        // The wire shape: a measured zero is an explicit 0, an unmeasured
+        // flag is absent rather than false.
+        let json = serde_json::to_value(id).unwrap();
+        assert_eq!(json, serde_json::json!({ "null_rows": 0 }));
+    }
+
+    /// No grain, no uniqueness check, but the schema check ran and the
+    /// census is a measurement of its own: a grainless bound export now
+    /// carries a `check` where it carried nothing.
+    #[test]
+    fn grainless_bound_export_gets_a_schema_check_with_the_census() {
+        let (conn, _dir) = attach_lake("census-grainless");
+        census_events(&conn);
+        let m = check(&conn, &census_cell(false), &HashMap::new()).unwrap();
+        let m = &m["t@1"];
+        assert_eq!(m.check, "schema");
+        assert!(m.grain.is_empty() && m.distinct_grain.is_none() && m.null_rows.is_empty());
+        assert_eq!(m.rows, 60);
+        assert_eq!(m.columns.len(), 3);
+        // Without a grain, `id` is an ordinary column and gets counted.
+        assert!(m.columns["id"].distinct_over_50);
+        let json = serde_json::to_value(m).unwrap();
+        assert!(json.get("distinct_grain").is_none(), "{json}");
+    }
+
+    /// The description and the definition both say `status` is empty; the
+    /// census says 45 of 60 rows are populated. `code`'s "non-empty" and
+    /// "never empty" are the opposite claim and draw nothing. Each finding
+    /// names the export, the column, who claimed it, the phrase, and the
+    /// count.
+    #[test]
+    fn prose_claiming_a_populated_column_is_empty_is_contradicted() {
+        let (conn, _dir) = attach_lake("census-prose");
+        census_events(&conn);
+        let def = census_cell(true);
+        let m = check(&conn, &def, &HashMap::new()).unwrap();
+        let m = &m["t@1"];
+        let claims = empty_claims_for(&def.interface[0], "t@1", None, &def.definitions);
+        let found = empty_claim_contradictions("t@1", &claims, m.rows, &m.columns);
+        let lines: Vec<String> = found.iter().map(|c| c.to_string()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "export 't@1' column 'status': the description says \"currently null\", but \
+                 verify measured 45 of 60 rows populated (15 NULL); the prose contradicts the \
+                 data",
+                "export 't@1' column 'status': the definition 'status' says \"not yet \
+                 populated\", but verify measured 45 of 60 rows populated (15 NULL); the \
+                 prose contradicts the data",
+            ]
+        );
+    }
+
+    /// A column that really is all NULL draws nothing, and so does one no
+    /// census measured (a materialized export, a pre-census record).
+    #[test]
+    fn an_empty_column_or_an_unmeasured_one_contradicts_nothing() {
+        let (conn, _dir) = attach_lake("census-null");
+        conn.execute_batch(
+            "CREATE TABLE events AS SELECT i::INTEGER AS id, NULL::VARCHAR AS status, \
+             'c' || i AS code FROM range(1, 61) t(i);",
+        )
+        .unwrap();
+        let def = census_cell(true);
+        let m = check(&conn, &def, &HashMap::new()).unwrap();
+        let m = &m["t@1"];
+        assert_eq!(m.columns["status"].null_rows, 60);
+        let claims = empty_claims_for(&def.interface[0], "t@1", None, &def.definitions);
+        assert!(empty_claim_contradictions("t@1", &claims, m.rows, &m.columns).is_empty());
+        assert!(
+            empty_claim_contradictions("t@1", &claims, m.rows, &BTreeMap::new()).is_empty(),
+            "no census, no contradiction"
+        );
+    }
+
+    /// The warehouse's comment counts as the description when the author
+    /// wrote none (the document applies the same precedence).
+    #[test]
+    fn a_warehouse_description_is_a_claim_when_no_authored_one_exists() {
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\nsources:\n  events: ./events.csv\ninterface:\n  - name: t\n    \
+             version: 1.0.0\n    bind: events\n    schema:\n      status: string\n",
+        )
+        .unwrap();
+        let warehouse = IndexMap::from([("status".to_string(), "Always NULL today.".to_string())]);
+        let claims = empty_claims_for(&def.interface[0], "t@1", Some(&warehouse), &[]);
+        assert_eq!(claims.len(), 1);
+        let columns = BTreeMap::from([(
+            "status".to_string(),
+            crate::manifest::ColumnMeasurement {
+                null_rows: 1,
+                distinct: Some(1),
+                distinct_over_50: false,
+                top_values: vec![crate::manifest::ValueRows {
+                    value: "x".to_string(),
+                    rows: 9,
+                }],
+            },
+        )]);
+        let found = empty_claim_contradictions("t@1", &claims, 10, &columns);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].phrase, found[0].null_rows, found[0].rows),
+            ("always null", 1, 10)
+        );
+    }
+
+    #[test]
+    fn claims_emptiness_matches_whole_phrases_and_skips_negations() {
+        assert!(claims_emptiness(
+            "currently null / backfill pending.",
+            "currently null"
+        ));
+        assert!(claims_emptiness("empty string when unknown.", "empty"));
+        assert!(claims_emptiness("set to empty.", "empty"));
+        assert!(!claims_emptiness("non-empty for paid rows.", "empty"));
+        assert!(!claims_emptiness("never empty after 2024.", "empty"));
+        assert!(!claims_emptiness("not empty.", "empty"));
+        assert!(!claims_emptiness("emptying the queue.", "empty"));
+        assert!(!claims_emptiness("nullable.", "always null"));
+        assert!(!claims_emptiness(
+            "the backfill is done.",
+            "backfill pending"
+        ));
     }
 
     // ADR 0012 §3 ratchet check 4: supported => non-empty description; the

@@ -47,8 +47,10 @@ Flat document. A record with `from` is a **claim** (origin per field:
 | `exports[].schema.<col>` | `type`, optional `unit`, `description`, `from`. |
 | `exports[].query` | `filters`, `filter_semantics`, `limit_default` 100, `limit_max` 1000, `offset_max` 1000000, `sample_request`. |
 | `exports[].probe` | At swap: `at`, `rows`, `coverage` (min/max per grain col), `values` (per col, with `complete`), `null_rows` (per grain col), `example_request` (from one real row). |
-| `exports[].check` | Live-check measurement (bound exports): `at`, `check`, `grain`, `rows`, `distinct_grain`, `null_rows`. Absent when no grain is declared. |
-| `exports[].freshness` | Author's `freshness:` verbatim. Advisory only, never measured. |
+| `exports[].check` | Live-check measurement (bound exports): `at`, `check` (`grain_unique`, or `schema` when no grain is declared), `grain`, `rows`, `distinct_grain`, `null_rows`, `columns`. |
+| `exports[].check.columns` | The column census, bound exports only: per declared column, `null_rows`; for a non-grain column of at most 50 distinct values, `distinct` and up to five `top_values` (`{value, rows}`); otherwise `distinct_over_50: true`. `top_values` withheld under `--no-data`. |
+| `exports[].freshness` | Author's `freshness:` verbatim. Advisory only, never compared against anything. |
+| `exports[].freshness_observed` | Discovered exports with a `freshness` claim and a live check: `at`, `intervals_end` (`deployed.intervals.end` as last synced), `age_seconds`. A number beside the claim, not a verdict on it. |
 | `upstreams[]` | `ref`, pinned `version` (usually `null`), attached `execution`, `data_as_of`. Last two absent for direct-attach upstreams. |
 | `build` | `execution`, `snapshot_id`, `verify_outcome`, `finished_at`, `data_as_of`. Absent on bound-only cells. |
 | `source_check` | `outcome`, `checked_at`, `datamk_version`, optional `data_as_of`. |
@@ -126,7 +128,8 @@ interface:
 | Bindable | A raw file source or a connection source with `table:`. Not `query:`. |
 | Document | `query: null` plus `binding: {source, object, connection}`, verbatim from `cell.yaml`, never profile-resolved. |
 | `datamk run` | Never computes a bound export. An all-bound cell has no snapshot; `run` refuses, use `verify` and `context`. |
-| `datamk verify -p prod` | Live-checks schema and grain against the warehouse (native types where available, BigQuery today). Writes `.cell/source_check.json` with a `cell.yaml` digest. |
+| `datamk verify -p prod` | Live-checks schema and grain against the warehouse (native types where available, BigQuery today) and takes the column census (`check.columns`). Writes `.cell/source_check.json` with a `cell.yaml` digest. |
+| Prose vs data | A column `description` or a definition with `applies_to: [route.column]` that says the column is empty (`currently null`, `backfill pending`, `not yet populated`, `not populated`, `always null`, `empty`) while the census measured rows populated draws a warning from `verify` and `release` and a note in `notes[]`. Never a failure. |
 | `datamk context` | Embeds `source_check` only while that digest matches the current `cell.yaml`. |
 | Status | Passing live check gives `verified_at_source`, never `verified`. |
 | Column prose | Warehouse column descriptions fill undescribed bound columns with `from.description: "warehouse"`. Authored prose wins. Not applied to materialized exports. |
@@ -147,6 +150,7 @@ description, exports, and `context_digest`. Static file; never served by
 ## Gotchas
 
 - `verify` fails on a `description` for a column the source no longer has, and on `contract: supported` without a non-empty export `description` (a `docs:` page does not count).
+- On a bound export, `verify` scans the object once per low-cardinality column for the census, on top of the grain check's full scan. Id-like columns cost one shared aggregate. Run it on a schedule, not per request.
 - `datamk release` digests `cell.yaml` prose and docs content; a change without a version bump warns. Warehouse prose is never in that digest.
 - Interface digest = `/context` `ETag` = `/openapi.json` `info.version` = manifest `context_digest`. Prose and docs-content edits do not move it. Adding, removing, or renaming a `docs:` page does. `?include=docs` has its own `ETag` (`"<digest>~docs.<hash>"`); `If-None-Match` gives 304.
 - Docs edits move `content_hash`, so a deploy rolls the workload.

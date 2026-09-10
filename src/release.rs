@@ -139,6 +139,39 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
         }
     }
 
+    // Prose that says a column is empty beside a census that measured it
+    // populated (`verify::empty_claim_contradictions`): the same warning
+    // `verify` printed, repeated on the release gesture, where the prose
+    // is about to be pinned as the supported meaning. Read from the records
+    // `verify` left (digest- and profile-gated, so a stale census contradicts
+    // nothing); no warehouse round trip here.
+    let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
+    if let Some(record) =
+        crate::manifest::SourceCheckRecord::fresh_for(&cell.dir, &cell_yaml_digest, profile)
+    {
+        let descriptions = crate::manifest::SourceDescriptionsRecord::fresh_for(
+            &cell.dir,
+            &cell_yaml_digest,
+            profile,
+        );
+        for export in &cell.def.interface {
+            let route = export.route()?;
+            let Some(m) = record.exports.get(&route) else {
+                continue;
+            };
+            let warehouse = export
+                .bind
+                .as_deref()
+                .and_then(|bind| descriptions.as_ref().and_then(|d| d.sources.get(bind)));
+            let claims =
+                crate::verify::empty_claims_for(export, &route, warehouse, &cell.def.definitions);
+            for c in crate::verify::empty_claim_contradictions(&route, &claims, m.rows, &m.columns)
+            {
+                tracing::warn!(route = %route, column = %c.column, "{c}");
+            }
+        }
+    }
+
     let path = cell.dir.join(".cell").join("published.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

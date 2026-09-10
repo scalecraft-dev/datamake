@@ -340,7 +340,22 @@ fn export_schema() -> Value {
                                 from cell.yaml. Advisory and unverified: nothing checks it \
                                 against build or data age, and nothing in this document \
                                 contradicts it when the data is stale. Read `build.data_as_of` \
-                                and `build.finished_at` for what is measured." },
+                                and `build.finished_at` for what is measured, and \
+                                `freshness_observed` where a discovered export has one." },
+            "freshness_observed": {
+                "type": "object",
+                "description": "The measurement beside `freshness`, discovered exports only: \
+                                the age of `deployed.intervals.end` (as the last sync recorded \
+                                it) at `check.at`. Present iff `freshness` is declared, the \
+                                tool reported an interval, and a live check stands. Never \
+                                compared against the claim.",
+                "required": ["at", "intervals_end", "age_seconds"],
+                "properties": {
+                    "at": { "type": "string", "format": "date-time" },
+                    "intervals_end": { "type": "string", "format": "date-time" },
+                    "age_seconds": { "type": "integer" }
+                }
+            },
             "grain": { "type": "array", "items": { "type": "string" } },
             "from": from_schema("description, grain"),
             "schema": { "type": "object", "additionalProperties": { "type": "object",
@@ -406,13 +421,18 @@ fn export_schema() -> Value {
             "check": {
                 "type": "object",
                 "description": "What `datamk verify`'s live check measured for this export.",
-                "required": ["at", "check", "grain", "rows", "distinct_grain"],
+                "required": ["at", "check", "grain", "rows"],
                 "properties": {
                     "at": { "type": "string", "format": "date-time" },
-                    "check": { "type": "string", "enum": ["grain_unique"] },
+                    "check": { "type": "string", "enum": ["grain_unique", "schema"],
+                        "description": "`grain_unique` when a grain is declared (the schema \
+                                        check ran too); `schema` for a grainless bound export: \
+                                        declared columns exist with compatible types, `grain` \
+                                        is empty and `distinct_grain` absent." },
                     "grain": { "type": "array", "items": { "type": "string" } },
                     "rows": { "type": "integer" },
                     "distinct_grain": { "type": "integer" },
+                    "columns": column_census_schema(),
                     "null_rows": {
                         "type": "object",
                         "description": "Rows with a NULL in each grain column as `verify` saw \
@@ -424,6 +444,38 @@ fn export_schema() -> Value {
                         "additionalProperties": { "type": "integer" }
                     }
                 }
+            }
+        }
+    })
+}
+
+/// `exports[].check.columns`: its own function only because `export_schema`'s
+/// one `json!` literal is at the macro's recursion limit.
+fn column_census_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "The column census, bound exports only: every declared \
+                        column as `verify` saw it. `null_rows` always; for a \
+                        non-grain column of at most 50 distinct non-NULL values, \
+                        `distinct` and up to five `top_values` ({value, rows}, \
+                        most frequent first, values rendered as text); above \
+                        that, `distinct_over_50: true` and no values. \
+                        `top_values` is withheld under --no-data. Absent on a \
+                        materialized export and on a record that predates \
+                        this measurement.",
+        "additionalProperties": {
+            "type": "object",
+            "required": ["null_rows"],
+            "properties": {
+                "null_rows": { "type": "integer" },
+                "distinct": { "type": "integer" },
+                "distinct_over_50": { "type": "boolean" },
+                "top_values": { "type": "array", "items": {
+                    "type": "object",
+                    "required": ["value", "rows"],
+                    "properties": { "value": { "type": "string" },
+                                    "rows": { "type": "integer" } }
+                } }
             }
         }
     })
@@ -760,6 +812,27 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("null_rows")));
+        // The census and the grainless `schema` check: `columns` and
+        // `distinct_grain` are both optional on the wire, and the check
+        // vocabulary names both checks that can run.
+        assert!(export["check"]["properties"].get("columns").is_some());
+        for optional in ["columns", "distinct_grain"] {
+            assert!(!export["check"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(optional)));
+        }
+        assert_eq!(
+            export["check"]["properties"]["check"]["enum"],
+            json!(["grain_unique", "schema"])
+        );
+        // The measurement beside the freshness claim is documented, and the
+        // claim's own description points at it.
+        assert!(export.get("freshness_observed").is_some());
+        assert!(export["freshness"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("freshness_observed"));
         assert!(
             export.get("from").is_some(),
             "per-field provenance is documented"

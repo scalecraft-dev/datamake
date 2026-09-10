@@ -263,6 +263,14 @@ pub struct ExportDoc {
     /// nothing in the document contradicts it when the data is stale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
+    /// The measurement beside that claim, where one can be made: how old
+    /// the newest loaded interval was when `verify` ran. Present iff
+    /// `freshness` is declared and `deployed.intervals.end` exists (a
+    /// discovered export, ADR 0016 §7) and a fresh live check stands.
+    /// Never compared against the claim: `freshness` stays advisory
+    /// (issue #11), this only puts a number next to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_observed: Option<FreshnessObserved>,
     pub grain: Vec<String>,
     /// Origin of `description` and `grain` (ADR 0015 §2), present for each
     /// that is present.
@@ -309,6 +317,32 @@ pub struct ExportDoc {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// The age of a discovered export's newest loaded interval at live-check
+/// time. `at` is the check's `checked_at`; `intervals_end` is
+/// `deployed.intervals.end` as the last `datamk sync` recorded it (stamped
+/// `deployed.at`), not a fresh state-store read, so `age_seconds` is the
+/// gap between the two timestamps and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FreshnessObserved {
+    pub at: String,
+    pub intervals_end: String,
+    pub age_seconds: i64,
+}
+
+impl FreshnessObserved {
+    /// `None` when either timestamp does not parse; a measurement is never
+    /// approximated from a string it could not read.
+    pub fn between(checked_at: &str, intervals_end: &str) -> Option<Self> {
+        let at = crate::timeutil::parse_rfc3339_utc(checked_at)?;
+        let end = crate::timeutil::parse_rfc3339_utc(intervals_end)?;
+        Some(FreshnessObserved {
+            at: checked_at.to_string(),
+            intervals_end: intervals_end.to_string(),
+            age_seconds: at - end,
+        })
+    }
 }
 
 /// The tool-side facts of a discovered export (ADR 0016 §7), on the wire.
@@ -571,10 +605,14 @@ pub struct SourceCheck {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportCheck {
     pub at: String,
+    /// `"grain_unique"`, or `"schema"` for a grainless bound export (the
+    /// declared columns exist with compatible types; no uniqueness check
+    /// ran, so `grain` is empty and `distinct_grain` absent).
     pub check: String,
     pub grain: Vec<String>,
     pub rows: i64,
-    pub distinct_grain: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distinct_grain: Option<i64>,
     /// Issue #10: rows with a NULL in each grain column, keyed by column,
     /// every grain column present. Omitted only when the record predates
     /// the measurement — never to mean zero. These rows are returned by an
@@ -582,6 +620,14 @@ pub struct ExportCheck {
     /// equality-only, with no NULL literal).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub null_rows: BTreeMap<String, i64>,
+    /// The column census, bound exports only: every declared column with
+    /// its NULL count, and for a non-grain column of at most 50 distinct
+    /// values, that count and the five most frequent values. Absent on a
+    /// materialized export (the probe measures its rows) and on a record
+    /// written before this was measured. `top_values` is row-derived and
+    /// withheld under `--no-data`, as the probe's `values` are.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub columns: BTreeMap<String, crate::manifest::ColumnMeasurement>,
 }
 
 impl SourceCheck {
@@ -605,6 +651,7 @@ impl SourceCheck {
                             rows: m.rows,
                             distinct_grain: m.distinct_grain,
                             null_rows: m.null_rows.clone(),
+                            columns: m.columns.clone(),
                         },
                     )
                 })
@@ -616,6 +663,17 @@ impl SourceCheck {
             data_as_of: r.data_as_of.clone(),
             datamk_version: r.datamk_version.clone(),
             exports,
+        }
+    }
+
+    /// `--no-data` (ADR 0012 §4): the census's `top_values` are row-derived,
+    /// the same class as the probe's `values`, and leave with them. The
+    /// counts stay: a NULL count names no entity.
+    pub fn withhold_values(&mut self) {
+        for check in self.exports.values_mut() {
+            for c in check.columns.values_mut() {
+                c.top_values.clear();
+            }
         }
     }
 }
@@ -772,6 +830,7 @@ pub fn interface(
                 contract: e.contract,
                 description: e.description.clone(),
                 freshness: e.freshness.clone(),
+                freshness_observed: None,
                 grain: e.grain.clone(),
                 from,
                 schema,
@@ -988,6 +1047,45 @@ pub const NOTE_VIRTUAL_CELL: &str =
      contract against the bound source(s), which raises this document to \
      `verified_at_source`.";
 
+/// The prose about a bound export's columns that its own census
+/// contradicts (`verify::empty_claim_contradictions`), as engine notes: the
+/// same sentence `verify` printed, placed where the agent reading the prose
+/// will see it. Engine-emitted (ADR 0012 §2): it quotes a phrase from the
+/// closed list, never the author's text.
+fn empty_claim_notes(
+    e: &ExportDoc,
+    definitions: &[DefinitionDoc],
+    check: &ExportCheck,
+) -> Vec<String> {
+    use crate::verify::{empty_claim_contradictions, EmptyClaim};
+    let mut claims = Vec::new();
+    for (col, doc) in &e.schema {
+        if let Some(text) = doc.description.as_deref() {
+            claims.push(EmptyClaim {
+                column: col,
+                claimed_by: "description".to_string(),
+                text,
+            });
+        }
+        for d in definitions {
+            if d.applies_to
+                .iter()
+                .any(|entry| entry == &format!("{}.{col}", e.route))
+            {
+                claims.push(EmptyClaim {
+                    column: col,
+                    claimed_by: format!("definition '{}'", d.term),
+                    text: &d.description,
+                });
+            }
+        }
+    }
+    empty_claim_contradictions(&e.route, &claims, check.rows, &check.columns)
+        .into_iter()
+        .map(|c| c.to_string())
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct Facts {
     pub cell: String,
@@ -1087,12 +1185,25 @@ pub fn assemble(facts: Facts) -> ContextDocument {
         .as_mut()
         .map(|c| std::mem::take(&mut c.exports))
         .unwrap_or_default();
-    let exports = interface
+    let definitions = &interface.definitions;
+    let exports: Vec<ExportDoc> = interface
         .exports
         .into_iter()
         .map(|mut e| {
             e.probe = probes.shift_remove(&e.route);
             e.check = checks.shift_remove(&e.route);
+            // The number beside the freshness claim: only where the claim,
+            // the tool's interval, and a live check all exist.
+            e.freshness_observed = match (&e.freshness, &e.deployed, &e.check) {
+                (Some(_), Some(d), Some(c)) => d
+                    .intervals
+                    .as_ref()
+                    .and_then(|i| FreshnessObserved::between(&c.at, &i.end)),
+                _ => None,
+            };
+            if let Some(check) = &e.check {
+                notes.extend(empty_claim_notes(&e, definitions, check));
+            }
             e
         })
         .collect();
@@ -3080,11 +3191,12 @@ interface:
                 check: "grain_unique".to_string(),
                 grain: vec!["order_date".to_string(), "region".to_string()],
                 rows: 4,
-                distinct_grain: 4,
+                distinct_grain: Some(4),
                 null_rows: BTreeMap::from([
                     ("order_date".to_string(), 0),
                     ("region".to_string(), 1),
                 ]),
+                columns: BTreeMap::new(),
             },
         );
         let doc = assemble(Facts {
@@ -3134,6 +3246,265 @@ interface:
             false,
         );
         assert_eq!(digest_of(&bare), digest_of(&doc));
+    }
+
+    /// A bound, discovered export with a freshness claim, an interval, and
+    /// prose on one column that says it is empty; the live check measured
+    /// it populated. Everything the census and `freshness_observed` need,
+    /// laid on by `assemble`.
+    fn census_facts(freshness: Option<&str>) -> Facts {
+        let mut def: CellDef = serde_yaml::from_str(
+            r#"
+cell: invoicing
+sources:
+  flight_spend:
+    connection: dw_silver
+    table: invoice.flight_spend
+interface:
+  - name: flight_spend
+    version: 1.0.0
+    bind: flight_spend
+    schema:
+      month: date
+      utm_campaign:
+        type: string
+        description: Campaign tag. Currently NULL / backfill pending.
+      invoice_amount: decimal
+"#,
+        )
+        .unwrap();
+        // `definitions:` resolves at `CellDef::load`, not at parse.
+        def.definitions = serde_yaml::from_str(
+            "- term: utm_campaign\n  description: Currently NULL, backfill pending.\n  \
+             applies_to: [flight_spend@1.utm_campaign]\n",
+        )
+        .unwrap();
+        def.interface[0].freshness = freshness.map(str::to_string);
+        def.interface[0].discovered = Some(crate::config::DiscoveredExport {
+            model: "invoice.flight_spend".to_string(),
+            kind: "INCREMENTAL_BY_TIME_RANGE".to_string(),
+            cron: None,
+            owner: None,
+            tags: Vec::new(),
+            fingerprint: "3237974788".to_string(),
+            version: None,
+            data_hash: None,
+            intervals: Some(crate::catalog::ir::Interval {
+                start: "2000-01-01T00:00:00Z".to_string(),
+                end: "2026-08-24T18:00:00Z".to_string(),
+            }),
+            pending_restatement: None,
+            depends_on: Vec::new(),
+            depends_on_unselected: 0,
+            at: "2026-08-24T19:02:11Z".to_string(),
+        });
+        let routes = discoverable_routes(&def).unwrap();
+        let columns = BTreeMap::from([
+            (
+                "month".to_string(),
+                crate::manifest::ColumnMeasurement {
+                    null_rows: 0,
+                    distinct: None,
+                    distinct_over_50: true,
+                    top_values: Vec::new(),
+                },
+            ),
+            (
+                "utm_campaign".to_string(),
+                crate::manifest::ColumnMeasurement {
+                    null_rows: 0,
+                    distinct: Some(1),
+                    distinct_over_50: false,
+                    top_values: vec![crate::manifest::ValueRows {
+                        value: "brand".to_string(),
+                        rows: 10063,
+                    }],
+                },
+            ),
+            (
+                "invoice_amount".to_string(),
+                crate::manifest::ColumnMeasurement {
+                    null_rows: 12,
+                    distinct: None,
+                    distinct_over_50: true,
+                    top_values: Vec::new(),
+                },
+            ),
+        ]);
+        let mut checks = IndexMap::new();
+        checks.insert(
+            "flight_spend@1".to_string(),
+            ExportCheck {
+                at: "2026-08-25T18:00:00Z".to_string(),
+                check: "schema".to_string(),
+                grain: Vec::new(),
+                rows: 10063,
+                distinct_grain: None,
+                null_rows: BTreeMap::new(),
+                columns,
+            },
+        );
+        Facts {
+            cell: def.cell.clone(),
+            interface: interface(&def, &routes, &IndexMap::new()),
+            provenance: None,
+            source_check: Some(SourceCheck {
+                outcome: "passed".to_string(),
+                checked_at: "2026-08-25T18:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: "0.0.28".to_string(),
+                exports: checks,
+            }),
+            freshness: None,
+            upstreams: Vec::new(),
+            probes: IndexMap::new(),
+            docs_fingerprints: IndexMap::new(),
+            served_here: false,
+            channels: Vec::new(),
+            direct_attach: false,
+            is_all_never: true,
+        }
+    }
+
+    /// The census rides `check` on the wire, a grainless bound export's
+    /// check says `schema`, and the prose the census contradicts becomes an
+    /// engine note naming the export, column, claimant and phrase, once per
+    /// claim (the description and the definition are two claims).
+    #[test]
+    fn census_lands_on_check_and_contradicted_prose_becomes_a_note() {
+        let v = serde_json::to_value(assemble(census_facts(Some("daily")))).unwrap();
+        let check = &v["exports"][0]["check"];
+        assert_eq!(check["check"], "schema");
+        assert_eq!(check["rows"], 10063);
+        assert!(check.get("distinct_grain").is_none(), "{check}");
+        assert_eq!(
+            check["columns"]["utm_campaign"],
+            serde_json::json!({
+                "null_rows": 0, "distinct": 1,
+                "top_values": [{ "value": "brand", "rows": 10063 }]
+            })
+        );
+        assert_eq!(
+            check["columns"]["month"],
+            serde_json::json!({ "null_rows": 0, "distinct_over_50": true })
+        );
+        let notes: Vec<&str> = v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            notes,
+            vec![
+                "export 'flight_spend@1' column 'utm_campaign': the description says \
+                 \"currently null\", but verify measured 10063 of 10063 rows populated \
+                 (0 NULL); the prose contradicts the data",
+                "export 'flight_spend@1' column 'utm_campaign': the definition \
+                 'utm_campaign' says \"currently null\", but verify measured 10063 of 10063 \
+                 rows populated (0 NULL); the prose contradicts the data",
+            ],
+            "{v}"
+        );
+        // A note is engine telemetry, not interface: the digest is unmoved.
+        assert_eq!(v["status"], "verified_at_source");
+    }
+
+    /// `freshness_observed` sits beside the claim, with the check's own
+    /// `at`, and is absent the moment any of its three inputs is: here,
+    /// the claim.
+    #[test]
+    fn freshness_observed_measures_the_interval_age_beside_the_claim() {
+        let v = serde_json::to_value(assemble(census_facts(Some("daily")))).unwrap();
+        let e = &v["exports"][0];
+        assert_eq!(e["freshness"], "daily");
+        assert_eq!(
+            e["freshness_observed"],
+            serde_json::json!({
+                "at": "2026-08-25T18:00:00Z",
+                "intervals_end": "2026-08-24T18:00:00Z",
+                "age_seconds": 86400
+            })
+        );
+        // Field order on the wire: the measurement directly follows the
+        // claim it measures.
+        let text = serde_json::to_string(e).unwrap();
+        assert!(
+            text.contains("\"freshness\":\"daily\",\"freshness_observed\":{"),
+            "{text}"
+        );
+
+        let v = serde_json::to_value(assemble(census_facts(None))).unwrap();
+        assert!(v["exports"][0].get("freshness_observed").is_none(), "{v}");
+    }
+
+    /// --no-data: the census's `top_values` leave with the probe's `values`;
+    /// every count stays.
+    #[test]
+    fn withhold_values_strips_top_values_and_keeps_counts() {
+        let mut facts = census_facts(None);
+        facts.source_check.as_mut().unwrap().withhold_values();
+        let v = serde_json::to_value(assemble(facts)).unwrap();
+        assert_eq!(
+            v["exports"][0]["check"]["columns"]["utm_campaign"],
+            serde_json::json!({ "null_rows": 0, "distinct": 1 })
+        );
+    }
+
+    /// End to end through the two CLI doors: `verify` writes the census
+    /// into `.cell/source_check.json`, `context` lays it on the export and
+    /// notes the contradicted sentence.
+    #[test]
+    fn verify_then_context_carries_the_census_and_the_contradiction_note() {
+        let dir = all_bound_cell_dir("census");
+        let file = dir.join("cell.yaml");
+        std::fs::write(
+            &file,
+            "cell: virtual_only\n\
+             interface:\n\
+             \x20 - name: virtual_pii\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20   bind: raw\n\
+             \x20   schema:\n\
+             \x20     id: bigint\n\
+             \x20     val:\n\
+             \x20       type: string\n\
+             \x20       description: Not populated until the migration lands.\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
+
+        let out = dir.join("context.json");
+        emit(&file, "local", Some(&out), false, None, None).expect("emit the context document");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let check = &v["exports"][0]["check"];
+        assert_eq!(check["check"], "grain_unique");
+        assert_eq!(
+            check["columns"]["id"],
+            serde_json::json!({ "null_rows": 0 })
+        );
+        assert_eq!(
+            check["columns"]["val"],
+            serde_json::json!({
+                "null_rows": 0, "distinct": 2,
+                "top_values": [{ "value": "a", "rows": 1 }, { "value": "b", "rows": 1 }]
+            })
+        );
+        assert_eq!(
+            v["notes"],
+            serde_json::json!([
+                "export 'virtual_pii@1' column 'val': the description says \"not populated\", \
+                 but verify measured 2 of 2 rows populated (0 NULL); the prose contradicts \
+                 the data"
+            ]),
+            "{v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- ADR 0017: definitions in the context document ---------------------

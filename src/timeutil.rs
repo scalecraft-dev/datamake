@@ -26,6 +26,54 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// The inverse of `civil_from_days` (same source): `(year, month, day)` ->
+/// days since the Unix epoch. No range check on `m`/`d`; the parser below
+/// bounds them.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// Parse the timestamps this codebase itself writes back to Unix seconds:
+/// `YYYY-MM-DDTHH:MM:SSZ` (`rfc3339_utc`), with an optional fractional
+/// second (ignored) and `+00:00` accepted in place of `Z`, or a bare
+/// `YYYY-MM-DD` (midnight UTC). Anything else, a non-UTC offset included,
+/// is `None`: a measurement built on a timestamp read wrong is worse than
+/// none.
+pub fn parse_rfc3339_utc(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, time) = match s.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut parts = date.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let mut secs = days_from_civil(y, m, d) * 86_400;
+    if let Some(t) = time {
+        let t = t.strip_suffix('Z').or_else(|| t.strip_suffix("+00:00"))?;
+        let t = t.split_once('.').map(|(whole, _)| whole).unwrap_or(t);
+        let mut parts = t.split(':');
+        let hh: i64 = parts.next()?.parse().ok()?;
+        let mm: i64 = parts.next()?.parse().ok()?;
+        let ss: i64 = parts.next()?.parse().ok()?;
+        if parts.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+            return None;
+        }
+        secs += hh * 3600 + mm * 60 + ss;
+    }
+    Some(secs)
+}
+
 /// Render a Unix timestamp (seconds) as RFC 3339 UTC with no fractional
 /// seconds: `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn rfc3339_utc(unix_secs: i64) -> String {
@@ -74,5 +122,33 @@ mod tests {
     #[test]
     fn filename_utc_replaces_colons_with_dashes() {
         assert_eq!(filename_utc(0), "1970-01-01T00-00-00Z");
+    }
+
+    /// The parser round-trips what `rfc3339_utc` writes, reads the shapes
+    /// the catalog and DuckDB produce, and refuses everything else.
+    #[test]
+    fn parse_rfc3339_utc_round_trips_and_refuses_other_shapes() {
+        for secs in [0, 951_868_800, 1_751_500_680, 1_800_000_000, -86_400] {
+            assert_eq!(parse_rfc3339_utc(&rfc3339_utc(secs)), Some(secs));
+        }
+        assert_eq!(parse_rfc3339_utc("2026-08-24"), Some(1_787_529_600));
+        assert_eq!(
+            parse_rfc3339_utc("2026-08-24T18:00:00.250Z"),
+            Some(1_787_594_400)
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-08-24T18:00:00+00:00"),
+            Some(1_787_594_400)
+        );
+        for bad in [
+            "",
+            "2026-13-01",
+            "2026-08-24T18:00Z",
+            "2026-08-24T18:00:00+02:00",
+            "2026-08-24 18:00:00",
+            "yesterday",
+        ] {
+            assert_eq!(parse_rfc3339_utc(bad), None, "{bad:?} must not parse");
+        }
     }
 }

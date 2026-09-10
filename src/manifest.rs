@@ -96,23 +96,30 @@ pub struct SourceCheckRecord {
     /// the fail-closed behavior we want, not a special case for it.
     #[serde(default)]
     pub profile: String,
-    /// Route key -> what the grain check actually measured. `#[serde(default)]`
+    /// Route key -> what `verify` actually measured. `#[serde(default)]`
     /// so records written before this field still parse (as empty — no
     /// measurement, never a fabricated one).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub exports: BTreeMap<String, GrainMeasurement>,
+    pub exports: BTreeMap<String, ExportMeasurement>,
 }
 
-/// The numbers behind `grain_verified` for one export: the 722/722 that used
-/// to be computed, compared, and thrown away.
+/// What `verify` measured for one export: the numbers behind
+/// `grain_verified` (the 722/722 that used to be computed, compared, and
+/// thrown away) and, for a bound export, the column census.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrainMeasurement {
-    /// The check that ran. `"grain_unique"` today; a closed vocabulary.
+pub struct ExportMeasurement {
+    /// The check that ran, a closed vocabulary: `"grain_unique"` when a
+    /// grain is declared (the schema check ran too), `"schema"` when none
+    /// is (declared columns exist with compatible types, nothing more).
+    /// `"schema"` is written for bound exports only: a grainless
+    /// materialized export still contributes no entry.
     pub check: String,
-    /// The grain columns it ran on.
+    /// The grain columns it ran on; empty under `"schema"`.
     pub grain: Vec<String>,
     pub rows: i64,
-    pub distinct_grain: i64,
+    /// Absent under `"schema"`: no grain, no distinct count to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_grain: Option<i64>,
     /// Issue #10: rows with a NULL in each grain column, keyed by column,
     /// every grain column present (zeros included). `#[serde(default)]` so
     /// records written before this was measured still parse — as empty,
@@ -120,6 +127,44 @@ pub struct GrainMeasurement {
     /// is an explicit `0`, never an absence.
     #[serde(default)]
     pub null_rows: BTreeMap<String, i64>,
+    /// The column census, bound exports only: every declared column, keyed
+    /// by name, zeros included. Same forward-parse rule as `null_rows`:
+    /// absent on a record written before this was measured, never to mean
+    /// an empty table. A materialized export's rows are measured by the
+    /// swap-time probe instead and carry nothing here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub columns: BTreeMap<String, ColumnMeasurement>,
+}
+
+/// One declared column of a bound export as `verify` saw it. The
+/// measurement that lets prose about a column ("currently NULL, backfill
+/// pending") be contradicted by the column: `check.null_rows` only ever
+/// covered the grain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnMeasurement {
+    /// Rows with a NULL here.
+    pub null_rows: i64,
+    /// Exact count of distinct non-NULL values, when it is at most 50.
+    /// Non-grain columns only; the grain's value set is the probe's job
+    /// where one runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct: Option<i64>,
+    /// More than 50 distinct non-NULL values: the census stops counting
+    /// and lists nothing (an id-like column's values are not a summary).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub distinct_over_50: bool,
+    /// The most frequent non-NULL values, at most five, most frequent
+    /// first, rendered as text whatever the type. Present exactly when
+    /// `distinct` is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_values: Vec<ValueRows>,
+}
+
+/// One value and how many rows carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueRows {
+    pub value: String,
+    pub rows: i64,
 }
 
 impl SourceCheckRecord {
