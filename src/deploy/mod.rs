@@ -56,6 +56,8 @@ pub async fn run(args: &DeployArgs) -> Result<()> {
 
     preflight::check(&PreflightInput {
         def: &loaded.def,
+        file: &args.file,
+        dir: &loaded.dir,
         bindings: &loaded.bindings,
         supports: target.supports(),
         serves,

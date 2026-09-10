@@ -318,7 +318,7 @@ fn from_schema(fields: &str) -> Value {
     json!({
         "type": "object",
         "description": format!("Origin of each claim on this record ({fields}). Closed set."),
-        "additionalProperties": { "type": "string", "enum": ["cell.yaml", "warehouse", "sqlmesh"] }
+        "additionalProperties": { "type": "string", "enum": ["cell.yaml", "warehouse", "sqlmesh", "ossie"] }
     })
 }
 
@@ -707,6 +707,7 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            semantic_model: None,
             definitions_source: None,
             definitions: Vec::new(),
             definitions_file: None,
@@ -875,6 +876,7 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            semantic_model: None,
             definitions_source: None,
             definitions: Vec::new(),
             definitions_file: None,
@@ -959,6 +961,7 @@ mod tests {
             access: Default::default(),
             discover: None,
             discovered_from: None,
+            semantic_model: None,
             definitions_source: None,
             definitions: vec![
                 serde_yaml::from_str(

@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::path::Path;
 
 use crate::config::{
     is_remote, CellDef, ResolvedBindings, ResolvedConnection, ResolvedSource, SnowflakeAuth,
@@ -9,6 +10,12 @@ use crate::deploy::target::Workloads;
 /// `bindings` comes from the pure `config::resolve`.
 pub struct PreflightInput<'a> {
     pub def: &'a CellDef,
+    /// The cell's own file and directory — needed only by
+    /// `check_semantic_model_pinned` (ADR 0018 §3), which reads
+    /// `.cell/semantic_model.json` off disk; every other check here stays
+    /// database-free and file-free.
+    pub file: &'a Path,
+    pub dir: &'a Path,
     pub bindings: &'a ResolvedBindings,
     pub supports: Workloads,
     /// Whether this deploy renders a Server (issue #8): `supports.long_lived()
@@ -43,6 +50,7 @@ pub fn check(i: &PreflightInput) -> Result<()> {
     // read it is refused here, on the deploy host, not inside its pod.
     crate::config::check_connections_bound(&i.bindings.sources)?;
     check_no_interactive_connections(i)?;
+    crate::ossie::record::check_release_pinned(i.dir, i.file, i.def)?;
     if i.serves {
         check_servable(i)?;
         check_auth(i)?;
@@ -247,6 +255,12 @@ mod tests {
     ) -> PreflightInput<'a> {
         PreflightInput {
             def,
+            // No test here exercises `semantic_model:` (that's
+            // `check_release_pinned`'s own module); a placeholder path is
+            // fine since `def.semantic_model` is always `None` in these
+            // fixtures, so the check short-circuits before touching disk.
+            file: std::path::Path::new("cell.yaml"),
+            dir: std::path::Path::new("."),
             bindings,
             supports,
             // Mirrors `deploy::run`: a Server is rendered iff the target can

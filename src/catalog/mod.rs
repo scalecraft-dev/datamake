@@ -142,18 +142,48 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
     // Pure parse first — a typo fails before any connection is opened.
     let def = crate::config::CellDef::load(file)?;
     let dir = crate::config::cell_dir(file);
-    let Some(d) = def.discover.clone() else {
+
+    // ADR 0018 §4: `sync` now refreshes every external state a cell
+    // declares — the `discover:` catalog when present, the
+    // `semantic_model:` source when present, either, or both — and errors
+    // only when a cell declares neither. Each half is independent: the
+    // semantic half needs no profile (it never opens a warehouse
+    // connection), so `sync_semantic` runs before `sync_discover` even
+    // resolves `profiles/<profile>.yaml`.
+    if def.discover.is_none() && def.semantic_model.is_none() {
         bail!(
-            "cell '{}' has no `discover:` block — `datamk sync` discovers an interface from a \
-             modeling tool's deployed state; a hand-authored cell is built with `datamk run`.",
+            "cell '{}' declares neither `discover:` nor `semantic_model:` — nothing for `datamk \
+             sync` to refresh.",
             def.cell
         );
-    };
+    }
+    if def.semantic_model.is_some() {
+        sync_semantic(&def, &dir, file, dry_run)?;
+    }
+    if def.discover.is_some() {
+        sync_discover(&def, &dir, file, profile, dry_run)?;
+    }
+    Ok(())
+}
+
+/// The `discover:` half of `sync` (ADR 0016): read the tool's deployed
+/// environment and the warehouse, write `.cell/deployed_catalog.json`.
+fn sync_discover(
+    def: &crate::config::CellDef,
+    dir: &Path,
+    file: &Path,
+    profile: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let d = def
+        .discover
+        .clone()
+        .expect("caller checked discover.is_some()");
     let profile_path = dir.join("profiles").join(format!("{profile}.yaml"));
     let raw = Bindings::load(&profile_path)?;
-    let state = named_connection(&raw, &d.state, &dir)
+    let state = named_connection(&raw, &d.state, dir)
         .with_context(|| format!("resolving `discover.state: {}`", d.state))?;
-    let wh = named_connection(&raw, &d.warehouse, &dir)
+    let wh = named_connection(&raw, &d.warehouse, dir)
         .with_context(|| format!("resolving `discover.warehouse: {}`", d.warehouse))?;
     let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
     let now = crate::timeutil::unix_now();
@@ -182,7 +212,7 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
             )
         })
         .collect();
-    if let Ok(previous) = DeployedCatalogRecord::load(&dir) {
+    if let Ok(previous) = DeployedCatalogRecord::load(dir) {
         for (object, version) in &pins {
             let (Some(old_version), Some(old), Some(new)) = (
                 previous.pins.get(object),
@@ -212,7 +242,7 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
     {
         let mut preview = def.clone();
         select::materialize(&mut preview, &d, &catalog, false)?;
-        crate::config::docs::validate_all(&dir, &preview)
+        crate::config::docs::validate_all(dir, &preview)
             .with_context(|| format!("validating cell definition {}", file.display()))?;
     }
 
@@ -226,7 +256,7 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
     };
     summarize(&record, &d, dry_run);
     if !dry_run {
-        let path = record.write(&dir)?;
+        let path = record.write(dir)?;
         eprintln!("Wrote {}", path.display());
         eprintln!("Next:");
         eprintln!("  datamk verify  -p {profile}    # live-check types against the warehouse");
@@ -234,6 +264,150 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
         eprintln!("  datamk serve   -p {profile}    # /context + /openapi.json; rows stay in the warehouse");
     }
     Ok(())
+}
+
+/// The `semantic_model:` half of `sync` (ADR 0018 §4): resolve the source
+/// (a directory, or a git fetch), walk it, merge every file into one
+/// `Document`, and write `.cell/semantic_model.json`. Opens no database,
+/// needs no profile.
+fn sync_semantic(
+    def: &crate::config::CellDef,
+    dir: &Path,
+    file: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::ossie::{git, record::Resolved, record::SemanticModelRecord, source};
+
+    let src = def
+        .semantic_model
+        .clone()
+        .expect("caller checked semantic_model.is_some()");
+    let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
+    let now = crate::timeutil::unix_now();
+
+    let (root, resolved) = match &src {
+        source::SemanticModelSource::Dir { dir: raw } => {
+            let root = source::resolve_dir(dir, raw)?;
+            let r = Resolved::Dir {
+                dir: root.to_string_lossy().into_owned(),
+            };
+            (root, r)
+        }
+        source::SemanticModelSource::Git {
+            git: url,
+            path,
+            r#ref,
+        } => {
+            let fetched = git::fetch(
+                dir,
+                url,
+                path.as_deref(),
+                r#ref.as_deref(),
+                &git::FetchOptions::default(),
+            )
+            .with_context(|| format!("fetching `semantic_model.git: {url}`"))?;
+            let r = Resolved::Commit {
+                commit: fetched.commit.clone(),
+            };
+            (fetched.checkout_dir, r)
+        }
+    };
+
+    let files = source::walk(&root)
+        .with_context(|| format!("walking semantic model source {}", root.display()))?;
+    if files.is_empty() {
+        bail!(
+            "no Ossie files (.yaml/.yml/.json) found under {} — nothing for `datamk sync` to \
+             record.",
+            root.display()
+        );
+    }
+    let merged = source::merge(&files)?;
+    // Invariant `merge` maintains: exactly one file entry per semantic
+    // model (a later phase — ADR 0018 §7's `semantic_matches[]` — reads
+    // `model_files` to name which file a model/dataset/field came from).
+    debug_assert_eq!(
+        merged.model_files.len(),
+        merged.document.semantic_model.len()
+    );
+    warn_unaddressable_synonyms(&merged.document);
+
+    let dataset_count: usize = merged
+        .document
+        .semantic_model
+        .iter()
+        .map(|m| m.datasets.len())
+        .sum();
+    let resolved_label = match &resolved {
+        Resolved::Dir { dir } => format!("dir {dir}"),
+        Resolved::Commit { commit } => format!("commit {commit}"),
+    };
+    let verb = if dry_run { "Would write" } else { "Wrote" };
+    eprintln!(
+        "{verb} .cell/semantic_model.json: {} files, {} semantic models, {} datasets ({resolved_label})",
+        merged.files.len(),
+        merged.document.semantic_model.len(),
+        dataset_count,
+    );
+
+    if !dry_run {
+        let record = SemanticModelRecord {
+            datamk_version: env!("CARGO_PKG_VERSION").to_string(),
+            cell_yaml_digest,
+            synced_at: crate::timeutil::rfc3339_utc(now),
+            source: src,
+            resolved,
+            content_sha256: merged.content_sha256,
+            files: merged.files,
+            document: merged.document,
+        };
+        record.save(dir)?;
+    }
+    Ok(())
+}
+
+/// ADR 0018 §7: a synonym outside `[A-Za-z0-9_.-]{1,64}` stays in the
+/// document (never rejected — datamake ingests, never rewrites, Ossie) but
+/// cannot join the `terms=` lookup index; warned here so an author notices
+/// at sync time rather than wondering why a lookup silently misses.
+fn warn_unaddressable_synonyms(doc: &crate::ossie::Document) {
+    let mut bad: Vec<String> = Vec::new();
+    let mut check = |ai: &Option<crate::ossie::AiContext>| {
+        let Some(crate::ossie::AiContext::Detail(d)) = ai else {
+            return;
+        };
+        for s in &d.synonyms {
+            let ok = !s.is_empty()
+                && s.chars().count() <= 64
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+            if !ok {
+                bad.push(s.clone());
+            }
+        }
+    };
+    for m in &doc.semantic_model {
+        check(&m.ai_context);
+        for ds in &m.datasets {
+            check(&ds.ai_context);
+            for f in &ds.fields {
+                check(&f.ai_context);
+            }
+        }
+        for met in &m.metrics {
+            check(&met.ai_context);
+        }
+    }
+    if !bad.is_empty() {
+        let shown: Vec<&str> = bad.iter().take(5).map(String::as_str).collect();
+        eprintln!(
+            "Warning: {} ai_context.synonyms entries are not addressable ([A-Za-z0-9_.-]{{1,64}}) \
+             and will not join the `terms=` lookup index: {}{}",
+            bad.len(),
+            shown.join(", "),
+            if bad.len() > shown.len() { ", …" } else { "" }
+        );
+    }
 }
 
 fn summarize(record: &DeployedCatalogRecord, d: &Discover, dry_run: bool) {
@@ -933,6 +1107,64 @@ mod tests {
             crate::config::CellDef::load(&dir.join("cell.yaml")).unwrap_err()
         );
         assert!(err.contains("must name at least one of"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0018 §4/§5: a cell with `semantic_model:` and no `discover:`
+    /// syncs with no profile at all — `sync_semantic` never opens a
+    /// database or reads `profiles/<p>.yaml`.
+    #[test]
+    fn sync_semantic_model_only_needs_no_profile_and_writes_the_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-catalog-semantic-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("osi")).unwrap();
+        std::fs::write(
+            dir.join("osi/model.yaml"),
+            "version: 0.1.1\nsemantic_model:\n  - name: m\n    datasets:\n      - name: d\n        \
+             source: s\n        fields:\n          - name: id\n            expression:\n              \
+             dialects:\n                - dialect: ANSI_SQL\n                  expression: id\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: c\nsemantic_model:\n  dir: osi\n",
+        )
+        .unwrap();
+        // No profiles/ directory at all — confirms the semantic half never
+        // needs one.
+        let file = dir.join("cell.yaml");
+        sync(&file, "local", false).unwrap();
+        let record = crate::ossie::record::SemanticModelRecord::load(&dir)
+            .expect(".cell/semantic_model.json must exist");
+        assert_eq!(record.files, vec!["model.yaml".to_string()]);
+        assert_eq!(record.document.semantic_model.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_with_neither_discover_nor_semantic_model_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-catalog-neither-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cell.yaml"), "cell: c\ninterface: []\n").unwrap();
+        let err = sync(&dir.join("cell.yaml"), "local", false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("declares neither `discover:` nor `semantic_model:`"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

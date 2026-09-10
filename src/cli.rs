@@ -54,10 +54,16 @@ pub enum Command {
     Init(InitArgs),
     /// Execute the transform pipeline, commit a snapshot, auto-verify (the Builder workload)
     Run(RunArgs),
-    /// Discover the interface from a modeling tool's deployed state and
-    /// record it (`discover:` cells, ADR 0016). Reads the tool's state store
-    /// and the warehouse — read-only — and writes .cell/deployed_catalog.json,
-    /// which `verify`, `context` and `serve` then read with no credentials.
+    /// Refresh a cell's external state: the discovered interface
+    /// (`discover:`, ADR 0016) and/or the ingested Apache Ossie semantic
+    /// model (`semantic_model:`, ADR 0018) — whichever the cell declares;
+    /// at least one is required. `discover:` reads the modeling tool's
+    /// state store and the warehouse (read-only) and writes
+    /// .cell/deployed_catalog.json; `semantic_model:` reads a directory or
+    /// a git ref and writes .cell/semantic_model.json. Both are
+    /// credential-light sidecars — `verify`, `context` and `serve` read
+    /// them, never the source directly. Needs no profile when the cell
+    /// declares `semantic_model:` only.
     Sync(SyncArgs),
     /// Machine-verify actual output against the declared interface
     Verify(FileArgs),

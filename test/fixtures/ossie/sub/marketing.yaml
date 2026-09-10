@@ -1,0 +1,22 @@
+version: 0.1.1
+semantic_model:
+  - name: marketing
+    description: Paid marketing spend.
+    datasets:
+      - name: campaign
+        source: '"dw-main-silver".marketing.campaign_spend'
+        primary_key: [campaign_id]
+        description: One row per campaign per day.
+        ai_context:
+          synonyms: [campaigns, ads]
+        fields:
+          - name: campaign_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: campaign_id
+          - name: spend
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: spend

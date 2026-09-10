@@ -55,7 +55,7 @@ fn init_discovered(dir: &Path, name: &str, tool: &str) -> Result<()> {
     let d = dir.display();
     println!("Created discovered cell '{name}' in {d}");
     println!("Next (edit discover.select and the profile's connections first):");
-    println!("  datamk sync    -f {d}/cell.yaml   # read the deployed models, write .cell/deployed_catalog.json");
+    println!("  datamk sync    -f {d}/cell.yaml   # read the deployed models (+ semantic_model:, if uncommented), write .cell/deployed_catalog.json");
     println!("  datamk verify  -f {d}/cell.yaml   # live-check types against the warehouse");
     println!("  datamk context -f {d}/cell.yaml   # the document agents read");
     println!("  datamk serve   -f {d}/cell.yaml   # /context + /openapi.json; rows stay in the warehouse");
@@ -73,6 +73,12 @@ description: One line — what this set of deployed models is for.
 #   - term: net_revenue           #   tied to no column at all (ADR 0017) — the thing a
 #     description: Invoiced revenue less credit memos.  # discovered cell's per-model
 #     # applies_to: [paid_media_daily@1.revenue]         # overrides have nowhere to hold.
+# semantic_model:                 # an Apache Ossie model (datamk ingests, never authors)
+#   dir: ../dbt-project/osi       #   directory of Ossie .yaml/.json files, walked recursively
+#   # git: https://github.com/acme/semantics.git   # or a git repo:
+#   # path: osi                   #   subpath (default: repo root)
+#   # ref: 4f2a91c…               #   commit sha — `release` refuses a moving branch
+#                                 # `datamk sync` snapshots it into .cell/ (gitignored)
 
 # A DISCOVERED cell (ADR 0016): the interface is read from the SQLMesh
 # project's deployed state by `datamk sync`, never authored here. There is no
@@ -219,6 +225,12 @@ interface:                        # the export list - the public surface, single
 #     # aliases: [nr]             #   export has nowhere to hold it. Looked up via
 #     # docs: docs/net_revenue.md #   `GET /context?terms=net_revenue` (ADR 0017).
 #     # applies_to: [orders_daily@2.revenue]  # name@major[.column]; omit for cell-wide
+# semantic_model:                 # an Apache Ossie model (datamk ingests, never authors)
+#   dir: ../dbt-project/osi       #   directory of Ossie .yaml/.json files, walked recursively
+#   # git: https://github.com/acme/semantics.git   # or a git repo:
+#   # path: osi                   #   subpath (default: repo root)
+#   # ref: 4f2a91c…               #   commit sha — `release` refuses a moving branch
+#                                 # `datamk sync` snapshots it into .cell/ (gitignored)
 
 access:                           # default-deny: the serving plane exposes data only when shareable
   shareable: true

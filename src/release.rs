@@ -13,6 +13,14 @@ use crate::manifest::Published;
 /// command.
 pub fn run(file: &Path, profile: &str) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
+
+    // ADR 0018 §3: a `semantic_model.git` source whose `ref:` is not a
+    // pinned commit sha must never ship — a moving branch means a later
+    // `datamk sync` (on any machine, at any time) would have ingested
+    // something datamk never checked. Checked before anything else so a
+    // release with no other problem still stops here.
+    crate::ossie::record::check_release_pinned(&cell.dir, file, &cell.def)?;
+
     let snapshot = current_snapshot(&cell.conn)?;
 
     // ADR 0013 §5: docs fingerprints are a release-time fact, computed here

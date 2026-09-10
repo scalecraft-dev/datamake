@@ -10,6 +10,7 @@ mod logging;
 mod manifest;
 mod mesh;
 mod ops;
+mod ossie;
 mod project;
 mod release;
 mod serve;
