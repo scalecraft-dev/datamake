@@ -262,3 +262,29 @@ not-found message.
    answer is `unverified`, never a join planner.
 3. Ossie 0.2 moves metrics to dataset-level measures ⇒ the version pin
    fails loudly on upgrade and the lookup keys change shape under authors.
+
+## Amendment (2026-09-11): `?model=`/`?terms=` (no route) project `exports[]` too
+
+§7's table says `/context?model=<name>` returns "one semantic model in
+full, composable with `terms`" — true, but on the real 42-export/47-dataset
+design-partner cell it arrived beside all 42 exports' full `schema`/
+`check`/`semantic[]` bodies anyway: 467 KB, of which the requested model
+was 38 KB. The door answered "the one thing you asked for" and "everything
+else" in the same breath.
+
+`GET /context?model=<name>` and `GET /context?terms=...`, absent a route,
+now project `exports[]` through `ExportDoc::to_index` (ADR 0012 §4
+amendment 2026-09-11, same date) — every export reduced to identity, its
+claims, `columns[]` (names), and `semantic_datasets[]` (`model/dataset`
+names) in place of `semantic[]`'s full dataset/field/relationship/metric
+bodies. `semantic_model`/`semantic_matches` themselves are unaffected —
+`?model=` still returns that one model in full; the projection only trims
+the tag-along `exports[]`. `datamk context --model`/`--terms` (without
+`--export`) match. `/context/<route>?terms=` keeps the route's full export
+— see the ADR 0017 §2 amendment (same date) for the full reasoning, which
+applies identically here since both doors share `?terms=`'s grammar.
+
+MCP is unaffected structurally: `describe_export` already narrows to one
+route (never carries the whole-cell `exports[]` to begin with), and the new
+`datamk://<mount>/context/index` resource (ADR 0012 §4 amendment) is the
+whole-cell projection's own door.

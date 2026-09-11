@@ -71,6 +71,7 @@
   "definitions_request": "context?terms=<term>[,<term>]&include=docs",
   "docs": [],
   "include_request": "context?include=docs",
+  "index_request": "context?view=index",
   "semantic_models": [],
   "semantic_matches": [],
   "build": {

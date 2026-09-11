@@ -43,6 +43,7 @@ count. Follow `next.offset`.
 | URI | Content |
 | --- | --- |
 | `datamk://<mount>/context` | The context document. |
+| `datamk://<mount>/context/index` | The whole-cell document with `exports[]` projected to identity, column names, and affordances — the same document `?view=index` returns. |
 | `datamk://<mount>/context/<route>` | One export, docs inlined. |
 | `datamk://<mount>/docs/<target>` | One docs page. Targets: `cell`, `<route>`, `definition:<term>`. |
 | `datamk://<mount>/semantic/<model>` | One Apache Ossie semantic model in full (ADR 0018) — the same document `?model=<name>` returns. One resource per bound model. |

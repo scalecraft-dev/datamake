@@ -139,14 +139,16 @@ fn terms_vocabulary(
     v
 }
 
-/// `/context`'s `include`, `terms`, and `model` parameters, documented from
-/// `INCLUDE_SECTIONS` (`serve::INCLUDE_SECTIONS`), the cell's glossary plus
+/// `/context`'s `include`, `terms`, `model`, and `view` parameters,
+/// documented from `INCLUDE_SECTIONS`/`VIEW_SECTIONS` (`serve::
+/// INCLUDE_SECTIONS`/`serve::VIEW_SECTIONS`), the cell's glossary plus
 /// Ossie lookup, and the bound semantic model index respectively — the
 /// exact vocabularies `validate_context_query`/`resolve_terms`/
 /// `resolve_model` enforce, so none can drift from what's generated here
-/// (ADR 0013 §8, ADR 0017 §6, ADR 0018 §7).
+/// (ADR 0013 §8, ADR 0017 §6, ADR 0018 §7, item 2).
 fn context_path_item(terms_vocabulary: &[Value], model_vocabulary: &[Value]) -> Value {
     let sections: Vec<Value> = super::INCLUDE_SECTIONS.iter().map(|s| json!(s)).collect();
+    let views: Vec<Value> = super::VIEW_SECTIONS.iter().map(|s| json!(s)).collect();
     json!({
         "get": {
             "summary": "The cell's context document (ADR 0012)",
@@ -160,12 +162,15 @@ fn context_path_item(terms_vocabulary: &[Value], model_vocabulary: &[Value]) -> 
                     "style": "form",
                     "explode": false,
                     "description": "Comma-separated optional sections to inline. Omit for the \
-                                    default document; `docs` inlines every declared docs page. \
-                                    Each section named in the response's `included` array is \
-                                    inlined ON THE RECORDS it belongs to — `include=docs` echoes \
-                                    `\"included\": [\"docs\"]` and sets `content` on each \
-                                    `docs[]` entry. `included` holds section names, never the \
-                                    content itself.",
+                                    default document; `docs` inlines every declared docs page; \
+                                    `check` inlines the per-column census on every bound \
+                                    export's `check`. Each section named in the response's \
+                                    `included` array is inlined ON THE RECORDS it belongs to — \
+                                    `include=docs` echoes `\"included\": [\"docs\"]` and sets \
+                                    `content` on each `docs[]` entry; `include=check` echoes \
+                                    `\"included\": [\"check\"]` and sets `columns` on each \
+                                    `exports[].check`. `included` holds section names, never \
+                                    the content itself.",
                     "schema": { "type": "array", "items": { "type": "string", "enum": sections } }
                 },
                 {
@@ -178,7 +183,11 @@ fn context_path_item(terms_vocabulary: &[Value], model_vocabulary: &[Value]) -> 
                                     `definitions[]` and, under `include=docs`, `docs[]` to \
                                     those terms' `definition:<term>` pages only. Matching is \
                                     case-insensitive; an unmatched token is echoed in \
-                                    `missing_terms`, never a 400 or 404.",
+                                    `missing_terms`, never a 400 or 404. On this door (never \
+                                    `/context/{route}`), also projects `exports[]` to the \
+                                    index shape (item 3) — the same projection `?view=index` \
+                                    applies — since asking for a handful of terms has no reason \
+                                    to pay for every export's full body too.",
                     "schema": { "type": "array", "items": { "type": "string",
                                                               "enum": terms_vocabulary } }
                 },
@@ -189,8 +198,24 @@ fn context_path_item(terms_vocabulary: &[Value], model_vocabulary: &[Value]) -> 
                     "description": "One Apache Ossie semantic model name (ADR 0018 §7) — \
                                     returns that model in full as `semantic_model`, composable \
                                     with `terms`. A whole-cell view: not accepted on \
-                                    `/context/{route}` (400).",
+                                    `/context/{route}` (400). Also projects `exports[]` to the \
+                                    index shape (item 3), same reason as `terms`.",
                     "schema": { "type": "string", "enum": model_vocabulary }
+                },
+                {
+                    "name": "view",
+                    "in": "query",
+                    "required": false,
+                    "description": "`full` (default) or `index` (item 2). `index` projects \
+                                    every `exports[]` entry to identity, claims, and \
+                                    affordances (`ExportDoc::to_index`) — no `schema`, `check`, \
+                                    `probe`, or `semantic[]` bodies; declared column names ride \
+                                    `columns[]` and bound Ossie datasets ride \
+                                    `semantic_datasets[]` instead. Composes with `include`, \
+                                    `terms`, and `model`. Not accepted on `/context/{route}` \
+                                    (400) — a single-export door is already the index's whole \
+                                    point.",
+                    "schema": { "type": "string", "enum": views }
                 }
             ],
             "responses": {
@@ -201,9 +226,9 @@ fn context_path_item(terms_vocabulary: &[Value], model_vocabulary: &[Value]) -> 
                 "304": { "description": "not modified (If-None-Match matched the current ETag \
                                           for the requested variant)" },
                 "400": { "description": "unknown query parameter; an unrecognized/empty \
-                                          `include` section; or a `terms`/`model` token that's \
+                                          `include` section; a `terms`/`model` token that's \
                                           empty, out of grammar, or (terms) exceeds the token \
-                                          cap" },
+                                          cap; or an unrecognized `view`" },
                 "401": { "description": "missing or unknown bearer token (cell has access.roles)" },
                 "403": { "description": "cell is not shareable, or the token's roles do not \
                                           include an allowed role" },
@@ -224,7 +249,7 @@ fn context_schema() -> Value {
         "type": "object",
         "required": ["datamk_context", "cell", "status", "grain_verified", "exports",
                      "upstreams", "definitions", "missing_terms", "definitions_request", "docs",
-                     "include_request", "data", "notes", "included"],
+                     "include_request", "index_request", "data", "notes", "included"],
         "description": "One level, no regions. A fact is a CLAIM iff its record carries \
                         `from` (who said it); a fact is a MEASUREMENT iff it sits in a \
                         block with a timestamp (`build`, `source_check`, `freshness`, an \
@@ -308,6 +333,9 @@ fn context_schema() -> Value {
                         "description": "Present only when `included` contains `docs`." }
                 }}},
             "include_request": { "type": "string" },
+            "index_request": { "type": "string",
+                "description": "The affordance to fetch the index projection (item 2) — \
+                                `context?view=index`, relative to the document's own URL." },
             "semantic_models": { "type": "array",
                 "description": "Apache Ossie semantic-model index (ADR 0018 §7) — always \
                                 present, `[]` without a bound `semantic_model:`. Full detail \
@@ -557,7 +585,17 @@ fn export_schema() -> Value {
             "semantic": { "type": "array", "items": semantic_dataset_schema(),
                 "description": "Every Apache Ossie dataset bound to this route (ADR 0018 §7) \
                                 — `[]` without a bound semantic model, or when nothing binds \
-                                to this route." }
+                                to this route." },
+            "columns": { "type": "array", "items": { "type": "string" },
+                "description": "`?view=index`/`?model=`/`?terms=` (without a route) only \
+                                (item 2/3): declared column names, in order, no type, unit, \
+                                description, or `from` — `schema`'s replacement in the index \
+                                projection. Empty (omitted) on the full document." },
+            "semantic_datasets": { "type": "array", "items": { "type": "string" },
+                "description": "`?view=index`/`?model=`/`?terms=` (without a route) only: \
+                                `model/dataset` names bound to this route — `semantic[]`'s \
+                                replacement in the index projection. Empty (omitted) on the \
+                                full document." }
         }
     })
 }
@@ -654,7 +692,9 @@ fn column_census_schema() -> Value {
                         that, `distinct_over_50: true` and no values. \
                         `top_values` is withheld under --no-data. Absent on a \
                         materialized export and on a record that predates \
-                        this measurement.",
+                        this measurement — and, served, unless `?include=check` \
+                        asked for it (item 4); the portable `datamk context` \
+                        artifact always inlines it when present.",
         "additionalProperties": {
             "type": "object",
             "required": ["null_rows"],
@@ -980,6 +1020,7 @@ mod tests {
             "definitions_request",
             "docs",
             "include_request",
+            "index_request",
             "semantic_models",
             "semantic_matches",
             "build",
@@ -1022,6 +1063,9 @@ mod tests {
             export["check"]["properties"]["check"]["enum"],
             json!(["grain_unique", "schema"])
         );
+        // item 2: the index projection's replacements for `schema`/`semantic[]`.
+        assert!(export.get("columns").is_some());
+        assert!(export.get("semantic_datasets").is_some());
         // The measurement beside the freshness claim is documented, and the
         // claim's own description points at it.
         assert!(export.get("freshness_observed").is_some());
@@ -1198,7 +1242,7 @@ mod tests {
         let params = doc["paths"]["/context"]["get"]["parameters"]
             .as_array()
             .unwrap();
-        assert_eq!(params.len(), 3, "{params:?}");
+        assert_eq!(params.len(), 4, "{params:?}");
         let include = &params[0];
         assert_eq!(include["name"], "include");
         assert_eq!(include["style"], "form");
@@ -1211,6 +1255,18 @@ mod tests {
             .collect();
         assert_eq!(enumerated, super::super::INCLUDE_SECTIONS.to_vec());
         assert_eq!(params[2]["name"], "model");
+
+        // item 2: `view` is documented from the same shared-vocabulary
+        // discipline as `include`.
+        let view = &params[3];
+        assert_eq!(view["name"], "view");
+        let view_enum: Vec<&str> = view["schema"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(view_enum, super::super::VIEW_SECTIONS.to_vec());
 
         let responses = &doc["paths"]["/context"]["get"]["responses"];
         for code in ["200", "304", "400", "401", "403", "404"] {

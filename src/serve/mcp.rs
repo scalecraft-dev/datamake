@@ -461,6 +461,14 @@ impl McpServer {
                     schema, meaning, query grammar, and provenance (GET /context).",
                 "mimeType": "application/json",
             }));
+            out.push(json!({
+                "uri": format!("datamk://{}/context/index", m.name),
+                "name": format!("{} context (index)", doc.cell),
+                "description": "The whole-cell context document with exports[] projected to \
+                    identity, column names, and affordances (GET /context?view=index) — for \
+                    picking a route before paying for its full document.",
+                "mimeType": "application/json",
+            }));
             for e in &doc.exports {
                 out.push(json!({
                     "uri": self.context_uri(m, Some(&e.route)),
@@ -516,7 +524,16 @@ impl McpServer {
                 not_found(format!("mounted cells: {}", known.join(", ")))
             })?;
         let text = if path == "context" {
-            serde_json::to_string(&build_context_document(&m.state))
+            let mut doc = build_context_document(&m.state);
+            doc.omit_check_columns();
+            serde_json::to_string(&doc)
+        } else if path == "context/index" {
+            // item 2: the whole-cell projection — checked before the
+            // generic `context/<route>` arm below, or `index` would read as
+            // an unknown route name.
+            let mut doc = build_context_document(&m.state);
+            doc.apply_index_view();
+            serde_json::to_string(&doc)
         } else if let Some(route) = path.strip_prefix("context/") {
             if !m.state.routes.contains_key(route) {
                 return Err(not_found(unknown_route_message(&m.state, route)));
@@ -580,7 +597,8 @@ impl McpServer {
             serde_json::to_string(&doc)
         } else {
             return Err(not_found(
-                "paths are `context`, `context/<route>`, `docs/<target>`, `semantic/<model>`"
+                "paths are `context`, `context/index`, `context/<route>`, `docs/<target>`, \
+                 `semantic/<model>`"
                     .to_string(),
             ));
         }
@@ -647,6 +665,9 @@ fn narrowed_with_docs(s: &AppState, route: &str) -> crate::context::ContextDocum
         .filter(|p| targets.contains(p.target.as_str()))
         .collect();
     doc.inline_docs(pages);
+    // item 4: MCP has no `?include=check` equivalent — mirrors the REST
+    // served default, which withholds the census unless asked.
+    doc.omit_check_columns();
     doc
 }
 
@@ -1095,6 +1116,59 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("mounted cells: smoke"));
+    }
+
+    /// item 2: `datamk://<mount>/context/index` — listed in `resources()`
+    /// and readable, and the whole-cell projection it returns matches
+    /// `?view=index`'s server-side twin exactly.
+    #[tokio::test]
+    async fn index_resource_is_listed_readable_and_projected() {
+        let s = single(false);
+        let v = call(&s, 1, "resources/list", Value::Null).await;
+        let uris: Vec<&str> = v["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert!(uris.contains(&"datamk://smoke/context/index"), "{uris:?}");
+
+        let v = call(
+            &s,
+            1,
+            "resources/read",
+            json!({ "uri": "datamk://smoke/context/index" }),
+        )
+        .await;
+        let c = &v["result"]["contents"][0];
+        assert_eq!(c["mimeType"], "application/json");
+        let doc: Value = serde_json::from_str(c["text"].as_str().unwrap()).unwrap();
+        let mut expected = build_context_document(&s.mounts[0].state);
+        expected.apply_index_view();
+        assert_eq!(
+            doc,
+            serde_json::to_value(expected).unwrap(),
+            "the resource matches ?view=index's projection"
+        );
+        assert_eq!(doc["exports"][0]["schema"], json!({}), "{doc}");
+        assert!(
+            !doc["exports"][0]["columns"].as_array().unwrap().is_empty(),
+            "{doc}"
+        );
+
+        // `index` is checked before the generic `context/<route>` arm, so
+        // it never reads as an unknown route.
+        let v = call(
+            &s,
+            1,
+            "resources/read",
+            json!({ "uri": "datamk://smoke/bogus" }),
+        )
+        .await;
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("context/index"));
     }
 
     /// `single()`, plus a bound semantic model — one model (`invoice`), one

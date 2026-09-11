@@ -293,6 +293,24 @@ pub struct ContextArgs {
     /// whole-cell view: mutually exclusive with `--export`.
     #[arg(long, value_name = "NAME")]
     pub model: Option<String>,
+    /// Project `exports[]` to identity, column names, and affordances
+    /// (item 2) — the portable twin of `GET /context?view=index`. A
+    /// whole-cell view: mutually exclusive with `--export`, same reason as
+    /// `--model`.
+    #[arg(long, value_enum, default_value = "full")]
+    pub view: ContextView,
+}
+
+/// `--view`'s closed vocabulary (item 2) — mirrors `serve::VIEW_SECTIONS`;
+/// kept a plain two-variant enum rather than a boolean because the wire
+/// vocabulary (`full`/`index`) is the contract, and a third view is additive
+/// here without touching every call site's signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+#[clap(rename_all = "lowercase")]
+pub enum ContextView {
+    #[default]
+    Full,
+    Index,
 }
 
 #[derive(Args)]
