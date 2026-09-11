@@ -150,6 +150,7 @@ async fn dispatch(command: Command) -> Result<()> {
             a.export.as_deref(),
             a.terms.as_deref(),
             a.model.as_deref(),
+            a.view == cli::ContextView::Index,
         ),
         Command::Mesh(a) => match a.command {
             cli::MeshCommand::Emit(e) => mesh::emit(

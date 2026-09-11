@@ -342,3 +342,33 @@ exits 0: the emission is truthful about its own state. Falsified if
 operators keep misreading a stale emission as validated — that argues for a
 non-zero exit, which is a behavior change this amendment deliberately does
 not take.
+
+## Amendment (2026-09-11): `?model=`/`?terms=` (no route) carry the index projection
+
+§2's "the document keeps its shape" still holds — one schema, additive
+fields, `datamk_context` stays 4 — but on the un-routed `/context` door,
+asking for `terms=` alone was paying for every export's full `schema`,
+`check`, `probe`, and `semantic[]` body to answer a lookup that only ever
+touches `definitions[]`/`docs[]`. Measured on the same 42-export/47-dataset
+cell ADR 0012's `view=index` amendment measures: `?terms=` is 431 KB, of
+which the matches (`definitions[]` + `semantic_matches[]`) are 1.4 KB.
+
+`GET /context?terms=...` and `GET /context?model=...`, absent a route, now
+also project `exports[]` through `ExportDoc::to_index` (ADR 0012 §4
+amendment 2026-09-11) — automatically, without `view=index` — because this
+door never narrows by route, so the narrower ask (a term subset, one model)
+has no reason to drag the wider one along. `datamk context --model`/
+`--terms` (without `--export`) match. **`/context/<route>?terms=`
+is exempt**: §3's composition rule already holds one route's document to
+its full export, and that full export is the whole point of asking a route
+door — projecting it there would take away the one thing a route-scoped
+request is for.
+
+The document's shape is unchanged by this — same `ExportDoc` schema, same
+fields, just fewer of them populated for this request. There is no escape
+hatch back to full `exports[]` under `terms=`/`model=`: the narrowed
+request is the signal that `exports[]` is not what's being asked for.
+Falsified if a caller demonstrably wants `terms=`/`model=` composed with
+full export bodies — the fix then is a route-scoped request
+(`/context/<route>?terms=`, exempt above) or the plain default document,
+not a third parameter on this door.

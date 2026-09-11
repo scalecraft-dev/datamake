@@ -110,6 +110,11 @@ pub struct ContextDocument {
     pub docs: Vec<DocsDoc>,
     /// The affordance to fetch docs content — a constant, always present.
     pub include_request: String,
+    /// The affordance to fetch the index projection (item 2, ADR 0012 §4
+    /// amendment 2026-09-11) — a constant, always present, beside
+    /// `include_request`/`definitions_request`. Relative to the document's
+    /// own URL, same rule as those two (RFC 3986, see `INCLUDE_DOCS_REQUEST`).
+    pub index_request: String,
     /// The Ossie semantic-model index (ADR 0018 §7) — always present,
     /// `[]` without a bound `semantic_model:`. Full detail lives behind
     /// `?model=`/`--model` (`semantic_model`) or per-route in
@@ -155,11 +160,14 @@ pub struct ContextDocument {
     pub data: DataBlock,
     /// Engine-emitted only — no author-supplied string ever lands here.
     pub notes: Vec<String>,
-    /// Which optional sections this response inlines (ADR 0013) —
-    /// engine-emitted, always present: `[]` on the default variant, `["docs"]`
-    /// under `?include=docs` (served) or the default portable emission. Lets
-    /// an agent distinguish "server predates this field" (absent — an old
-    /// binary) from "this cell has no docs" (present, and `docs` is `[]`).
+    /// Which optional sections this response inlines (ADR 0013, extended by
+    /// item 4) — engine-emitted, always present: `[]` on the default
+    /// variant, any subset of `["docs", "check"]` under `?include=` (served)
+    /// — `docs` under `?include=docs`, `check` under `?include=check` —
+    /// or the default portable emission, which carries both (no
+    /// `--no-check` flag; a file cannot be re-requested). Lets an agent
+    /// distinguish "server predates this field" (absent — an old binary)
+    /// from "this cell has no docs" (present, and `docs` is `[]`).
     pub included: Vec<String>,
     /// Portable artifact only (`datamk context`): when the document was
     /// emitted. A hosted `/context` omits it — the response is always now.
@@ -201,6 +209,11 @@ const INCLUDE_DOCS_REQUEST: &str = "context?include=docs";
 /// `INCLUDE_DOCS_REQUEST` — not templated per-cell; the placeholder is for
 /// the reader, not resolved server-side.
 const DEFINITIONS_REQUEST: &str = "context?terms=<term>[,<term>]&include=docs";
+
+/// `context?view=index` — the affordance naming how to ask for the index
+/// projection (item 2, ADR 0012 §4 amendment 2026-09-11). A constant, like
+/// `INCLUDE_DOCS_REQUEST`.
+const INDEX_REQUEST: &str = "context?view=index";
 
 /// One glossary term (ADR 0017 §2) — the index an agent reads before it
 /// asks. Always present in full on the default document (never gated
@@ -344,6 +357,55 @@ pub struct ExportDoc {
     /// dataset/field claims themselves are structural, from `interface`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub semantic: Vec<DatasetDoc>,
+    /// `view=index`/`--view index` only (`to_index`): declared column names,
+    /// no type/unit/description/from — enough for an agent to pick a route
+    /// before paying for `schema`'s full cost. Empty (omitted) on the full
+    /// document, where `schema` already carries this and more.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// `view=index`/`--view index` only (`to_index`): `model/dataset` names
+    /// bound to this route — the index's stand-in for `semantic[]`'s full
+    /// bodies. Empty (omitted) on the full document.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub semantic_datasets: Vec<String>,
+}
+
+impl ExportDoc {
+    /// The index projection (`?view=index`/`--view index`, added alongside
+    /// per-route docs and `?model=`/`?terms=` without a route): identity,
+    /// the claims that fit in a sentence, and the affordances — every field
+    /// that costs bytes without answering "what is this and how do I call
+    /// it" is dropped. Same struct as the full document (one schema, ADR
+    /// 0012 §2), so a consumer that has only ever seen `view=index` parses
+    /// `view=full` with no new code — it just sees more fields populated.
+    pub fn to_index(&self) -> ExportDoc {
+        ExportDoc {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            route: self.route.clone(),
+            contract: self.contract,
+            description: self.description.clone(),
+            freshness: self.freshness.clone(),
+            freshness_observed: self.freshness_observed.clone(),
+            grain: self.grain.clone(),
+            from: self.from.clone(),
+            schema: IndexMap::new(),
+            query: self.query.clone(),
+            binding: self.binding.clone(),
+            depends_on: self.depends_on.clone(),
+            depends_on_unselected: self.depends_on_unselected,
+            deployed: self.deployed.clone(),
+            probe: None,
+            check: None,
+            semantic: Vec::new(),
+            columns: self.schema.keys().cloned().collect(),
+            semantic_datasets: self
+                .semantic
+                .iter()
+                .map(|d| format!("{}/{}", d.model, d.dataset))
+                .collect(),
+        }
+    }
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1114,6 +1176,8 @@ pub fn interface(
                     .as_ref()
                     .map(|index| route_semantic_docs(index, route))
                     .unwrap_or_default(),
+                columns: Vec::new(),
+                semantic_datasets: Vec::new(),
             }
         })
         .collect();
@@ -2096,6 +2160,7 @@ pub fn assemble(facts: Facts) -> ContextDocument {
         definitions_request: interface.definitions_request,
         docs,
         include_request: interface.include_request,
+        index_request: INDEX_REQUEST.to_string(),
         semantic_models: interface.semantic_models,
         semantic,
         semantic_model: None,
@@ -2269,21 +2334,71 @@ impl ContextDocument {
         true
     }
 
-    /// Inline docs content (ADR 0013): marks `included: ["docs"]` and sets
+    /// Inline docs content (ADR 0013): adds `"docs"` to `included` and sets
     /// `content` on each `docs[]` entry whose `target` a loaded page names.
-    /// `included` is set even when there are no pages — a truthful
+    /// `included` gains the entry even when there are no pages — a truthful
     /// (possibly empty) answer, distinct from "server predates this field".
+    /// Idempotent and order-independent with `inline_check` — both push
+    /// their own name rather than overwrite, so `?include=docs,check`
+    /// carries both regardless of call order.
     pub fn inline_docs<'a>(
         &mut self,
         pages: impl IntoIterator<Item = &'a crate::config::docs::DocsPage>,
     ) {
-        self.included = vec!["docs".to_string()];
+        mark_included(&mut self.included, "docs");
         for p in pages {
             if let Some(d) = self.docs.iter_mut().find(|d| d.target == p.target) {
                 d.media_type = p.media_type.clone();
                 d.content = Some(p.content.to_string());
             }
         }
+    }
+
+    /// `?include=check`/portable emission (item 4): marks `included` as
+    /// carrying the census — the data itself is already on `exports[].
+    /// check.columns` from `assemble`; the served default's mirror call is
+    /// `omit_check_columns`, which clears it. A no-op on the columns
+    /// themselves, so calling this after `omit_check_columns` does not
+    /// resurrect them — callers choose exactly one per response. Marks
+    /// `included` unconditionally, exactly as `inline_docs` does: `included`
+    /// exists so an agent can tell "the census was not requested" from
+    /// "this cell has no census" (ADR 0013), and a cell with no bound
+    /// export answers the second question with empty `check`s, not with a
+    /// missing marker.
+    pub fn inline_check(&mut self) {
+        mark_included(&mut self.included, "check");
+    }
+
+    /// The served default (item 4): the per-column census is row-derived
+    /// detail, the same class `--no-data` already withholds from the probe
+    /// — cleared unless `?include=check` asked for it. The rollup
+    /// (`check`, `grain`, `rows`, `distinct_grain`, `null_rows`, `at`) is
+    /// never touched; it stays on every record regardless.
+    pub fn omit_check_columns(&mut self) {
+        for e in &mut self.exports {
+            if let Some(check) = &mut e.check {
+                check.columns = BTreeMap::new();
+            }
+        }
+    }
+
+    /// `?view=index`/`--view index`: every export projected through
+    /// `ExportDoc::to_index` — same cell-level fields, `exports[]` reduced
+    /// to identity, claims, and affordances. Refused on `/context/<route>`
+    /// by the caller (a single-export door is already the index's whole
+    /// point); composes with `include`/`terms`/`model` because it only
+    /// touches `exports[]`.
+    pub fn apply_index_view(&mut self) {
+        self.exports = self.exports.iter().map(ExportDoc::to_index).collect();
+    }
+}
+
+/// Push `section` onto `included` iff it isn't already there — the shared
+/// primitive `inline_docs`/`inline_check` use so `?include=docs,check` (in
+/// either order) yields the same `included` array.
+fn mark_included(included: &mut Vec<String>, section: &str) {
+    if !included.iter().any(|s| s == section) {
+        included.push(section.to_string());
     }
 }
 
@@ -2616,18 +2731,21 @@ pub fn build_document(
     profile: &str,
     no_docs: bool,
 ) -> Result<ContextDocument> {
-    build_document_for(file, profile, no_docs, None, None, None)
+    build_document_for(file, profile, no_docs, None, None, None, false)
 }
 
 /// `build_document`, optionally narrowed to one export's route (`datamk
 /// context --export <route>`, the portable twin of `GET /context/<route>`),
 /// to a `--terms` list (ADR 0017 §6, composing with `--export` exactly as
-/// `terms=` composes with `/context/<route>`), and/or to one semantic model
-/// in full (`--model`, ADR 0018 §7) — mutually exclusive with `--export`
-/// (`model` is a whole-cell view). An unknown route or model is an error
-/// naming the ones that exist; an unknown term is an error naming the known
-/// ones — the deliberate CLI asymmetry with the served door (ADR 0013 §7):
-/// a file written by `--out` cannot be re-requested.
+/// `terms=` composes with `/context/<route>`), to one semantic model in
+/// full (`--model`, ADR 0018 §7) — mutually exclusive with `--export`
+/// (`model` is a whole-cell view) — and/or to the index projection
+/// (`--view index`, item 2), also mutually exclusive with `--export` for the
+/// same reason `/context/<route>` refuses `?view=index`. An unknown route or
+/// model is an error naming the ones that exist; an unknown term is an error
+/// naming the known ones — the deliberate CLI asymmetry with the served door
+/// (ADR 0013 §7): a file written by `--out` cannot be re-requested.
+#[allow(clippy::too_many_arguments)]
 pub fn build_document_for(
     file: &std::path::Path,
     profile: &str,
@@ -2635,9 +2753,15 @@ pub fn build_document_for(
     export: Option<&str>,
     terms: Option<&[String]>,
     model: Option<&str>,
+    index_view: bool,
 ) -> Result<ContextDocument> {
     if export.is_some() && model.is_some() {
         anyhow::bail!("--model is a whole-cell view; drop --export");
+    }
+    if export.is_some() && index_view {
+        anyhow::bail!(
+            "--view index is a whole-cell projection; drop --export (it is already one export)"
+        );
     }
     let loaded = crate::config::load(file, profile)?;
     let routes = discoverable_routes(&loaded.def)?;
@@ -2894,6 +3018,14 @@ pub fn build_document_for(
         }
     }
 
+    // item 2/item 3: whole-cell only (refused on --export above), same
+    // trigger the served door uses — explicit `--view index`, or `--model`,
+    // or `--terms` without `--export` (which would otherwise narrow to one
+    // route's full export, ADR 0017 §6's composition).
+    if index_view || model.is_some() || (terms.is_some() && export.is_none()) {
+        doc.apply_index_view();
+    }
+
     // ADR 0013 §7 / ADR 0017 §6: inline by default — a portable artifact
     // with null content pointing at a path the reader doesn't have is a
     // dangling pointer. `--no-docs` withholds page content only; a term's
@@ -2904,6 +3036,9 @@ pub fn build_document_for(
         let pages = crate::config::docs::load_declared(&loaded.dir, &loaded.def, &routes)?;
         doc.inline_docs(&pages);
     }
+    // item 4: the portable artifact always carries the census when one
+    // exists — no `--no-check` flag (a file cannot be re-requested).
+    doc.inline_check();
 
     doc.emitted_at = Some(crate::timeutil::rfc3339_utc(crate::timeutil::unix_now()));
     doc.cell_yaml_digest = Some(cell_yaml_digest);
@@ -2925,10 +3060,11 @@ pub fn emit(
     export: Option<&str>,
     terms: Option<&[String]>,
     model: Option<&str>,
+    index_view: bool,
 ) -> Result<()> {
     use anyhow::Context as _;
 
-    let doc = build_document_for(file, profile, no_docs, export, terms, model)?;
+    let doc = build_document_for(file, profile, no_docs, export, terms, model, index_view)?;
     let json = serde_json::to_string_pretty(&doc)?;
     match out {
         Some(path) => {
@@ -3962,11 +4098,18 @@ interface:
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         let default_doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&default_out).unwrap()).unwrap();
-        assert_eq!(default_doc["included"], serde_json::json!(["docs"]));
+        // The portable emission inlines both optional sections (a file
+        // cannot be re-requested), and says so even when this cell has no
+        // census to inline — the marker answers "was it asked for".
+        assert_eq!(
+            default_doc["included"],
+            serde_json::json!(["docs", "check"])
+        );
         assert_eq!(default_doc["docs"][0]["target"], "cell");
         assert!(
             default_doc["docs"][0]["content"]
@@ -3985,11 +4128,13 @@ interface:
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         let no_docs_doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&no_docs_out).unwrap()).unwrap();
-        assert_eq!(no_docs_doc["included"], serde_json::json!([]));
+        // `--no-docs` withholds docs only; the census marker is unaffected.
+        assert_eq!(no_docs_doc["included"], serde_json::json!(["check"]));
         assert!(
             no_docs_doc["docs"][0].get("content").is_none(),
             "{no_docs_doc}"
@@ -4053,7 +4198,7 @@ interface:
         );
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None, None)
+        emit(&file, "local", Some(&out), false, None, None, None, false)
             .expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -4147,7 +4292,7 @@ interface:
         crate::verify::run(&file, "local", false).expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None, None)
+        emit(&file, "local", Some(&out), false, None, None, None, false)
             .expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -4185,7 +4330,7 @@ interface:
         std::fs::write(&file, yaml).unwrap();
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None, None)
+        emit(&file, "local", Some(&out), false, None, None, None, false)
             .expect("emit must still succeed, just without the stale record");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -4656,7 +4801,7 @@ interface:
         crate::verify::run(&file, "local", false).expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
-        emit(&file, "local", Some(&out), false, None, None, None)
+        emit(&file, "local", Some(&out), false, None, None, None, false)
             .expect("emit the context document");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -5508,7 +5653,7 @@ interface:
         .unwrap();
 
         let file = dir.join("cell.yaml");
-        let doc = build_document_for(&file, "local", true, None, None, None)
+        let doc = build_document_for(&file, "local", true, None, None, None, false)
             .expect("datamk context must still emit, not refuse");
         assert!(
             doc.notes
@@ -5561,7 +5706,7 @@ interface:
         )
         .unwrap();
 
-        let doc = build_document_for(&file, "local", true, None, None, None)
+        let doc = build_document_for(&file, "local", true, None, None, None, false)
             .expect("datamk context must still emit over a drifted source");
         assert!(
             doc.notes
@@ -5603,7 +5748,7 @@ interface:
         let file = dir.join("cell.yaml");
         crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
 
-        let err = build_document_for(&file, "local", true, None, None, Some("nope"))
+        let err = build_document_for(&file, "local", true, None, None, Some("nope"), false)
             .expect_err("an unknown model must fail");
         let msg = err.to_string();
         assert!(msg.contains("no semantic model 'nope'"), "{msg}");
@@ -5611,7 +5756,7 @@ interface:
 
         // A near-miss (a prefix of the real name) is offered as the nearest
         // match, not the whole vocabulary.
-        let err = build_document_for(&file, "local", true, None, None, Some("invoi"))
+        let err = build_document_for(&file, "local", true, None, None, Some("invoi"), false)
             .expect_err("an unknown model must fail");
         let msg = err.to_string();
         assert!(msg.contains("nearest: invoice"), "{msg}");
@@ -5651,6 +5796,7 @@ interface:
             None,
             Some(&["flight_spen".to_string()]),
             None,
+            false,
         )
         .expect_err("an unknown term must fail");
         let msg = err.to_string();
@@ -5676,9 +5822,123 @@ interface:
             Some("orders_daily@2"),
             None,
             Some("x"),
+            false,
         )
         .expect_err("--export and --model together must fail");
         assert!(err.to_string().contains("--model is a whole-cell view"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// item 2: `/context/<route>`'s refusal of `?view=index` (ADR 0012 §4
+    /// amendment) mirrors on the CLI — `--view index` composed with
+    /// `--export` is a whole-cell projection asked of a single-export door.
+    #[test]
+    fn view_index_and_export_together_is_an_error() {
+        let def = sample_def();
+        let dir = semantic_context_dir("cli-view-export");
+        std::fs::write(dir.join("cell.yaml"), serde_yaml::to_string(&def).unwrap()).unwrap();
+        let file = dir.join("cell.yaml");
+        let err = build_document_for(
+            &file,
+            "local",
+            true,
+            Some("orders_daily@2"),
+            None,
+            None,
+            true,
+        )
+        .expect_err("--export and --view index together must fail");
+        assert!(err.to_string().contains("whole-cell projection"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// item 2: the index projection drops the bulky per-export fields and
+    /// carries column names plus bound Ossie dataset names instead.
+    #[test]
+    fn view_index_projects_exports_to_identity_and_affordances() {
+        let dir = semantic_context_dir("cli-view-index");
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: orders\n\
+             interface:\n\
+             \x20 - name: orders_daily\n\
+             \x20   version: 1.0.0\n\
+             \x20   description: One row per order.\n\
+             \x20   grain: [order_date]\n\
+             \x20   schema:\n\
+             \x20     order_date: date\n\
+             \x20     revenue: decimal\n",
+        )
+        .unwrap();
+        let file = dir.join("cell.yaml");
+        let doc = build_document_for(&file, "local", true, None, None, None, true)
+            .expect("--view index must still emit");
+        assert_eq!(doc.exports.len(), 1);
+        let e = &doc.exports[0];
+        assert_eq!(e.name, "orders_daily");
+        assert_eq!(e.route, "orders_daily@1");
+        assert_eq!(
+            e.columns,
+            vec!["order_date".to_string(), "revenue".to_string()]
+        );
+        assert!(e.schema.is_empty(), "{:?}", e.schema);
+        assert!(e.semantic_datasets.is_empty(), "{:?}", e.semantic_datasets);
+        // `schema` (the full column bodies) is emitted empty, never
+        // populated — `columns` (names only) is the index's replacement.
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["exports"][0]["schema"], serde_json::json!({}), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// item 3: `datamk context --model` (no `--export`) projects `exports[]`
+    /// automatically — the portable twin of `?model=` doing the same.
+    #[test]
+    fn model_without_export_projects_exports_and_lists_the_bound_dataset() {
+        let dir = semantic_context_dir("cli-model-projects");
+        std::fs::create_dir_all(dir.join("osi")).unwrap();
+        std::fs::write(
+            dir.join("osi/invoice.yaml"),
+            "version: 0.1.1\n\
+             semantic_model:\n\
+             \x20 - name: invoice\n\
+             \x20   datasets:\n\
+             \x20     - name: flight_spend\n\
+             \x20       source: flight_spend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("data.csv"), "id,amount\n1,10.0\n").unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: t\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n\
+             interface:\n\
+             \x20 - name: flight_spend\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20   bind: raw\n\
+             \x20   schema:\n\
+             \x20     id: bigint\n\
+             \x20     amount: decimal\n\
+             semantic_model:\n\
+             \x20 dir: osi\n",
+        )
+        .unwrap();
+        let file = dir.join("cell.yaml");
+        crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
+
+        let doc = build_document_for(&file, "local", true, None, None, Some("invoice"), false)
+            .expect("--model must still emit");
+        assert_eq!(doc.semantic_model.as_ref().unwrap().name, "invoice");
+        assert_eq!(doc.exports.len(), 1);
+        let e = &doc.exports[0];
+        assert!(e.schema.is_empty(), "{:?}", e.schema);
+        assert_eq!(e.columns, vec!["id".to_string(), "amount".to_string()]);
+        assert_eq!(
+            e.semantic_datasets,
+            vec!["invoice/flight_spend".to_string()]
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

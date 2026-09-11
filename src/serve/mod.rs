@@ -1349,10 +1349,15 @@ async fn health(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(body)
 }
 
-/// The closed `include=` vocabulary (ADR 0013 §4) — the single source both
-/// `validate_context_query` and `openapi::generate`'s documented `enum`
-/// read, so the two can never drift.
-pub(crate) const INCLUDE_SECTIONS: &[&str] = &["docs"];
+/// The closed `include=` vocabulary (ADR 0013 §4, extended by item 4) — the
+/// single source both `validate_context_query` and `openapi::generate`'s
+/// documented `enum` read, so the two can never drift.
+pub(crate) const INCLUDE_SECTIONS: &[&str] = &["docs", "check"];
+
+/// The closed `view=` vocabulary (item 2) — same discipline as
+/// `INCLUDE_SECTIONS`. `full` is the default and never needs to be named;
+/// listed here so both the validator and `openapi::generate` read one list.
+pub(crate) const VIEW_SECTIONS: &[&str] = &["full", "index"];
 
 /// `?terms=` cap (ADR 0017 §3) — the largest known estate at request time.
 const MAX_TERMS: usize = 64;
@@ -1367,24 +1372,28 @@ struct ContextQuery {
     include: Vec<String>,
     terms: Vec<String>,
     model: Option<String>,
+    /// `true` under `?view=index`; `false` (the default) is `view=full`.
+    index_view: bool,
 }
 
 /// Validate `/context`'s query string against the closed `{include, terms,
-/// model}` grammar (ADR 0013 §4, extended by ADR 0017 §3 and ADR 0018 §7):
-/// `include`'s value is a comma-separated list drawn from
+/// model, view}` grammar (ADR 0013 §4, extended by ADR 0017 §3, ADR 0018
+/// §7, and item 2): `include`'s value is a comma-separated list drawn from
 /// `INCLUDE_SECTIONS`; `terms`'s value is a comma-separated list of tokens
 /// matching `[A-Za-z0-9_.-]`, capped at `MAX_TERMS`; `model`'s value is one
 /// token matching `[A-Za-z0-9_.-]{1,128}` — given more than once, a 400 (no
-/// comma-list semantics: a document names one model, not several). Any
-/// other parameter, an empty value, an empty segment, or an out-of-grammar
-/// token is a 400. Takes the raw pairs (not a `HashMap`) so repeated keys
-/// are seen rather than silently collapsed — the discipline
-/// `serve_export`'s `validate_params` already established.
+/// comma-list semantics: a document names one model, not several); `view`'s
+/// value is one of `VIEW_SECTIONS`, also given at most once. Any other
+/// parameter, an empty value, an empty segment, or an out-of-grammar token
+/// is a 400. Takes the raw pairs (not a `HashMap`) so repeated keys are
+/// seen rather than silently collapsed — the discipline `serve_export`'s
+/// `validate_params` already established.
 fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<ContextQuery, String> {
     let mut include: Vec<String> = Vec::new();
     let mut terms: Vec<String> = Vec::new();
     let mut terms_seen = 0usize;
     let mut model: Option<String> = None;
+    let mut view: Option<String> = None;
     for (k, v) in pairs {
         match k.as_str() {
             "include" => {
@@ -1394,14 +1403,15 @@ fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<Con
                         // whose single `split` item is `""`) and a
                         // trailing/leading/double comma (`?include=docs,`)
                         // with one check.
-                        return Err(
-                            "`include` must name at least one section — `/context` accepts: docs"
-                                .to_string(),
-                        );
+                        return Err(format!(
+                            "`include` must name at least one section — `/context` accepts: {}",
+                            INCLUDE_SECTIONS.join(", ")
+                        ));
                     }
                     if !INCLUDE_SECTIONS.contains(&tok) {
                         return Err(format!(
-                            "unknown `include` section '{tok}' — `/context` accepts: docs"
+                            "unknown `include` section '{tok}' — `/context` accepts: {}",
+                            INCLUDE_SECTIONS.join(", ")
                         ));
                     }
                     if !include.iter().any(|s| s == tok) {
@@ -1457,10 +1467,24 @@ fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<Con
                 }
                 model = Some(v.clone());
             }
+            "view" => {
+                if view.is_some() {
+                    return Err("`view` can only be given once".to_string());
+                }
+                if !VIEW_SECTIONS.contains(&v.as_str()) {
+                    return Err(format!(
+                        "unknown `view` '{v}' — `/context` accepts: {}",
+                        VIEW_SECTIONS.join(", ")
+                    ));
+                }
+                view = Some(v.clone());
+            }
             other => {
                 return Err(format!(
                     "unknown query parameter '{other}' — `/context` accepts `include` \
-                     (sections: docs), `terms`, and `model`"
+                     (sections: {}), `terms`, `model`, and `view` (sections: {})",
+                    INCLUDE_SECTIONS.join(", "),
+                    VIEW_SECTIONS.join(", ")
                 ));
             }
         }
@@ -1469,6 +1493,7 @@ fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<Con
         include,
         terms,
         model,
+        index_view: view.as_deref() == Some("index"),
     })
 }
 
@@ -1566,6 +1591,14 @@ fn resolve_model(
 /// ignoring `?include=dcos` would return `content: null`, read by an agent
 /// as "no docs", the exact false-confidence failure `validate_params`
 /// already exists to kill on the data door.
+///
+/// `?view=index` (item 2) projects every `exports[]` entry to identity,
+/// claims, and affordances — `ExportDoc::to_index`. `?model=` and `?terms=`
+/// (item 3) apply the same projection automatically, even without
+/// `?view=index`: this door never narrows by route, so asking for one model
+/// or a handful of terms has no reason to also pay for every export's
+/// `schema`/`check`/`semantic[]` bodies. `/context/<route>?terms=` (the
+/// other door) is exempt — a route's own export stays full.
 async fn context_doc(
     State(s): State<Arc<AppState>>,
     Query(pairs): Query<Vec<(String, String)>>,
@@ -1580,6 +1613,7 @@ async fn context_doc(
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
     let want_docs = query.include.iter().any(|s| s == "docs");
+    let want_check = query.include.iter().any(|s| s == "check");
     // ADR 0017 §3: an unresolved token still selects the (empty) `terms=`
     // variant — `narrow_terms` reports it in `missing_terms`, never a 400.
     let terms = (!query.terms.is_empty()).then(|| resolve_terms(&s, &query.terms));
@@ -1595,17 +1629,19 @@ async fn context_doc(
     };
 
     // The interface digest names the interface; the ETag names a
-    // representation of it (ADR 0013 §6, ADR 0017 §4, ADR 0018 §7): every
-    // suffix below is either precomputed at startup or, for
+    // representation of it (ADR 0013 §6, ADR 0017 §4, ADR 0018 §7, item 2,
+    // item 4): every suffix below is either precomputed at startup or, for
     // `~terms`/`~docs`/`~model` under a filter, a bounded in-memory hash (or
     // a plain name) over data already resident in `AppState` — never a
     // filesystem, store, or DuckDB read.
     let etag = context_etag(
         &s,
         want_docs,
+        want_check,
         None,
         terms.as_deref(),
         query.model.as_deref(),
+        query.index_view,
     );
     if matches_etag(&headers, &etag) {
         return not_modified(etag);
@@ -1618,6 +1654,16 @@ async fn context_doc(
         doc.narrow_terms(&query.terms, &s.interface.definitions, &all_docs);
     }
     doc.semantic_model = semantic_model;
+    // item 2/item 3: a whole-cell projection, so only the un-routed door
+    // offers it — `context_export` 400s `?view=index` before reaching here,
+    // and never auto-projects under `terms=` (a route's export stays full,
+    // ADR 0017 §2's composition). Also triggers without `?view=index`
+    // whenever `model=` is set, or `terms=` is set here (this door never
+    // narrows by route) — the whole point of asking for one key is not
+    // paying for every export's `schema`/`check`/`semantic[]` bodies too.
+    if query.index_view || query.model.is_some() || terms.is_some() {
+        doc.apply_index_view();
+    }
     if want_docs {
         // Whatever `doc.docs` holds at this point (the full list, or the
         // `terms=`-selected subset) — inlining only ever adds `content` to
@@ -1630,6 +1676,14 @@ async fn context_doc(
             .filter(|p| targets.contains(p.target.as_str()))
             .collect();
         doc.inline_docs(pages);
+    }
+    // item 4: the served default withholds the per-column census — the same
+    // row-derived class `--no-data` withholds from the probe — unless
+    // `?include=check` asked for it.
+    if want_check {
+        doc.inline_check();
+    } else {
+        doc.omit_check_columns();
     }
     context_response(etag, doc)
 }
@@ -1661,12 +1715,30 @@ async fn context_export(
         )
             .into_response();
     }
+    // item 2: same reasoning — `/context/<route>` is already one export, so
+    // a whole-cell projection over `exports[]` has nothing to narrow.
+    if query.index_view {
+        return (
+            StatusCode::BAD_REQUEST,
+            "view=index is a whole-cell projection; /context/<route> is already one export",
+        )
+            .into_response();
+    }
     let want_docs = query.include.iter().any(|s| s == "docs");
+    let want_check = query.include.iter().any(|s| s == "check");
     let terms = (!query.terms.is_empty()).then(|| resolve_terms(&s, &query.terms));
     if !s.routes.contains_key(&route) {
         return (StatusCode::NOT_FOUND, unknown_route_message(&s, &route)).into_response();
     }
-    let etag = context_etag(&s, want_docs, Some(&route), terms.as_deref(), None);
+    let etag = context_etag(
+        &s,
+        want_docs,
+        want_check,
+        Some(&route),
+        terms.as_deref(),
+        None,
+        false,
+    );
     if matches_etag(&headers, &etag) {
         return not_modified(etag);
     }
@@ -1686,6 +1758,11 @@ async fn context_export(
             .filter(|p| targets.contains(p.target.as_str()))
             .collect();
         doc.inline_docs(pages);
+    }
+    if want_check {
+        doc.inline_check();
+    } else {
+        doc.omit_check_columns();
     }
     context_response(etag, doc)
 }
@@ -1717,21 +1794,31 @@ fn unknown_route_message(s: &AppState, route: &str) -> String {
 /// distinct tag by construction); `~docs.<sha12>` adds the docs-content
 /// bundle for `?include=docs`, computed over the *selected* pages' sha256s
 /// in declared order when `terms` narrows it, or `s.docs_bundle_sha12`
-/// (precomputed at startup) otherwise; `~model.<name>` (ADR 0018 §7) names a
+/// (precomputed at startup) otherwise; `~check` (item 4) marks `?include=
+/// check` — no hash needed, the census travels with the document itself,
+/// the same "name it" style as `~model`; `~index` (item 2) marks
+/// `?view=index`, same style. `~model.<name>` (ADR 0018 §7) names a
 /// `?model=` narrowing — the plain name, not a hash: bounded, closed
 /// grammar, no benefit to hashing it. A cell with neither observed input
-/// present and no `terms=`/`model=` keeps the exact byte-identical default
-/// ETag it always had (mesh.rs copies this verbatim into `context_digest`).
+/// present and none of `terms=`/`model=`/`include=`/`view=` keeps the exact
+/// byte-identical default ETag it always had (mesh.rs copies this verbatim
+/// into `context_digest`).
+#[allow(clippy::too_many_arguments)]
 fn context_etag(
     s: &AppState,
     want_docs: bool,
+    want_check: bool,
     export: Option<&str>,
     terms: Option<&[String]>,
     model: Option<&str>,
+    index_view: bool,
 ) -> String {
     let mut etag = format!("\"{}", s.digest);
     if let Some(obs) = &s.observed_bundle_sha12 {
         etag.push_str(&format!("~observed.{obs}"));
+    }
+    if index_view {
+        etag.push_str("~index");
     }
     if let Some(route) = export {
         etag.push_str(&format!("~export.{route}"));
@@ -1768,6 +1855,9 @@ fn context_etag(
             etag.push_str(&format!("~docs.{}", s.docs_bundle_sha12));
         }
         None => {}
+    }
+    if want_check {
+        etag.push_str("~check");
     }
     etag.push('"');
     etag
@@ -4299,6 +4389,249 @@ pub(in crate::serve) mod smoke {
         })
     }
 
+    /// A synthetic cell with `n_exports` bound exports of `n_columns`
+    /// columns each, plus one Apache Ossie dataset bound to every export by
+    /// name — the shape the motivating measurement (a real 42-export,
+    /// 47-dataset cell) approximates, built from scratch so the test is
+    /// hermetic. No transform runs (every export is `bind:`, like
+    /// `built_all_never_cell`): `engine::open` tolerates the never-published
+    /// catalog, so there is no DuckDB build cost even at this export count.
+    fn synthetic_router(n_exports: usize, n_columns: usize) -> Router {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-serve-smoke-synthetic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(dir.join("data.csv"), "col_00\n1\n").unwrap();
+
+        let mut yaml = String::from(
+            "cell: synthetic\ndescription: A synthetic cell for the index-projection size test.\n\
+             sources:\n\x20 raw: ./data.csv\naccess:\n\x20 shareable: true\ninterface:\n",
+        );
+        for e in 0..n_exports {
+            yaml.push_str(&format!(
+                "\x20 - name: export_{e}\n\x20   version: 1.0.0\n\
+                 \x20   description: Synthetic export {e}, one row per col_00.\n\
+                 \x20   grain: [col_00]\n\x20   bind: raw\n\x20   schema:\n"
+            ));
+            for c in 0..n_columns {
+                yaml.push_str(&format!(
+                    "\x20     col_{c:02}: {{ type: bigint, description: \"Column {c} of export {e}: a synthetic bigint measure used only to size-test the index projection against the full per-export schema, check census, and Ossie field bodies.\" }}\n"
+                ));
+            }
+        }
+        std::fs::write(dir.join("cell.yaml"), &yaml).unwrap();
+        std::fs::write(
+            dir.join("profiles/local.yaml"),
+            "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
+        )
+        .unwrap();
+
+        let cell_yaml = dir.join("cell.yaml");
+
+        // A synthetic `.cell/source_check.json` (bypassing a real live
+        // verify pass — DuckDB never touched, per-column census fabricated
+        // directly) so the full document actually carries `check.columns`
+        // at the same scale the motivating measurement did: the census is
+        // 87 KB of a real 429 KB document, and a full document that omits
+        // it would understate what `?view=index`/`?include=check` are
+        // actually saving.
+        let cell_yaml_digest = crate::context::cell_yaml_digest_of(&cell_yaml).unwrap();
+        let exports: BTreeMap<String, crate::manifest::ExportMeasurement> = (0..n_exports)
+            .map(|e| {
+                let columns: BTreeMap<String, crate::manifest::ColumnMeasurement> = (0..n_columns)
+                    .map(|c| {
+                        let m = if c == 0 {
+                            // col_00 is the grain column: census reports
+                            // only its NULL count (the probe/grain check
+                            // already own its value set).
+                            crate::manifest::ColumnMeasurement {
+                                null_rows: 0,
+                                distinct: None,
+                                distinct_over_50: false,
+                                top_values: Vec::new(),
+                            }
+                        } else {
+                            crate::manifest::ColumnMeasurement {
+                                null_rows: 0,
+                                distinct: Some(1),
+                                distinct_over_50: false,
+                                top_values: vec![crate::manifest::ValueRows {
+                                    value: "1".to_string(),
+                                    rows: 1,
+                                }],
+                            }
+                        };
+                        (format!("col_{c:02}"), m)
+                    })
+                    .collect();
+                (
+                    format!("export_{e}@1"),
+                    crate::manifest::ExportMeasurement {
+                        check: "grain_unique".to_string(),
+                        grain: vec!["col_00".to_string()],
+                        rows: 1,
+                        distinct_grain: Some(1),
+                        null_rows: BTreeMap::from([("col_00".to_string(), 0)]),
+                        columns,
+                    },
+                )
+            })
+            .collect();
+        std::fs::create_dir_all(dir.join(".cell")).unwrap();
+        std::fs::write(
+            dir.join(".cell/source_check.json"),
+            serde_json::to_string(&crate::manifest::SourceCheckRecord {
+                outcome: "passed".to_string(),
+                checked_at: "2026-09-11T00:00:00Z".to_string(),
+                data_as_of: None,
+                datamk_version: env!("CARGO_PKG_VERSION").to_string(),
+                cell_yaml_digest,
+                profile: "local".to_string(),
+                exports,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut cell =
+            engine::open(&cell_yaml, "local", true).expect("open the synthetic cell read-only");
+        let routes = crate::context::discoverable_routes(&cell.def).unwrap();
+        let fields: Vec<crate::ossie::Field> = (0..n_columns)
+            .map(|c| crate::ossie::Field {
+                name: format!("col_{c:02}"),
+                expression: crate::ossie::Expression {
+                    dialects: vec![crate::ossie::DialectExpression {
+                        dialect: crate::ossie::Dialect::AnsiSql,
+                        expression: format!("col_{c:02}"),
+                    }],
+                },
+                dimension: None,
+                label: None,
+                description: Some(format!(
+                    "Column {c}, synthetic Ossie field: a bound measure whose prose exists only to give \
+                     the full document realistic per-field mass for the size-projection test."
+                )),
+                datatype: Some(crate::ossie::DataType::Integer),
+                ai_context: None,
+                custom_extensions: vec![],
+            })
+            .collect();
+        // Datasets round-robin across several models (`n_models`) — the
+        // motivating cell's 47 datasets are not one model's worth (a real
+        // Ossie estate splits by domain), and `?model=<name>` only ever
+        // returns one. Bundling every dataset into a single model would
+        // make `?model=` re-request the whole estate by definition, which
+        // is a real (unhelped) case, just not this cell's shape — one
+        // model per export/dataset here, the extreme of that split.
+        let n_models = n_exports;
+        let models: Vec<crate::ossie::SemanticModel> = (0..n_models)
+            .map(|m| {
+                let datasets: Vec<crate::ossie::Dataset> = (0..n_exports)
+                    .filter(|e| e % n_models == m)
+                    .map(|e| crate::ossie::Dataset {
+                        name: format!("export_{e}"),
+                        source: format!("export_{e}"),
+                        primary_key: vec!["col_00".to_string()],
+                        unique_keys: vec![],
+                        description: Some(format!("Synthetic dataset {e}.")),
+                        ai_context: None,
+                        fields: fields.clone(),
+                        custom_extensions: vec![],
+                    })
+                    .collect();
+                crate::ossie::SemanticModel {
+                    name: format!("synthetic_model_{m}"),
+                    description: Some(format!("The synthetic size-test model {m}.")),
+                    ai_context: None,
+                    datasets,
+                    relationships: vec![],
+                    metrics: vec![],
+                    custom_extensions: vec![],
+                }
+            })
+            .collect();
+        let model_files: indexmap::IndexMap<String, String> = (0..n_models)
+            .map(|m| {
+                (
+                    format!("synthetic_model_{m}"),
+                    format!("synthetic_{m}.yaml"),
+                )
+            })
+            .collect();
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-11T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc123".to_string(),
+            files: (0..n_models)
+                .map(|m| format!("synthetic_{m}.yaml"))
+                .collect(),
+            model_files,
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: models,
+            },
+        };
+        cell.def.semantic = Some(crate::ossie::bind::SemanticIndex::build(
+            record,
+            &routes.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+        ));
+        let (state, _store) =
+            build_state(cell, /* no_data */ false, &cell_yaml, "local", "").expect("build state");
+        app(state, DEFAULT_MAX_CONCURRENCY)
+    }
+
+    /// The motivating measurement, reproduced on a hermetic fixture: on a
+    /// 40-export, 30-column, one-dataset-per-export synthetic cell,
+    /// `?view=index` and `?model=` are both well under 10% of the full
+    /// document's bytes — the whole point of the projection.
+    #[test]
+    fn view_index_and_model_are_under_a_tenth_of_the_full_document_on_a_synthetic_cell() {
+        let router = synthetic_router(40, 30);
+        rt().block_on(async {
+            let (status, full_body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{full_body}");
+            let full_bytes = full_body.len();
+
+            let (status, index_body) = get(&router, "/context?view=index", None).await;
+            assert_eq!(status, StatusCode::OK, "{index_body}");
+            let index_bytes = index_body.len();
+
+            let (status, model_body) =
+                get(&router, "/context?model=synthetic_model_0", None).await;
+            assert_eq!(status, StatusCode::OK, "{model_body}");
+            let model_bytes = model_body.len();
+
+            eprintln!(
+                "synthetic 40-export/30-column cell: full={full_bytes}B \
+                 view=index={index_bytes}B ({:.1}%) model=synthetic_model_0={model_bytes}B ({:.1}%)",
+                100.0 * index_bytes as f64 / full_bytes as f64,
+                100.0 * model_bytes as f64 / full_bytes as f64,
+            );
+            assert!(
+                (index_bytes as f64) < 0.10 * full_bytes as f64,
+                "view=index ({index_bytes}B) must be under 10% of full ({full_bytes}B)"
+            );
+            assert!(
+                (model_bytes as f64) < 0.10 * full_bytes as f64,
+                "?model= ({model_bytes}B) must be under 10% of full ({full_bytes}B)"
+            );
+        });
+    }
+
     #[test]
     fn model_query_param_returns_the_full_model_with_a_distinct_etag() {
         let router = router_with_semantic();
@@ -4370,6 +4703,175 @@ pub(in crate::serve) mod smoke {
             assert!(body.contains("`include`"), "{body}");
             assert!(body.contains("`terms`"), "{body}");
             assert!(body.contains("`model`"), "{body}");
+            assert!(body.contains("`view`"), "{body}");
+        });
+    }
+
+    // --- item 2: `?view=index` ----------------------------------------------
+
+    #[test]
+    fn view_index_is_200_with_a_distinct_etag_and_projects_exports() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?view=index", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let e = &v["exports"][0];
+            assert_eq!(e["route"], "orders_daily@2");
+            assert_eq!(e["schema"], serde_json::json!({}), "{v}");
+            assert!(e.get("check").is_none(), "{v}");
+            assert!(e.get("probe").is_none(), "{v}");
+            let columns: Vec<&str> = e["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_str().unwrap())
+                .collect();
+            assert_eq!(columns, vec!["order_date", "region", "revenue"]);
+            assert_eq!(v["index_request"], "context?view=index");
+
+            let (_, h_plain, _) = get_with_headers(&router, "/context", &[]).await;
+            let (_, h_index, _) = get_with_headers(&router, "/context?view=index", &[]).await;
+            let etag_plain = h_plain
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let etag_index = h_index
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_ne!(etag_plain, etag_index);
+            assert!(etag_index.contains("~index"), "{etag_index}");
+
+            let (status, _, _) = get_with_headers(
+                &router,
+                "/context?view=index",
+                &[("if-none-match", &etag_index)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED);
+        });
+    }
+
+    #[test]
+    fn view_bogus_is_400_naming_the_vocabulary() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context?view=bogus", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("unknown `view`"), "{body}");
+            assert!(body.contains("full"), "{body}");
+            assert!(body.contains("index"), "{body}");
+        });
+    }
+
+    #[test]
+    fn view_index_on_the_route_door_is_400() {
+        let router = router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context/orders_daily@2?view=index", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("whole-cell projection"), "{body}");
+        });
+    }
+
+    // --- item 3: `?model=`/`?terms=` without a route also project ----------
+
+    /// `?model=` and `?terms=` (no route) carry the index projection
+    /// automatically — no `schema`, no `semantic[]` bodies — while
+    /// `/context/<route>?terms=` keeps that route's full export (ADR 0017
+    /// §2's composition holds).
+    #[test]
+    fn model_and_terms_without_a_route_project_exports_but_the_route_door_keeps_the_full_export() {
+        let model_router = router_with_semantic();
+        let terms_router = router_definitions(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&model_router, "/context?model=invoice", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["semantic_model"]["name"], "invoice");
+            let e = &v["exports"][0];
+            assert_eq!(e["schema"], serde_json::json!({}), "{v}");
+            assert!(e.get("semantic").is_none(), "{v}");
+            assert!(
+                e["semantic_datasets"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("invoice/orders_daily")),
+                "{v}"
+            );
+
+            let (status, body) = get(&terms_router, "/context?terms=net_revenue", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["exports"][0]["schema"], serde_json::json!({}), "{v}");
+
+            // The route door is exempt: `/context/<route>?terms=` still
+            // carries that route's full schema.
+            let (status, body) =
+                get(&terms_router, "/context/orders@1?terms=net_revenue", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["exports"][0]["schema"].as_object().unwrap().len(),
+                2,
+                "{v}"
+            );
+            assert!(v["exports"][0]["schema"]["revenue"].is_object(), "{v}");
+        });
+    }
+
+    // --- item 4: `?include=check` -------------------------------------------
+
+    /// The served default withholds `check.columns`; `?include=check` inlines
+    /// it, flips `included`, and gets its own `ETag` variant.
+    #[test]
+    fn include_check_inlines_columns_and_flips_included_and_etag() {
+        let router = all_never_verified_router_with(|_| {});
+        rt().block_on(async {
+            let (status, body) = get(&router, "/context", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let check = &v["exports"][0]["check"];
+            assert!(check.is_object(), "{v}");
+            assert!(check.get("columns").is_none(), "{v}");
+            assert_eq!(check["rows"], 2, "the rollup stays: {v}");
+            assert_eq!(v["included"], serde_json::json!([]));
+
+            let (status, body) = get(&router, "/context?include=check", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(v["exports"][0]["check"]["columns"]["id"].is_object(), "{v}");
+            assert_eq!(v["included"], serde_json::json!(["check"]));
+
+            let (_, h_plain, _) = get_with_headers(&router, "/context", &[]).await;
+            let (_, h_check, _) = get_with_headers(&router, "/context?include=check", &[]).await;
+            let etag_plain = h_plain
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let etag_check = h_check
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_ne!(etag_plain, etag_check);
+            assert!(etag_check.contains("~check"), "{etag_check}");
+
+            let (status, _, _) = get_with_headers(
+                &router,
+                "/context?include=check",
+                &[("if-none-match", &etag_check)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED);
         });
     }
 
@@ -4491,6 +4993,13 @@ pub(in crate::serve) mod smoke {
         ///   `false`), so there is no "routes should be here but aren't" to
         ///   explain; only a *server* that could have mounted routes and
         ///   didn't needs the sentence.
+        /// - `exports[].check.columns` / `included`'s `"check"` entry (item
+        ///   4): portable always inlines the census when one exists — there
+        ///   is no `--no-check` flag, a file cannot be re-requested — while
+        ///   hosted's default withholds it (`?include=check` opts in). This
+        ///   test never requests `include=check` on the hosted side, so
+        ///   unlike the docs asymmetry below it can't be resolved by
+        ///   comparing like-for-like; it is always stripped.
         ///
         /// Everything else — `status`, `grain_verified`, `declared`
         /// (including `query`, unconditional since commit 4),
@@ -4547,11 +5056,18 @@ pub(in crate::serve) mod smoke {
                     for e in exports.iter_mut() {
                         if let Some(e) = e.as_object_mut() {
                             e.remove("probe");
+                            if let Some(check) = e.get_mut("check").and_then(|c| c.as_object_mut())
+                            {
+                                check.remove("columns");
+                            }
                         }
                     }
                 }
                 if let Some(notes) = obj.get_mut("notes").and_then(|n| n.as_array_mut()) {
                     notes.retain(|n| n.as_str() != Some(crate::context::NOTE_NO_ROUTES_MOUNTED));
+                }
+                if let Some(included) = obj.get_mut("included").and_then(|i| i.as_array_mut()) {
+                    included.retain(|s| s.as_str() != Some("check"));
                 }
             }
 

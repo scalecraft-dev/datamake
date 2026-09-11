@@ -841,3 +841,54 @@ reused, not reimplemented. What would reverse it: a design partner needing
 MCP against a hosted cell they cannot run locally (then `POST /mcp` on
 `serve`, same module, inheriting bearer auth); agents demonstrably unable
 to compose `describe_export` → `query_export` in two hops.
+
+## Amendment (2026-09-11): `?view=index` — the index projection (context bloat)
+
+Measured on a real 42-export/47-dataset cell: default `/context` is 429 KB
+compact, of which `exports[]` is 383 KB (`semantic` 158 KB, `schema` 122 KB,
+`check` 87 KB, `description` 25 KB, `deployed` 13 KB) — agents refuse it.
+§2's "the document is flat, one schema" stands; what was missing was a
+*view* of that one schema cheap enough to pick a route from before paying
+for its body.
+
+- **`?view=index` / `datamk context --view index`** — closed vocabulary
+  `full` (default) | `index`. `index` returns the full document with every
+  `exports[]` entry projected through `ExportDoc::to_index`: identity
+  (`name`, `version`, `route`, `contract`), the claims that fit in a
+  sentence (`description`, `grain`, `freshness`, `from`), the affordances
+  (`query`/`binding`, `deployed`), declared column *names* (`columns[]`,
+  §3's `schema` minus type/unit/description/`from`), and bound Ossie
+  dataset names (`semantic_datasets[]`, `model/dataset`, §7's `semantic[]`
+  minus every field/relationship/metric body). Every cell-level field
+  (`semantic_models[]`, `definitions[]`, `upstreams[]`, `docs[]` identity,
+  `build`, `source_check` rollup, `data`, `notes`) stays — this is an
+  `exports[]`-only projection, not a second document.
+- **Composes**, never collapses: `include`, `terms`, `model` all still work
+  under `view=index` — the projection runs on whatever `exports[]` those
+  narrowed it to. Refused on `/context/<route>` (400): a single-export door
+  is already the index's whole point, so the combination names something
+  incoherent, the same refusal `?model=` already draws there.
+- **`index_request`** joins `include_request`/`definitions_request` as a
+  constant, always-present affordance, relative per §2's RFC 3986 rule.
+- **ETag** gains a `~index` component, same style as `~docs`/`~model`; the
+  plain default response is unaffected byte for byte.
+- **One schema, still.** `ExportDoc` gained two fields (`columns`,
+  `semantic_datasets`), both empty and omitted on the full document — no
+  second struct, no second document to keep in sync. A consumer that has
+  only ever parsed `view=index` reads `view=full` unmodified; it just sees
+  more fields populated.
+- **MCP:** `datamk://<mount>/context/index`, alongside `context` and
+  `context/<route>` — the same projection over stdio.
+
+Measured on a synthetic 40-export/30-column/one-dataset-per-export cell:
+`?view=index` and `?model=` both land under 10% of the full document's
+bytes (`serve::smoke::
+view_index_and_model_are_under_a_tenth_of_the_full_document_on_a_synthetic_cell`).
+See the ADR 0017 §2 and ADR 0018 §7 amendments (same date) for `?model=`
+and `?terms=` (without a route) applying this same projection
+automatically — the other half of the same measurement.
+
+Premises: an agent's first move is almost always "what exists," not "give
+me everything" — the index answers the first cheaply. What would reverse
+it: a client that always wants the full body anyway, for which `view=index`
+is simply unused, at zero cost to it.

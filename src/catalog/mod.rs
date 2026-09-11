@@ -786,6 +786,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .expect("the portable door still emits on a stale record");
         assert!(doc.exports.is_empty());

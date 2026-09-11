@@ -6,6 +6,42 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Added: `?view=index` — a whole-cell projection cheap enough for an agent to read (ADR 0012 §4, ADR 0017 §2, ADR 0018 §7 amendments)
+
+On a real 42-export/47-dataset cell, `GET /context` measured 429 KB
+compact — `exports[]` alone was 383 KB (`semantic` 158 KB, `schema` 122 KB,
+`check` 87 KB) — and agents refused to read it; `?model=`/`?terms=` fared no
+better (467 KB and 431 KB respectively, of which the actually-requested
+content was 38 KB and 1.4 KB). Additive; `datamk_context` stays 4.
+
+- **`?view=index` / `datamk context --view index`.** Projects every
+  `exports[]` entry to identity, claims (`description`, `grain`,
+  `freshness`, `from`), affordances (`query`/`binding`, `deployed`),
+  declared column *names* (`columns[]`, in place of `schema`'s full column
+  bodies), and bound Ossie dataset names (`semantic_datasets[]`, in place
+  of `semantic[]`'s full bodies) — everything cell-level stays. Composes
+  with `include`/`terms`/`model`; refused (400) on `/context/<route>`, a
+  single-export door already being the index's whole point. New
+  `index_request` affordance, always present. New `~index` `ETag` suffix.
+  MCP resource `datamk://<mount>/context/index`.
+- **`?model=` and `?terms=` (without a route) now apply the same
+  projection automatically** — this door never narrows by route, so asking
+  for one model or a term subset has no reason to drag every export's full
+  body along. `/context/<route>?terms=` is exempt: that door's whole point
+  is the route's full export. `datamk context --model`/`--terms` (without
+  `--export`) match.
+- **The per-column census (`exports[].check.columns`) moves behind
+  `?include=check`** — omitted by default (including under `?view=index`),
+  present under `?include=check`, and always inlined in the portable
+  `datamk context` emission (no `--no-check` flag; a file cannot be
+  re-requested). The rollup (`check`, `grain`, `rows`, `distinct_grain`,
+  `null_rows`, `at`) stays on every record. `include` becomes `docs` |
+  `check`; `included` lists `check` when inlined. New `~check` `ETag`
+  suffix.
+- Measured on a synthetic 40-export/30-column/one-dataset-per-export cell:
+  `?view=index` and `?model=` both land under 10% of the full document's
+  bytes.
+
 ### Added: `semantic_model:` — Apache Ossie ingest (ADR 0018)
 
 datamake ingests business meaning it does not author: `semantic_model:`
