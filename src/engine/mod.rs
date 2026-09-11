@@ -5917,48 +5917,45 @@ mod tests {
         // `CREATE TABLE IF NOT EXISTS ... AS <select> LIMIT 0` short-circuits
         // rather than fully evaluating an expensive SELECT — proven at 80M
         // rows (9,579x for a window aggregate). This canary regresses that
-        // claim at a CI-friendly scale: a 10M-row windowed aggregate staged
-        // into a real TEMP table (staging always fully evaluates — that's
-        // the delta, not what this canary is about), then bootstrap reading
-        // `LIMIT 0` from it. The ADR's own claim is sub-10ms; this asserts a
-        // much more generous bound to stay stable on a loaded CI box while
-        // still catching a real regression — an in-session full
-        // materialization of the same relation measured ~9x slower locally.
+        // claim at a CI-friendly scale, and measures exactly what the gate
+        // claims: the bootstrap DDL over the *expensive SELECT itself*
+        // against a full evaluation of the same SELECT in the same session.
+        // Two earlier shapes flaked on a loaded CI box — a fixed 500ms cap
+        // (573ms observed), then a ratio against copying an already-staged
+        // table (182ms vs 506ms: a copy is cheap, so the ratio was weak by
+        // construction). The windowed SELECT is seconds of work at 10M rows;
+        // its LIMIT 0 is fixed DDL overhead. The bootstrap is timed three
+        // times (fresh table each) and the minimum taken, so first-call
+        // catalog/checkpoint cost on a cold box cannot masquerade as
+        // evaluation. A regression to full evaluation reads ~1x and fails.
         let (conn, _dir) = probe_attach("bootstrap-canary");
-        conn.execute_batch(
-            "CREATE TEMP TABLE stg AS SELECT id, \
-               sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running, \
-               avg(id) OVER (ORDER BY id ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) AS avgw \
-             FROM range(10000000) r(id);",
-        )
-        .expect("stage a 10M-row windowed relation");
+        const EXPENSIVE: &str = "SELECT id, \
+            sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running, \
+            avg(id) OVER (ORDER BY id ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) AS avgw \
+          FROM range(10000000) r(id)";
 
-        let started = Instant::now();
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS bootstrapped AS SELECT * FROM stg LIMIT 0;")
+        let mut bootstrap = Duration::MAX;
+        for i in 0..3 {
+            let started = Instant::now();
+            conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS bootstrapped_{i} AS {EXPENSIVE} LIMIT 0;"
+            ))
             .expect("bootstrap DDL");
-        let elapsed = started.elapsed();
-
+            bootstrap = bootstrap.min(started.elapsed());
+        }
         let count: i64 = conn
-            .query_row("SELECT count(*) FROM bootstrapped", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM bootstrapped_0", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "bootstrap must create an empty table");
 
-        // The bound is relative, not wall-clock: a loaded CI box once took
-        // 573ms for the LIMIT 0 path against a fixed 500ms cap while the
-        // full evaluation of the same relation would have taken several
-        // times longer still. What the gate actually claims is the *ratio*
-        // — short-circuit versus full evaluation — so measure the full
-        // materialization in the same session and require the bootstrap to
-        // be well inside it (locally ~9x; 3x leaves room for a noisy box
-        // while a regression to full evaluation reads ~1x and fails).
         let started = Instant::now();
-        conn.execute_batch("CREATE TABLE full_copy AS SELECT * FROM stg;")
-            .expect("full materialization of the staged relation");
+        conn.execute_batch(&format!("CREATE TABLE full_copy AS {EXPENSIVE};"))
+            .expect("full evaluation of the expensive SELECT");
         let full = started.elapsed();
         assert!(
-            elapsed * 3 < full,
-            "bootstrap took {elapsed:?} against a 10M-row staged relation whose full \
-             materialization took {full:?} — gate 3 expects LIMIT 0 to short-circuit, not \
+            bootstrap * 3 < full,
+            "bootstrap took {bootstrap:?} (best of 3) against a 10M-row windowed SELECT whose \
+             full evaluation took {full:?} — gate 3 expects LIMIT 0 to short-circuit, not \
              evaluate; a planner regression may have reintroduced full evaluation on every \
              declarative bootstrap"
         );
