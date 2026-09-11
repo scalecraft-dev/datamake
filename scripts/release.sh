@@ -31,8 +31,12 @@ cd "$(git rev-parse --show-toplevel)"
 # Releases cut from a clean, up-to-date main only.
 branch="$(git rev-parse --abbrev-ref HEAD)"
 [ "$branch" = "main" ] || die "releases are cut from main (currently on '$branch')"
-git diff --quiet && git diff --cached --quiet \
-  || die "working tree is not clean; commit or stash first"
+# A previous attempt that died in the gate leaves Cargo.toml/Cargo.lock
+# stamped — that is this script's own artifact, re-stamped idempotently
+# below, so it is the one kind of dirt a retry tolerates. Anything else is
+# the operator's to commit or stash.
+dirty="$(git status --porcelain --untracked-files=no | awk '{print $2}' | grep -v -x -e Cargo.toml -e Cargo.lock || true)"
+[ -z "$dirty" ] || die "working tree is not clean (${dirty//$'\n'/, }); commit or stash first"
 git fetch origin main --tags --quiet
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
   || die "main is not in sync with origin/main; pull/push first"
