@@ -286,7 +286,7 @@ fn serve_fails_loud_on_missing_principals() {
             "-p",
             "missing-principals",
             "--port",
-            "18091",
+            "0",
         ],
     );
     assert!(
@@ -310,6 +310,10 @@ fn serve_fails_loud_on_missing_principals() {
 /// at a Postgres catalog and S3 bucket that don't exist, so success is itself
 /// proof no DB was opened.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_dry_run_passes_preflight_without_a_db() {
     let dir = fixture("orders", "deploydry");
     let out = run(
@@ -336,6 +340,10 @@ fn deploy_dry_run_passes_preflight_without_a_db() {
 
 /// `deploy -p local` is refused early: local is the run/serve profile, not deployable.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_refuses_local_profile() {
     let dir = fixture("orders", "deploylocal");
     let out = run(&dir, &["deploy", "-f", "cell.yaml", "-p", "local"]);
@@ -481,6 +489,10 @@ fn init_scaffolds_deploy_overlay_and_runnable_cell() {
 /// `KUBECONFIG` is pinned to a nonexistent path so the failure mode is
 /// deterministic regardless of the runner's ambient kubeconfig.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_apply_attempts_cluster_and_defers_unreachable_probe() {
     let dir = fixture("orders", "deployapply");
     let out = Command::new(bin())
@@ -515,6 +527,10 @@ fn deploy_apply_attempts_cluster_and_defers_unreachable_probe() {
 /// unreachable/nonexistent `KUBECONFIG`, a dry-run deploy must still succeed
 /// and print manifests, proving it never tried to connect.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_dry_run_never_contacts_a_cluster() {
     let dir = fixture("orders", "deploydryoffline");
     let out = Command::new(bin())
@@ -542,6 +558,10 @@ fn deploy_dry_run_never_contacts_a_cluster() {
 /// output, and `datamk run` exiting 1 on the same fixture); this pins the
 /// fixed behavior at the same layer the bug was found at.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_dry_run_renders_no_init_job_for_an_all_bound_cell() {
     let dir = all_bound_fixture("nodryinit");
     let out = run(
@@ -571,6 +591,10 @@ fn deploy_dry_run_renders_no_init_job_for_an_all_bound_cell() {
 /// the agnostic Server-only pre-flight (servable/auth) is skipped when no
 /// Server is rendered: a compose-only cell has no HTTP surface to protect.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_dry_run_without_serve_renders_no_server_and_skips_server_preflight() {
     let dir = fixture("orders", "deploynoserve");
     std::fs::write(
@@ -612,6 +636,10 @@ fn deploy_dry_run_without_serve_renders_no_server_and_skips_server_preflight() {
 /// ahead of every pod-bearing object, and the Server pod mounts the reduced
 /// `<cell>-<profile>-server` Secret while Builder pods mount `<cell>-<profile>`.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_dry_run_renders_service_accounts_and_the_split_profile_secrets() {
     let dir = fixture("orders", "deploysa");
     std::fs::write(
@@ -662,6 +690,10 @@ fn deploy_dry_run_renders_service_accounts_and_the_split_profile_secrets() {
 
 /// Issue #8: neither `serve:` nor `schedule:` is refused with the fix named.
 #[test]
+#[cfg_attr(
+    not(feature = "kubernetes"),
+    ignore = "needs the kubernetes deploy target"
+)]
 fn deploy_refuses_an_overlay_with_neither_serve_nor_schedule() {
     let dir = fixture("orders", "deployneither");
     std::fs::write(
