@@ -64,6 +64,16 @@ network again. `sync` now refreshes *all* external state in one pass: the
 errors only when the cell declares neither. The semantic half needs no
 profile.
 
+When `semantic_model.git.ref` is a pinned 40-hex commit sha and
+`.cell/semantic_model.json` already records that exact commit from the
+identical `git`/`path`/`ref`, `sync` reuses the snapshot: no clone, no
+fetch, no network access at all — it prints `reusing
+.cell/semantic_model.json at <sha> (pinned; nothing to fetch)` and exits 0.
+This is what lets a deploy pod with no git credentials run `sync` safely:
+CI produces the pinned snapshot with the runner's own creds at build time,
+and a commit sha can never resolve to something different later. `datamk
+sync --refetch` forces the clone regardless.
+
 ## Bind datasets to exports
 
 A dataset binds to an export when its `source`, normalized (quotes
@@ -84,17 +94,50 @@ For every bound dataset, without executing a query:
 
 | Claim | Check |
 |---|---|
-| A field's identity expression (bare column name) | Must be a declared column of the export — hard error, lists the declared columns. |
-| Any other `ANSI_SQL` field expression | `DESCRIBE SELECT <expr> FROM <source>` must succeed — hard error quoting DuckDB's message. |
-| A field with no `ANSI_SQL` variant | Recorded `verified: false, reason: "dialect"` — warned once per dataset, never a hard error. |
-| `primary_key` | Compared to the export's grain as a set. Differs → hard error. No export grain → recorded `no_grain`. |
-| Relationship `from_columns`/`to_columns` | Must be fields or declared columns of their datasets, when both sides are bound; same length. Unbound side → recorded `unbound`. |
-| Metric expression | `DESCRIBE SELECT <expr> FROM` a cross product of every bound dataset of the model — identifier/type resolution only, no join synthesized, no rows read. A referenced dataset that's unbound → `unverified: unbound`; no `ANSI_SQL` variant → `unverified: dialect`. |
+| A field's identity expression (bare column name) | Must be a declared column of the export — recorded `reason: "error"`, lists the declared columns, fails the check. |
+| Any other `ANSI_SQL` field expression | `DESCRIBE SELECT <expr> FROM <source>` must succeed — recorded `reason: "error"` quoting DuckDB's message, fails the check. |
+| A field with no `ANSI_SQL` variant | Recorded `verified: false, reason: "dialect"` — warned once per dataset, never fails the check. |
+| A field expression calling a function DuckDB doesn't have | Recorded `verified: false, reason: "function"` — warned, never fails the check. A foreign-dialect callable authored under `ANSI_SQL` (e.g. BigQuery's `HLL_COUNT.MERGE`) reads this way; a bad *column* still fails it. |
+| `primary_key` | Compared to the export's grain as a set. Differs → recorded `"error"`, fails the check. No export grain → recorded `no_grain`. |
+| Relationship `from_columns`/`to_columns` | Must be fields or declared columns of their datasets, when both sides are bound; same length. Bad → recorded `"error"`, fails the check. Unbound side → recorded `unbound`. |
+| Metric expression | `DESCRIBE SELECT <expr> FROM` a cross product of every bound dataset of the model — identifier/type resolution only, no join synthesized, no rows read. A referenced dataset that's unbound → `unverified: unbound`; no `ANSI_SQL` variant → `unverified: dialect`; an unqualified expression over more than one bound dataset → `unverified: ambiguous`; a missing function → `unverified: function`; DuckDB genuinely rejects it → `"error"`, fails the check. |
+
+A false claim is recorded, never bailed out on mid-pass (follow-up 8):
+every dataset, relationship, and metric is still checked, the full summary
+block prints with every failure `✗`-marked, and only then does `verify`
+exit non-zero, naming every failure it found — not just the first one a
+15-minute bind pass happened to reach.
 
 Results land in `.cell/semantic_check.json`, keyed `model/dataset@route`
 (one entry per bound route — a dataset bound to two majors gets two
 entries), stamped with `cell_yaml_digest`, `profile`, `checked_at`, and the
-synced content's own `content_sha256`.
+synced content's own `content_sha256` — written only when every check in
+the pass passed.
+
+### `--semantic-only`
+
+```bash
+datamk verify -f cell.yaml -p prod --semantic-only
+```
+
+Runs only the checks above and writes only `.cell/semantic_check.json` —
+skips the declared-schema type/grain checks, the column census, the live
+half of the `contract: supported` description lint, and
+`.cell/source_check.json`/`.cell/source_descriptions.json` entirely.
+Refused on a cell with no `semantic_model:` ("nothing to check").
+
+Exists because a full live verify over a large discovered estate binds
+*every* declared source before checking anything — on a 41-export SQLMesh
+estate, that bind pass alone took ~15 minutes, almost none of it needed
+for the Ossie checks, which are `DESCRIBE` only. `--semantic-only` still
+binds every declared source when the cell has a bound export (a dataset
+can bind to a bound export's live view), but via a schema-only probe: the
+identical read wrapped so the connector returns a correctly-typed *empty*
+result instead of the whole view — zero rows can never trip BigQuery's
+`EXPORT DATA` staging escalation, so that escalation never fires. An
+incremental source still stages for real (`--semantic-only` does not
+touch watermark logic), and a materialized (unbound) export's checks run
+against the already-built lake table either way, untouched by the flag.
 
 ## The four doors
 
@@ -158,8 +201,14 @@ half:
   auto-verify exactly like a bad declared column.
 - A metric is never evaluated and a relationship never joined by datamake,
   anywhere, under any flag. There is no `/metrics/<name>` route.
-- `custom_extensions[].data` is parsed only for `vendor_name: DATAMAKE`;
-  every other vendor's payload rides through byte for byte, uninterpreted.
+- `custom_extensions[].data` is opaque to datamake for every vendor — never
+  parsed, always passed through byte for byte, uninterpreted. Nothing
+  datamake-specific lives inside an Ossie document (see "Refused" in
+  [ADR 0018](../adr/0018-ossie-ingest.md)): no datamake-defined `ai_context`
+  key, no `vendor_name: DATAMAKE` payload. `vendor_name` is a closed enum
+  (`COMMON`, `SNOWFLAKE`, `SALESFORCE`, `DBT`, `DATABRICKS`, `GOODDATA`) in
+  Ossie 0.1.1 — `DATAMAKE` is valid Ossie only under `0.2.0.dev0`, which
+  makes it free-form.
 - A synonym outside `[A-Za-z0-9_.-]{1,64}` is kept in the document's prose
   but never addressable via `terms=` — `datamk sync` warns about it once.
 

@@ -823,7 +823,8 @@ pub fn run(
 
     // Sources are session-local TEMP VIEWs: visible to transforms, never committed
     // to the catalog.
-    let (advances, source_infos, warehouse_columns) = bind_sources(&cell, opts.full_refresh)?;
+    let (advances, source_infos, warehouse_columns) =
+        bind_sources(&cell, opts.full_refresh, false)?;
 
     // The shrink detector (ADR 0005 §2 item 2): truncation (`CREATE OR REPLACE
     // ... FROM <incremental view>`) is idempotent and invisible to
@@ -1750,6 +1751,7 @@ fn bind_source(
     gcs: Option<&ResolvedGcs>,
     scratch: &Path,
     full_refresh: bool,
+    schema_only: bool,
     classify_cache: &mut ClassifyCache,
     cell_name: &str,
 ) -> Result<BindOutcome> {
@@ -1932,6 +1934,11 @@ fn bind_source(
                     // string is `esc()` for delivery — no identifier
                     // rewriting, no predicate injection (§2).
                     let select = config.query_read_sql(&alias, query);
+                    let select = if schema_only {
+                        schema_only_probe(&select)
+                    } else {
+                        select
+                    };
                     let temp_table = format!("__jobs_{idx}");
                     let staging_uri = config.staging_uri();
                     let staged_rows = match conn
@@ -2065,6 +2072,11 @@ fn bind_source(
                                     config.read_sql(&alias, table, &meta, None).with_context(
                                         || format!("binding connection source '{name}' -> {table}"),
                                     )?;
+                                let select = if schema_only {
+                                    schema_only_probe(&select)
+                                } else {
+                                    select
+                                };
                                 let temp_table = format!("__jobs_{idx}");
                                 let staging_uri = config.staging_uri();
                                 let staged_rows = match conn.execute_batch(&format!(
@@ -2202,7 +2214,17 @@ pub(crate) type BindResult = (
 /// cell, `query:`-shaped, or a connector with no classification job) are
 /// simply absent from the map — `verify::check` falls through to DuckDB's
 /// `DESCRIBE` for those, correctly, not as a lesser fallback.
-pub(crate) fn bind_sources(cell: &Cell, full_refresh: bool) -> Result<BindResult> {
+///
+/// `schema_only` (follow-up 2, `datamk verify --semantic-only`): every
+/// non-incremental view-backed source is bound via `schema_only_probe`
+/// instead of a real stage — see that function's doc comment. `false` (the
+/// default for `run` and every other `verify` path) is byte-identical to
+/// the pre-follow-up-2 behavior.
+pub(crate) fn bind_sources(
+    cell: &Cell,
+    full_refresh: bool,
+    schema_only: bool,
+) -> Result<BindResult> {
     connectors::prepare(&cell.sources, &cell.dir)?;
     // View-backed connection sources (BigQuery views/materialized
     // views/external tables): classification is batched at most once per
@@ -2223,6 +2245,7 @@ pub(crate) fn bind_sources(cell: &Cell, full_refresh: bool) -> Result<BindResult
             cell.gcs.as_ref(),
             &cell.scratch,
             full_refresh,
+            schema_only,
             &mut classify_cache,
             &cell.def.cell,
         )?;
@@ -2235,6 +2258,22 @@ pub(crate) fn bind_sources(cell: &Cell, full_refresh: bool) -> Result<BindResult
         source_infos.push(outcome.info);
     }
     Ok((advances, source_infos, warehouse_columns))
+}
+
+/// `datamk verify --semantic-only`'s cost cut (follow-up 2): the identical
+/// jobs-API `select` a normal bind would stage, wrapped so the connector
+/// returns a correctly-typed *empty* result instead of the view's actual
+/// rows — zero rows can never trip `config.is_response_too_large`, so the
+/// `EXPORT DATA` escalation this function exists to let a caller skip never
+/// fires. Column types still resolve correctly (the connector still plans
+/// and binds the query; it just returns nothing), which is all a plan-time
+/// `DESCRIBE` (ADR 0018 §6) needs — `--semantic-only` never reads
+/// `warehouse_columns`/the declared-schema or grain checks that would need
+/// real rows. Not applied to an incremental source (`stage_incremental`) or
+/// an already-cheap `ObjectKind::Table` view — both are out of scope for
+/// this cut; see `bind_source`'s two call sites.
+fn schema_only_probe(select: &str) -> String {
+    format!("SELECT * FROM ({select}) AS __datamk_schema_only LIMIT 0")
 }
 
 /// The classification-denied fallback's safety net: probe the real table
@@ -4459,6 +4498,7 @@ mod tests {
             None,
             &scratch,
             false,
+            false,
             &mut cache,
             "orders",
         )
@@ -4536,6 +4576,7 @@ mod tests {
             None,
             None,
             &scratch,
+            false,
             false,
             &mut cache,
             "orders",
@@ -5901,11 +5942,25 @@ mod tests {
             .query_row("SELECT count(*) FROM bootstrapped", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "bootstrap must create an empty table");
+
+        // The bound is relative, not wall-clock: a loaded CI box once took
+        // 573ms for the LIMIT 0 path against a fixed 500ms cap while the
+        // full evaluation of the same relation would have taken several
+        // times longer still. What the gate actually claims is the *ratio*
+        // — short-circuit versus full evaluation — so measure the full
+        // materialization in the same session and require the bootstrap to
+        // be well inside it (locally ~9x; 3x leaves room for a noisy box
+        // while a regression to full evaluation reads ~1x and fails).
+        let started = Instant::now();
+        conn.execute_batch("CREATE TABLE full_copy AS SELECT * FROM stg;")
+            .expect("full materialization of the staged relation");
+        let full = started.elapsed();
         assert!(
-            elapsed < Duration::from_millis(500),
-            "bootstrap took {elapsed:?} against a 10M-row staged relation — gate 3 expects this \
-             to short-circuit LIMIT 0, not evaluate; a planner regression may have reintroduced \
-             full evaluation on every declarative bootstrap"
+            elapsed * 3 < full,
+            "bootstrap took {elapsed:?} against a 10M-row staged relation whose full \
+             materialization took {full:?} — gate 3 expects LIMIT 0 to short-circuit, not \
+             evaluate; a planner regression may have reintroduced full evaluation on every \
+             declarative bootstrap"
         );
     }
 

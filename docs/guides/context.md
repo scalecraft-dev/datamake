@@ -105,7 +105,7 @@ definitions:                                       # or: definitions: definition
 | `unit` | Token, ≤16 chars, no whitespace. |
 | `docs` | One relative path per level. ≤64 KiB per page, ≤256 KiB per cell. Empty, non-UTF-8, or oversized is a parse error. No `/docs/:name` route. |
 | `definitions` | Inline list or one file path. Lookup by term or alias, case-insensitive, exact only. |
-| `terms=` | Narrows `definitions[]` and `docs[]` to those terms' pages. Served: unknown term is 200 with `missing_terms`. `datamk context --terms`: unknown term exits non-zero. |
+| `terms=` | Narrows `definitions[]` and `docs[]` to those terms' pages. Served: unknown term is 200 with `missing_terms`. `datamk context --terms`: unknown term exits non-zero, naming the known-term count and up to 8 nearest matches (prefix, then substring, then same-first-3-characters) — never the whole vocabulary. `--model` naming an unknown model gets the same treatment. |
 
 ## Semantic models (Apache Ossie)
 

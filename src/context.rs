@@ -1388,6 +1388,69 @@ pub(crate) fn is_addressable_token(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+/// Up to 8 entries of `known` nearest to `token` (case-insensitive, ASCII):
+/// prefix matches first, then substring matches, then same-first-3-
+/// characters matches, each tier only filling what the previous didn't —
+/// never fuzzy-scored. `emit`'s unknown-term/unknown-model errors use this
+/// so a typo against a several-hundred-term vocabulary doesn't get answered
+/// with the whole vocabulary (follow-up 5).
+const NEAREST_LIMIT: usize = 8;
+
+fn nearest_matches(token: &str, known: &[&str]) -> Vec<String> {
+    let needle = token.to_ascii_lowercase();
+    let needle_prefix3: String = needle.chars().take(3).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let push = |s: &str, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+        if seen.insert(s.to_ascii_lowercase()) {
+            out.push(s.to_string());
+        }
+    };
+    for &k in known {
+        if out.len() >= NEAREST_LIMIT {
+            break;
+        }
+        if k.to_ascii_lowercase().starts_with(&needle) {
+            push(k, &mut out, &mut seen);
+        }
+    }
+    if out.len() < NEAREST_LIMIT {
+        for &k in known {
+            if out.len() >= NEAREST_LIMIT {
+                break;
+            }
+            if k.to_ascii_lowercase().contains(&needle) {
+                push(k, &mut out, &mut seen);
+            }
+        }
+    }
+    if out.len() < NEAREST_LIMIT && needle_prefix3.chars().count() == 3 {
+        for &k in known {
+            if out.len() >= NEAREST_LIMIT {
+                break;
+            }
+            let kl = k.to_ascii_lowercase();
+            let kprefix: String = kl.chars().take(3).collect();
+            if kprefix == needle_prefix3 {
+                push(k, &mut out, &mut seen);
+            }
+        }
+    }
+    out
+}
+
+/// `token`, annotated with its nearest known matches when there are any —
+/// `"token (nearest: a, b, c)"` or bare `"token"` when nothing is close.
+fn annotate_with_nearest(token: &str, known: &[&str]) -> String {
+    let near = nearest_matches(token, known);
+    if near.is_empty() {
+        token.to_string()
+    } else {
+        format!("{token} (nearest: {})", near.join(", "))
+    }
+}
+
 /// Every addressable Ossie name/synonym across the whole bound semantic
 /// model (ADR 0018 §7, M6/M8), indexed once: dataset and field
 /// names/synonyms point at their dataset; metric names/synonyms point at
@@ -2789,14 +2852,14 @@ pub fn build_document_for(
                 known.extend(d.aliases.iter().map(String::as_str));
             }
             known.extend(doc.semantic_lookup.iter().map(|e| e.token.as_str()));
+            let annotated: Vec<String> = missing
+                .iter()
+                .map(|t| annotate_with_nearest(t, &known))
+                .collect();
             anyhow::bail!(
-                "unknown term(s): {} — known terms: {}",
-                missing.join(", "),
-                if known.is_empty() {
-                    "none".to_string()
-                } else {
-                    known.join(", ")
-                }
+                "unknown term(s): {} — {} known term(s)",
+                annotated.join("; "),
+                known.len()
             );
         }
     }
@@ -2818,17 +2881,15 @@ pub fn build_document_for(
             .as_ref()
             .is_some_and(|idx| doc.with_semantic_model(idx, name, semantic_check.as_ref()));
         if !found {
+            let known: Vec<&str> = doc
+                .semantic_models
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect();
             anyhow::bail!(
-                "no semantic model '{name}' — known models: {}",
-                if doc.semantic_models.is_empty() {
-                    "none".to_string()
-                } else {
-                    doc.semantic_models
-                        .iter()
-                        .map(|m| m.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
+                "no semantic model '{}' — {} known model(s)",
+                annotate_with_nearest(name, &known),
+                known.len()
             );
         }
     }
@@ -3985,7 +4046,7 @@ interface:
     fn context_embeds_source_check_and_reports_verified_at_source_after_a_passing_live_verify() {
         let dir = all_bound_cell_dir("fresh");
         let file = dir.join("cell.yaml");
-        crate::verify::run(&file, "local").expect("live-verify the all-never cell");
+        crate::verify::run(&file, "local", false).expect("live-verify the all-never cell");
         assert!(
             dir.join(".cell/source_check.json").is_file(),
             "verify must have written the source-check record"
@@ -4083,7 +4144,7 @@ interface:
     fn source_check_carries_the_grain_measurement_through_to_the_document() {
         let dir = all_bound_cell_dir("measurements");
         let file = dir.join("cell.yaml");
-        crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
+        crate::verify::run(&file, "local", false).expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
         emit(&file, "local", Some(&out), false, None, None, None)
@@ -4114,7 +4175,7 @@ interface:
         // along as if it still applied.
         let dir = all_bound_cell_dir("stale");
         let file = dir.join("cell.yaml");
-        crate::verify::run(&file, "local").expect("live-verify the all-never cell");
+        crate::verify::run(&file, "local", false).expect("live-verify the all-never cell");
         assert!(dir.join(".cell/source_check.json").is_file());
 
         // Edit cell.yaml after the check ran — the record's digest no
@@ -4592,7 +4653,7 @@ interface:
              \x20 raw: ./data.csv\n",
         )
         .unwrap();
-        crate::verify::run(&file, "local").expect("live-verify the all-bound cell");
+        crate::verify::run(&file, "local", false).expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
         emit(&file, "local", Some(&out), false, None, None, None)
@@ -5482,7 +5543,7 @@ interface:
         )
         .unwrap();
         let file = dir.join("cell.yaml");
-        crate::catalog::sync(&file, "local", false).expect("datamk sync (Ossie half)");
+        crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
 
         // The source changes after the sync — `datamk context` re-walks the
         // `dir:` source (never `serve`) and notes the drift without
@@ -5517,10 +5578,11 @@ interface:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ADR 0018 §7: `--model` naming an unknown model exits non-zero naming
-    /// the models that exist — the `--terms` precedent.
+    /// ADR 0018 §7, follow-up 5: `--model` naming an unknown model exits
+    /// non-zero with the known-model count and, when one is close, its
+    /// nearest match(es) — never the whole vocabulary.
     #[test]
-    fn unknown_model_is_an_error_naming_the_known_ones() {
+    fn unknown_model_is_an_error_naming_the_count_and_nearest_match() {
         let dir = semantic_context_dir("cli-unknown-model");
         std::fs::create_dir_all(dir.join("osi")).unwrap();
         std::fs::write(
@@ -5539,13 +5601,61 @@ interface:
         )
         .unwrap();
         let file = dir.join("cell.yaml");
-        crate::catalog::sync(&file, "local", false).expect("datamk sync (Ossie half)");
+        crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
 
         let err = build_document_for(&file, "local", true, None, None, Some("nope"))
             .expect_err("an unknown model must fail");
         let msg = err.to_string();
         assert!(msg.contains("no semantic model 'nope'"), "{msg}");
-        assert!(msg.contains("invoice"), "{msg}");
+        assert!(msg.contains("1 known model(s)"), "{msg}");
+
+        // A near-miss (a prefix of the real name) is offered as the nearest
+        // match, not the whole vocabulary.
+        let err = build_document_for(&file, "local", true, None, None, Some("invoi"))
+            .expect_err("an unknown model must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("nearest: invoice"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Follow-up 5: `datamk context --terms` on an unknown token exits
+    /// non-zero with the known-term count and up to 8 nearest matches, not
+    /// the whole vocabulary.
+    #[test]
+    fn unknown_term_is_an_error_naming_the_count_and_nearest_match() {
+        let dir = semantic_context_dir("cli-unknown-term");
+        std::fs::create_dir_all(dir.join("osi")).unwrap();
+        std::fs::write(
+            dir.join("osi/invoice.yaml"),
+            "version: 0.1.1\n\
+             semantic_model:\n\
+             \x20 - name: invoice\n\
+             \x20   datasets:\n\
+             \x20     - name: flight_spend\n\
+             \x20       source: flight_spend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: t\nsemantic_model:\n  dir: osi\n",
+        )
+        .unwrap();
+        let file = dir.join("cell.yaml");
+        crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
+
+        let err = build_document_for(
+            &file,
+            "local",
+            true,
+            None,
+            Some(&["flight_spen".to_string()]),
+            None,
+        )
+        .expect_err("an unknown term must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("known term(s)"), "{msg}");
+        assert!(msg.contains("nearest: flight_spend"), "{msg}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

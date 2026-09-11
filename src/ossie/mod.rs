@@ -209,9 +209,9 @@ pub struct Metric {
 }
 
 /// `custom_extensions[].data` is a JSON string, passed through
-/// byte-for-byte here — a later phase parses it for `vendor_name ==
-/// "DATAMAKE"` only (ADR 0018 §2 point 3); every other vendor's payload is
-/// opaque to datamake by design.
+/// byte-for-byte, uninterpreted, regardless of `vendor_name` (ADR 0018 §2
+/// point 3, "Refused": nothing datamake-specific lives inside an Ossie
+/// document) — opaque to datamake by design, for every vendor alike.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomExtension {
@@ -365,17 +365,7 @@ fn validate_shape(doc: &Document, file_label: &str) -> Result<()> {
                 m.name
             );
         }
-        validate_datamake_extension(
-            &m.custom_extensions,
-            file_label,
-            &format!("model '{}'", m.name),
-        )?;
         for ds in &m.datasets {
-            validate_datamake_extension(
-                &ds.custom_extensions,
-                file_label,
-                &format!("model '{}' dataset '{}'", m.name, ds.name),
-            )?;
             for f in &ds.fields {
                 if f.expression.dialects.is_empty() {
                     bail!(
@@ -386,14 +376,6 @@ fn validate_shape(doc: &Document, file_label: &str) -> Result<()> {
                         f.name
                     );
                 }
-                validate_datamake_extension(
-                    &f.custom_extensions,
-                    file_label,
-                    &format!(
-                        "model '{}' dataset '{}' field '{}'",
-                        m.name, ds.name, f.name
-                    ),
-                )?;
             }
         }
         for met in &m.metrics {
@@ -405,11 +387,6 @@ fn validate_shape(doc: &Document, file_label: &str) -> Result<()> {
                     met.name
                 );
             }
-            validate_datamake_extension(
-                &met.custom_extensions,
-                file_label,
-                &format!("model '{}' metric '{}'", m.name, met.name),
-            )?;
         }
         for r in &m.relationships {
             if r.from_columns.is_empty() || r.to_columns.is_empty() {
@@ -420,35 +397,6 @@ fn validate_shape(doc: &Document, file_label: &str) -> Result<()> {
                     r.name
                 );
             }
-            validate_datamake_extension(
-                &r.custom_extensions,
-                file_label,
-                &format!("model '{}' relationship '{}'", m.name, r.name),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// ADR 0018 §2 point 3: `custom_extensions[].data` is a JSON string,
-/// parsed at ingest only for `vendor_name == "DATAMAKE"` — invalid JSON
-/// there is a hard error naming the file and location. Every other
-/// vendor's `data` is opaque to datamake by design and passed through
-/// byte-for-byte, unparsed, regardless of its shape.
-fn validate_datamake_extension(
-    extensions: &[CustomExtension],
-    file_label: &str,
-    location: &str,
-) -> Result<()> {
-    for ext in extensions {
-        if ext.vendor_name != "DATAMAKE" {
-            continue;
-        }
-        if let Err(e) = serde_json::from_str::<serde_json::Value>(&ext.data) {
-            bail!(
-                "{file_label}: {location}: `custom_extensions[].data` for vendor_name \
-                 'DATAMAKE' is not valid JSON — {e}."
-            );
         }
     }
     Ok(())
@@ -588,43 +536,19 @@ semantic_model:
         assert!(err.to_string().contains("expression.dialects"));
     }
 
-    // --- L2: `custom_extensions[].data` for vendor_name == DATAMAKE --------
+    // --- `custom_extensions[].data`: opaque to datamake, every vendor -------
 
     #[test]
-    fn datamake_custom_extension_with_valid_json_parses() {
-        let text = "version: 0.1.1\nsemantic_model:\n  - name: m\n    datasets:\n      - name: d\n        source: s\n        custom_extensions:\n          - vendor_name: DATAMAKE\n            data: '{\"a\": 1}'\n";
-        let doc = Document::parse_str(text, "f.yaml").unwrap();
-        assert_eq!(
-            doc.semantic_model[0].datasets[0].custom_extensions[0].data,
-            "{\"a\": 1}"
-        );
-    }
-
-    #[test]
-    fn datamake_custom_extension_with_invalid_json_is_a_hard_error() {
-        let text = "version: 0.1.1\nsemantic_model:\n  - name: m\n    datasets:\n      - name: d\n        source: s\n        custom_extensions:\n          - vendor_name: DATAMAKE\n            data: 'not json'\n";
-        let err = Document::parse_str(text, "f.yaml").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("DATAMAKE"), "{msg}");
-        assert!(msg.contains("not valid JSON"), "{msg}");
-        assert!(msg.contains("dataset 'd'"), "{msg}");
-    }
-
-    #[test]
-    fn other_vendor_custom_extension_is_passed_through_unparsed() {
-        // Not JSON at all — must not error, because it isn't DATAMAKE's.
+    fn custom_extension_data_is_passed_through_unparsed_regardless_of_vendor() {
+        // Not JSON at all, and not datamake's concern either way — every
+        // vendor's payload rides through byte for byte, uninterpreted (ADR
+        // 0018 §2 point 3, "Refused": nothing datamake-specific lives
+        // inside an Ossie document).
         let text = "version: 0.1.1\nsemantic_model:\n  - name: m\n    datasets:\n      - name: d\n        source: s\n        custom_extensions:\n          - vendor_name: ACME\n            data: 'definitely not json {{{'\n";
         let doc = Document::parse_str(text, "f.yaml").unwrap();
         assert_eq!(
             doc.semantic_model[0].datasets[0].custom_extensions[0].data,
             "definitely not json {{{"
         );
-    }
-
-    #[test]
-    fn datamake_custom_extension_on_a_metric_is_validated() {
-        let text = "version: 0.1.1\nsemantic_model:\n  - name: m\n    datasets:\n      - name: d\n        source: s\n    metrics:\n      - name: total\n        expression:\n          dialects:\n            - dialect: ANSI_SQL\n              expression: SUM(d.x)\n        custom_extensions:\n          - vendor_name: DATAMAKE\n            data: 'oops'\n";
-        let err = Document::parse_str(text, "f.yaml").unwrap_err();
-        assert!(err.to_string().contains("metric 'total'"), "{err}");
     }
 }

@@ -45,6 +45,45 @@ The golden context fixture (`test/fixtures/context_v4_golden.json`) gained
 empty on a cell with no `semantic_model:` — a deliberate, additive
 re-baseline; every other new field is omitted when absent.
 
+### Added: Ossie ingest follow-ups from a 46-dataset SQLMesh estate (ADR 0018)
+
+- A `DESCRIBE` failure whose message names a missing scalar/aggregate/macro
+  (e.g. BigQuery's `HLL_COUNT.MERGE`, authored under `ANSI_SQL` because OSI
+  0.1.1's dialect enum has no `BIGQUERY`) is recorded `reason: "function"`
+  / `unverified:function` and warned — not a hard error. A bad column is
+  still one.
+- `datamk verify --semantic-only` runs only the Ossie checks and writes
+  only `.cell/semantic_check.json`, skipping the declared-schema/grain
+  checks, the census, and `.cell/source_check.json`/
+  `.cell/source_descriptions.json` entirely. It still binds every declared
+  source a dataset might bind to, but via a schema-only probe (a zero-row
+  read) rather than staging the whole view — the cut that turned a
+  41-export estate's ~15-minute live-verify bind pass into a plan-time-only
+  one. Refused on a cell with no `semantic_model:`.
+- A false semantic claim no longer aborts the rest of the check: every
+  dataset, relationship, and metric in the pass is still attempted, the
+  printed summary block shows every failure `✗`-marked (never just the
+  first one a bind pass happened to reach), and `verify` then fails naming
+  every failure it found. New vocabulary: `reason: "error"` (fields),
+  `primary_key: "error"`, and `"error"` as a relationship/metric status.
+- `datamk sync` reuses `.cell/semantic_model.json` with no network access
+  when `semantic_model.git.ref` is a pinned 40-hex sha already recorded
+  from the identical source — the deploy pod has no git credentials; CI
+  produces the pinned snapshot with the runner's own creds at build time.
+  `datamk sync --refetch` forces the clone regardless.
+- `datamk context --terms`/`--model` on an unknown token now prints the
+  known-vocabulary count and up to 8 nearest matches (prefix, then
+  substring, then same-first-3-characters) instead of the whole
+  (sometimes several-hundred-term) vocabulary.
+- `custom_extensions[].data` is no longer parsed for any vendor, including
+  `DATAMAKE` — it rides through byte-for-byte, uninterpreted, for every
+  vendor alike. Nothing datamake-specific lives inside an Ossie document
+  (ADR 0018, "Refused"); docs updated everywhere accordingly, and
+  `vendor_name` is a closed enum with no `DATAMAKE` member under `0.1.1`
+  (`0.2.0.dev0` makes it free-form) regardless.
+
+See [docs/guides/semantic-model.md](docs/guides/semantic-model.md).
+
 ### Added: the column census on bound exports, and prose the data contradicts
 
 `verify` now measures every declared column of a bound export (`bind:`,

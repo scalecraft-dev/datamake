@@ -109,10 +109,16 @@ pub struct SemanticCheckRecord {
     /// unbound datasets alike (ADR 0018 §5: an unbound dataset is kept,
     /// never dropped; a dataset bound to two routes gets two entries).
     pub datasets: BTreeMap<String, DatasetCheck>,
-    /// "model/relationship name" -> `"verified"` or `"unbound"`.
+    /// "model/relationship name" -> `"verified"`, `"unbound"`, or `"error"`
+    /// (a genuinely bad `from_columns`/`to_columns` claim, follow-up 8 —
+    /// recorded, not bailed out on).
     pub relationships: BTreeMap<String, String>,
-    /// "model/metric name" -> `"verified"`, `"unverified:dialect"`, or
-    /// `"unverified:unbound"`.
+    /// "model/metric name" -> `"verified"`, `"unverified:dialect"`,
+    /// `"unverified:unbound"`, `"unverified:ambiguous"`,
+    /// `"unverified:function"` (DuckDB has no such scalar/aggregate/macro —
+    /// a foreign-dialect callable authored under `ANSI_SQL`), or `"error"`
+    /// (DuckDB genuinely rejected the expression, follow-up 8 — recorded,
+    /// not bailed out on).
     pub metrics: BTreeMap<String, String>,
 }
 
@@ -165,6 +171,13 @@ impl SemanticCheckRecord {
     }
 }
 
+/// Whether `s` is a 40-hex git commit sha — a pinned `ref:`, never a moving
+/// branch/tag. Shared by `check_release_pinned` and `catalog::sync_semantic`'s
+/// pinned-snapshot reuse (follow-up 4).
+pub fn is_pinned_sha(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// ADR 0018 §3: `datamk release` and `datamk deploy` refuse a
 /// `semantic_model.git` source whose `ref:` is not a 40-hex commit sha
 /// matching the record's resolved commit — a moving branch (or an unset
@@ -187,7 +200,6 @@ pub fn check_release_pinned(dir: &Path, file: &Path, def: &crate::config::CellDe
              synced from a git source; run `datamk sync` again."
         );
     };
-    let is_pinned_sha = |s: &str| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
     let ref_display = r#ref.as_deref().unwrap_or("(unset, defaults to HEAD)");
     match r#ref.as_deref() {
         Some(r) if is_pinned_sha(r) && r == commit => Ok(()),

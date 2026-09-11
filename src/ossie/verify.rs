@@ -32,7 +32,10 @@ pub struct DatasetCheck {
     /// `None` for a dataset ADR 0018 §5 kept but bound to nothing.
     pub route: Option<String>,
     /// `"matches"` | `"no_grain"` | `"absent"` for a bound dataset;
-    /// `"unbound"` when `route` is `None` — nothing was compared.
+    /// `"unbound"` when `route` is `None` — nothing was compared; `"error"`
+    /// when `primary_key` genuinely disagrees with the export's grain (the
+    /// message rides in `check_export`'s `errors` accumulator, follow-up 8
+    /// — the failing claim, never a bailed-out call).
     pub primary_key: String,
     pub fields: BTreeMap<String, FieldCheck>,
 }
@@ -51,6 +54,14 @@ pub fn dataset_key(model: &str, dataset: &str, route: Option<&str>) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldCheck {
     pub verified: bool,
+    /// `"dialect"` (no `ANSI_SQL` variant), `"function"` (`DESCRIBE`
+    /// rejected the expression because DuckDB has no such scalar/aggregate/
+    /// macro — a foreign-dialect callable authored under `ANSI_SQL`, e.g.
+    /// BigQuery's `HLL_COUNT.MERGE`), or `"error"` (a genuine hard-failing
+    /// claim: a bad column, or DuckDB rejected the expression for any other
+    /// reason — follow-up 8: recorded, not bailed out on, so the rest of
+    /// this dataset/export is still checked; the message rides in
+    /// `check_export`'s `errors` accumulator).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -87,6 +98,21 @@ fn describe_plan(conn: &Connection, sql: &str) -> std::result::Result<(), duckdb
 
 const NOTHING_EXECUTED: &str =
     "Nothing was executed: this is a plan-time check, no rows were read.";
+
+/// Whether a `describe_plan` failure names a missing function rather than a
+/// bad column (follow-up 1: a 46-dataset SQLMesh estate's real trigger,
+/// `HLL_COUNT.MERGE(x)` — a BigQuery-native aggregate authored under
+/// `ANSI_SQL` because OSI 0.1.1's dialect enum has no `BIGQUERY`). DuckDB's
+/// catalog error names the callable's kind ("Scalar Function", "Aggregate
+/// Function", "Macro") followed by "with name ... does not exist"; matched
+/// loosely (contains both "function" and "does not exist", ASCII
+/// case-insensitive) rather than against one exact wording, since the kind
+/// prefix varies. A missing *column* says "does not have a column named" and
+/// never matches this — it stays a hard error.
+fn is_missing_function_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("function") && lower.contains("does not exist")
+}
 
 /// H2: what `assert_scalar_or_aggregate_shape` refuses — a foreign
 /// expression interpolated raw into `DESCRIBE SELECT <expr> FROM …` binds
@@ -225,12 +251,25 @@ pub fn referenced_datasets<'a>(model: &'a SemanticModel, expr: &str) -> Vec<&'a 
 /// checked against `export`. `source` is the same string `verify::check`
 /// already passed to `describe` for this export — the live view for a
 /// bound export, the lake table for a materialized one.
+///
+/// Follow-up 8: a false claim about one field or one dataset's
+/// `primary_key` no longer aborts the rest of this call — it's recorded
+/// `verified: false, reason: "error"` (fields) or `primary_key: "error"`
+/// (the dataset), its message pushed onto `errors`, and every remaining
+/// field/dataset is still checked. `errors` non-empty is still a failing
+/// `datamk verify`; the caller (`verify::check_semantic`) aggregates every
+/// entry into one error after every dataset/relationship/metric has been
+/// attempted, so a 15-minute bind pass's results are never thrown away by
+/// the first bad claim. The H2 shape gate (`assert_scalar_or_aggregate_shape`)
+/// is the one exception: a refused expression shape is a security refusal,
+/// not a data-truth claim, and still aborts immediately via `Result::Err`.
 pub fn check_export(
     conn: &Connection,
     export: &Export,
     route: &str,
     source: &str,
     index: &SemanticIndex,
+    errors: &mut Vec<(String, String)>,
 ) -> Result<Vec<DatasetCheck>> {
     let mut out = Vec::new();
     for (model_name, ds) in index.datasets_for_route(route) {
@@ -253,18 +292,29 @@ pub fn check_export(
             if let Some(ident) = bare_identifier(expr) {
                 if !export.schema.keys().any(|c| c.eq_ignore_ascii_case(&ident)) {
                     let declared: Vec<&str> = export.schema.keys().map(String::as_str).collect();
-                    bail!(
-                        "model '{model_name}' dataset '{}' field '{}': identity expression \
-                         '{expr}' is not a declared column of export '{route}' — declared \
-                         columns: {}",
-                        ds.name,
-                        field.name,
-                        if declared.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            declared.join(", ")
-                        }
+                    errors.push((
+                        format!("{model_name}/{}", ds.name),
+                        format!(
+                            "model '{model_name}' dataset '{}' field '{}': identity expression \
+                             '{expr}' is not a declared column of export '{route}' — declared \
+                             columns: {}",
+                            ds.name,
+                            field.name,
+                            if declared.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                declared.join(", ")
+                            }
+                        ),
+                    ));
+                    fields.insert(
+                        field.name.clone(),
+                        FieldCheck {
+                            verified: false,
+                            reason: Some("error".to_string()),
+                        },
                     );
+                    continue;
                 }
             } else {
                 if let Err(e) = assert_scalar_or_aggregate_shape(expr) {
@@ -276,12 +326,43 @@ pub fn check_export(
                 }
                 let sql = format!("DESCRIBE SELECT {expr} FROM {source}");
                 if let Err(e) = describe_plan(conn, &sql) {
-                    bail!(
-                        "model '{model_name}' dataset '{}' field '{}': DuckDB rejected `{expr}` \
-                         — {e}. {NOTHING_EXECUTED}",
-                        ds.name,
-                        field.name
+                    if is_missing_function_error(&e.to_string()) {
+                        tracing::warn!(
+                            model = %model_name,
+                            dataset = %ds.name,
+                            field = %field.name,
+                            expression = %expr,
+                            error = %e,
+                            "DuckDB has no such function — recorded unverified:function, not a \
+                             hard error (a foreign-dialect scalar/aggregate/macro authored under \
+                             ANSI_SQL, e.g. HLL_COUNT.MERGE under BigQuery; a bad column stays a \
+                             hard error)"
+                        );
+                        fields.insert(
+                            field.name.clone(),
+                            FieldCheck {
+                                verified: false,
+                                reason: Some("function".to_string()),
+                            },
+                        );
+                        continue;
+                    }
+                    errors.push((
+                        format!("{model_name}/{}", ds.name),
+                        format!(
+                            "model '{model_name}' dataset '{}' field '{}': DuckDB rejected \
+                             `{expr}` — {e}. {NOTHING_EXECUTED}",
+                            ds.name, field.name
+                        ),
+                    ));
+                    fields.insert(
+                        field.name.clone(),
+                        FieldCheck {
+                            verified: false,
+                            reason: Some("error".to_string()),
+                        },
                     );
+                    continue;
                 }
             }
             fields.insert(
@@ -322,14 +403,16 @@ pub fn check_export(
             if pk == grain {
                 "matches".to_string()
             } else {
-                bail!(
-                    "model '{model_name}' dataset '{}': primary_key {:?} does not match export \
-                     '{route}'s grain {:?} — the grain is the contract (uniqueness-checked \
-                     every run); primary_key must restate it exactly",
-                    ds.name,
-                    ds.primary_key,
-                    export.grain
-                );
+                errors.push((
+                    format!("{model_name}/{}", ds.name),
+                    format!(
+                        "model '{model_name}' dataset '{}': primary_key {:?} does not match \
+                         export '{route}'s grain {:?} — the grain is the contract \
+                         (uniqueness-checked every run); primary_key must restate it exactly",
+                        ds.name, ds.primary_key, export.grain
+                    ),
+                ));
+                "error".to_string()
             }
         };
 
@@ -355,10 +438,16 @@ fn export_by_route<'a>(def: &'a CellDef, route: &str) -> Option<&'a Export> {
 /// cell is `"unbound"`, never an error — an Ossie relationship spanning a
 /// dataset this cell doesn't export is exactly ADR 0018 §5's "the same
 /// `osi/` serves every cell cut from one repo."
+///
+/// Follow-up 8: a bad `from_columns`/`to_columns` claim is recorded
+/// `"error"` and pushed onto `errors` rather than aborting the call — every
+/// remaining relationship is still checked (see `check_export`'s doc
+/// comment for why).
 pub fn check_relationships(
     model: &SemanticModel,
     index: &SemanticIndex,
     def: &CellDef,
+    errors: &mut Vec<(String, String)>,
 ) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for rel in &model.relationships {
@@ -373,17 +462,20 @@ pub fn check_relationships(
             continue;
         };
         if rel.from_columns.len() != rel.to_columns.len() {
-            bail!(
-                "model '{}' relationship '{}': from_columns {:?} and to_columns {:?} have \
-                 different lengths.",
-                model.name,
-                rel.name,
-                rel.from_columns,
-                rel.to_columns
-            );
+            errors.push((
+                format!("{}/{}", model.name, rel.name),
+                format!(
+                    "model '{}' relationship '{}': from_columns {:?} and to_columns {:?} have \
+                     different lengths.",
+                    model.name, rel.name, rel.from_columns, rel.to_columns
+                ),
+            ));
+            out.insert(rel.name.clone(), "error".to_string());
+            continue;
         }
         let from_export = export_by_route(def, &from_route);
         let to_export = export_by_route(def, &to_route);
+        let mut bad = false;
         for (side, ds, cols, export) in [
             ("from", from_ds, &rel.from_columns, from_export),
             ("to", to_ds, &rel.to_columns, to_export),
@@ -393,18 +485,27 @@ pub fn check_relationships(
                 let is_column =
                     export.is_some_and(|e| e.schema.keys().any(|k| k.eq_ignore_ascii_case(c)));
                 if !is_field && !is_column {
-                    bail!(
-                        "model '{}' relationship '{}': {side}_columns names '{c}', which is \
-                         neither a field of dataset '{}' nor a declared column of the export \
-                         it's bound to.",
-                        model.name,
-                        rel.name,
-                        ds.name
-                    );
+                    errors.push((
+                        format!("{}/{}", model.name, rel.name),
+                        format!(
+                            "model '{}' relationship '{}': {side}_columns names '{c}', which is \
+                             neither a field of dataset '{}' nor a declared column of the export \
+                             it's bound to.",
+                            model.name, rel.name, ds.name
+                        ),
+                    ));
+                    bad = true;
                 }
             }
         }
-        out.insert(rel.name.clone(), "verified".to_string());
+        out.insert(
+            rel.name.clone(),
+            if bad {
+                "error".to_string()
+            } else {
+                "verified".to_string()
+            },
+        );
     }
     Ok(out)
 }
@@ -424,11 +525,18 @@ pub fn check_relationships(
 /// `run`-failing error. No join is synthesized (ADR 0018, "Refused") — the
 /// cross product (when there is one) is there so identifiers resolve, not
 /// so the query means anything if it were ever run, which it never is.
+///
+/// Follow-up 8: a metric DuckDB genuinely rejects is recorded `"error"` and
+/// pushed onto `errors` rather than aborting the call — every remaining
+/// metric of this model is still checked (the scenario a 46-dataset
+/// SQLMesh estate hit: two bad metrics in one model, the second never even
+/// attempted under the old bail-on-first behavior).
 pub fn check_metrics(
     conn: &Connection,
     model: &SemanticModel,
     index: &SemanticIndex,
     def: &CellDef,
+    errors: &mut Vec<(String, String)>,
 ) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for metric in &model.metrics {
@@ -516,12 +624,27 @@ pub fn check_metrics(
                 );
                 out.insert(metric.name.clone(), "unverified:ambiguous".to_string());
             }
-            Err(e) => {
-                bail!(
-                    "model '{}' metric '{}': DuckDB rejected `{expr}` — {e}. {NOTHING_EXECUTED}",
-                    model.name,
-                    metric.name
+            Err(e) if is_missing_function_error(&e.to_string()) => {
+                tracing::warn!(
+                    model = %model.name,
+                    metric = %metric.name,
+                    error = %e,
+                    "DuckDB has no such function — recorded unverified:function, not a hard \
+                     error (a foreign-dialect scalar/aggregate/macro authored under ANSI_SQL, \
+                     e.g. HLL_COUNT.MERGE under BigQuery)"
                 );
+                out.insert(metric.name.clone(), "unverified:function".to_string());
+            }
+            Err(e) => {
+                errors.push((
+                    format!("{}/{}", model.name, metric.name),
+                    format!(
+                        "model '{}' metric '{}': DuckDB rejected `{expr}` — {e}. \
+                         {NOTHING_EXECUTED}",
+                        model.name, metric.name
+                    ),
+                ));
+                out.insert(metric.name.clone(), "error".to_string());
             }
         }
     }
@@ -705,13 +828,14 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
         assert_eq!(checks.len(), 1);
         assert!(checks[0].fields["id"].verified);
     }
 
     #[test]
-    fn identity_field_missing_from_declared_columns_is_a_hard_error() {
+    fn identity_field_missing_from_declared_columns_is_recorded_error_not_a_bailed_out_call() {
         let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
         let ds = dataset("dsa", "dsa", &[], vec![field("nope", "nope")]);
         let idx = SemanticIndex::build(
@@ -719,11 +843,14 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not a declared column"), "{err}");
-        assert!(err.contains("id"), "{err}");
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
+        let fc = &checks[0].fields["nope"];
+        assert!(!fc.verified);
+        assert_eq!(fc.reason.as_deref(), Some("error"));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("not a declared column"), "{errors:?}");
+        assert!(errors[0].1.contains("id"), "{errors:?}");
     }
 
     #[test]
@@ -735,7 +862,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
         assert!(checks[0].fields["plus_one"].verified);
     }
 
@@ -748,10 +876,12 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Nothing was executed"), "{err}");
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
+        assert!(!checks[0].fields["bogus"].verified);
+        assert_eq!(checks[0].fields["bogus"].reason.as_deref(), Some("error"));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("Nothing was executed"), "{errors:?}");
     }
 
     #[test]
@@ -768,10 +898,49 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
         let fc = &checks[0].fields["snowflake_only"];
         assert!(!fc.verified);
         assert_eq!(fc.reason.as_deref(), Some("dialect"));
+    }
+
+    #[test]
+    fn computed_expression_calling_a_missing_function_is_recorded_unverified_function_not_a_hard_error(
+    ) {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
+        let ds = dataset(
+            "dsa",
+            "dsa",
+            &[],
+            vec![field("hll", "TOTALLY_MADE_UP_AGG_FUNC(id)")],
+        );
+        let idx = SemanticIndex::build(
+            record_with(vec![model("m", vec![ds], vec![], vec![])]),
+            &[export("dsa", "a_tbl", &["id"], &[])],
+        );
+        let exp = export("dsa", "a_tbl", &["id"], &[]);
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
+        let fc = &checks[0].fields["hll"];
+        assert!(!fc.verified);
+        assert_eq!(fc.reason.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn computed_expression_naming_a_missing_column_is_recorded_error_not_unverified_function() {
+        let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id;");
+        let ds = dataset("dsa", "dsa", &[], vec![field("bogus", "id + doesnotexist")]);
+        let idx = SemanticIndex::build(
+            record_with(vec![model("m", vec![ds], vec![], vec![])]),
+            &[export("dsa", "a_tbl", &["id"], &[])],
+        );
+        let exp = export("dsa", "a_tbl", &["id"], &[]);
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
+        assert_eq!(checks[0].fields["bogus"].reason.as_deref(), Some("error"));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("Nothing was executed"), "{errors:?}");
     }
 
     // --- primary_key ---------------------------------------------------------
@@ -785,12 +954,13 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &["id"])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &["id"]);
-        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
         assert_eq!(checks[0].primary_key, "matches");
     }
 
     #[test]
-    fn primary_key_differing_from_grain_is_a_hard_error() {
+    fn primary_key_differing_from_grain_is_recorded_error_not_a_bailed_out_call() {
         let conn = conn_with("CREATE TABLE a_tbl AS SELECT 1 AS id, 2 AS other;");
         let ds = dataset("dsa", "dsa", &["other"], vec![field("id", "id")]);
         let idx = SemanticIndex::build(
@@ -798,11 +968,15 @@ mod tests {
             &[export("dsa", "a_tbl", &["id", "other"], &["id"])],
         );
         let exp = export("dsa", "a_tbl", &["id", "other"], &["id"]);
-        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("does not match export"), "{err}");
-        assert!(err.contains("primary_key must restate it exactly"), "{err}");
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
+        assert_eq!(checks[0].primary_key, "error");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("does not match export"), "{errors:?}");
+        assert!(
+            errors[0].1.contains("primary_key must restate it exactly"),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -814,7 +988,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
         assert_eq!(checks[0].primary_key, "no_grain");
     }
 
@@ -827,7 +1002,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &["id"])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &["id"]);
-        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
         assert_eq!(checks[0].primary_key, "absent");
     }
 
@@ -865,7 +1041,8 @@ mod tests {
             vec![],
         );
         let idx = index_for(&def, &model);
-        let out = check_relationships(&model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_relationships(&model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["r"], "verified");
     }
 
@@ -878,21 +1055,23 @@ mod tests {
             .relationships
             .push(relationship("r", "dsa", "dsc", &["id"], &["id"]));
         let idx = index_for(&def, &model);
-        let out = check_relationships(&model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_relationships(&model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["r"], "unbound");
     }
 
     #[test]
-    fn relationship_naming_a_nonexistent_column_is_a_hard_error() {
+    fn relationship_naming_a_nonexistent_column_is_recorded_error_not_a_bailed_out_call() {
         let (_, def, model) = two_dataset_model(
             vec![relationship("r", "dsa", "dsb", &["nope"], &["id"])],
             vec![],
         );
         let idx = index_for(&def, &model);
-        let err = check_relationships(&model, &idx, &def)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("nope"), "{err}");
+        let mut errors = Vec::new();
+        let out = check_relationships(&model, &idx, &def, &mut errors).unwrap();
+        assert_eq!(out["r"], "error");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("nope"), "{errors:?}");
     }
 
     #[test]
@@ -902,7 +1081,8 @@ mod tests {
             vec![metric("total", "SUM(dsa.val) + SUM(dsb.other)")],
         );
         let idx = index_for(&def, &model);
-        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["total"], "verified");
     }
 
@@ -912,7 +1092,8 @@ mod tests {
         model.datasets.push(dataset("dsc", "dsc", &[], vec![]));
         model.metrics.push(metric("total", "SUM(dsc.whatever)"));
         let idx = index_for(&def, &model);
-        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["total"], "unverified:unbound");
     }
 
@@ -921,19 +1102,59 @@ mod tests {
         let (conn, def, mut model) = two_dataset_model(vec![], vec![]);
         model.metrics.push(dialect_only_metric("total"));
         let idx = index_for(&def, &model);
-        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["total"], "unverified:dialect");
     }
 
     #[test]
-    fn metric_duckdb_error_is_a_hard_error_naming_nothing_executed() {
+    fn metric_duckdb_error_is_recorded_error_not_a_bailed_out_call() {
         let (conn, def, mut model) = two_dataset_model(vec![], vec![]);
         model.metrics.push(metric("total", "SUM(dsa.nonexistent)"));
         let idx = index_for(&def, &model);
-        let err = check_metrics(&conn, &model, &idx, &def)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Nothing was executed"), "{err}");
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
+        assert_eq!(out["total"], "error");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("Nothing was executed"), "{errors:?}");
+    }
+
+    /// Follow-up 8: two metrics that both genuinely fail in the same model
+    /// are both attempted and both recorded — the old bail-on-first
+    /// behavior stopped after the first, so the estate scenario this
+    /// fixes never even saw the second metric's failure.
+    #[test]
+    fn two_failing_metrics_in_one_model_are_both_named_and_both_recorded() {
+        let (conn, def, mut model) = two_dataset_model(vec![], vec![]);
+        model.metrics.push(metric("first", "SUM(dsa.nonexistent)"));
+        model.metrics.push(metric("second", "SUM(dsb.alsomissing)"));
+        let idx = index_for(&def, &model);
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
+        assert_eq!(out["first"], "error");
+        assert_eq!(out["second"], "error");
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors.iter().any(|(label, _)| label == "m/first"),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|(label, _)| label == "m/second"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn metric_calling_a_missing_function_is_unverified_function_not_a_hard_error() {
+        let (conn, def, mut model) = two_dataset_model(vec![], vec![]);
+        model.metrics.push(metric(
+            "total",
+            "TOTALLY_MADE_UP_AGG_FUNC(dsa.val) + SUM(dsb.other)",
+        ));
+        let idx = index_for(&def, &model);
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
+        assert_eq!(out["total"], "unverified:function");
     }
 
     // --- H2: no subquery/table function reaches DESCRIBE -------------------
@@ -978,7 +1199,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+        let mut errors = Vec::new();
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1001,7 +1223,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+        let mut errors = Vec::new();
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1024,7 +1247,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+        let mut errors = Vec::new();
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1050,7 +1274,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx)
+        let mut errors = Vec::new();
+        let err = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1075,7 +1300,8 @@ mod tests {
             &[export("dsa", "a_tbl", &["id"], &[])],
         );
         let exp = export("dsa", "a_tbl", &["id"], &[]);
-        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx).unwrap();
+        let mut errors = Vec::new();
+        let checks = check_export(&conn, &exp, "dsa@1", "a_tbl", &idx, &mut errors).unwrap();
         assert!(checks[0].fields["plus_one"].verified);
     }
 
@@ -1087,7 +1313,8 @@ mod tests {
             "(SELECT count(*) FROM read_parquet('s3://bucket/x.parquet'))",
         ));
         let idx = index_for(&def, &model);
-        let err = check_metrics(&conn, &model, &idx, &def)
+        let mut errors = Vec::new();
+        let err = check_metrics(&conn, &model, &idx, &def, &mut errors)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1105,7 +1332,8 @@ mod tests {
         // none, and more than one dataset is bound.
         model.metrics.push(metric("total", "COUNT(*)"));
         let idx = index_for(&def, &model);
-        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["total"], "unverified:ambiguous");
     }
 
@@ -1118,7 +1346,8 @@ mod tests {
         let ds_a = dataset("dsa", "dsa", &["id"], vec![field("id", "id")]);
         let model = model("m", vec![ds_a], vec![], vec![metric("total", "SUM(val)")]);
         let idx = index_for(&def, &model);
-        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["total"], "verified");
     }
 
@@ -1144,7 +1373,8 @@ mod tests {
             vec![metric("total", "SUM(dsa.id) + SUM(dsb.id) + SUM(amount)")],
         );
         let idx = index_for(&def, &model);
-        let out = check_metrics(&conn, &model, &idx, &def).unwrap();
+        let mut errors = Vec::new();
+        let out = check_metrics(&conn, &model, &idx, &def, &mut errors).unwrap();
         assert_eq!(out["total"], "unverified:ambiguous");
     }
 }

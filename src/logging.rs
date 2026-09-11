@@ -363,9 +363,10 @@ mod tests {
             file: "cell.yaml".into(),
             profile: "local".into(),
         });
-        let verify = Command::Verify(FileArgs {
+        let verify = Command::Verify(crate::cli::VerifyArgs {
             file: "cell.yaml".into(),
             profile: "local".into(),
+            semantic_only: false,
         });
         let status = Command::Status(FileArgs {
             file: "cell.yaml".into(),

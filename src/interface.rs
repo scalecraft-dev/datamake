@@ -55,7 +55,7 @@ pub fn import(
     // metadata job — not a lesser fallback, there is genuinely no other
     // authority to consult there either).
     let cell = crate::engine::open(file, profile, true)?;
-    let (_, _, warehouse_columns) = crate::engine::bind_sources(&cell, false)
+    let (_, _, warehouse_columns) = crate::engine::bind_sources(&cell, false, false)
         .context("binding sources to read live column types for import")?;
     let actual = crate::verify::describe(&cell.conn, &bind_name)
         .with_context(|| format!("describing bound source '{bind_name}'"))?;
