@@ -5942,11 +5942,25 @@ mod tests {
             .query_row("SELECT count(*) FROM bootstrapped", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "bootstrap must create an empty table");
+
+        // The bound is relative, not wall-clock: a loaded CI box once took
+        // 573ms for the LIMIT 0 path against a fixed 500ms cap while the
+        // full evaluation of the same relation would have taken several
+        // times longer still. What the gate actually claims is the *ratio*
+        // — short-circuit versus full evaluation — so measure the full
+        // materialization in the same session and require the bootstrap to
+        // be well inside it (locally ~9x; 3x leaves room for a noisy box
+        // while a regression to full evaluation reads ~1x and fails).
+        let started = Instant::now();
+        conn.execute_batch("CREATE TABLE full_copy AS SELECT * FROM stg;")
+            .expect("full materialization of the staged relation");
+        let full = started.elapsed();
         assert!(
-            elapsed < Duration::from_millis(500),
-            "bootstrap took {elapsed:?} against a 10M-row staged relation — gate 3 expects this \
-             to short-circuit LIMIT 0, not evaluate; a planner regression may have reintroduced \
-             full evaluation on every declarative bootstrap"
+            elapsed * 3 < full,
+            "bootstrap took {elapsed:?} against a 10M-row staged relation whose full \
+             materialization took {full:?} — gate 3 expects LIMIT 0 to short-circuit, not \
+             evaluate; a planner regression may have reintroduced full evaluation on every \
+             declarative bootstrap"
         );
     }
 
