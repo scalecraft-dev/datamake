@@ -12,8 +12,11 @@ name: Release binaries
 # jour ships. The host runner label is deliberately NOT load-bearing for
 # compatibility; only the container is.
 #
-# No cross-job build caches: tag builds are rare enough to be evicted anyway,
-# and a cold ~30min compile beats cache-key drift on a release artifact.
+# Build caches (Swatinem/rust-cache, one key per target) persist the release
+# profile's dependency tree — bundled DuckDB above all — across tags. A cold
+# release compiled that tree four times over (~13 min per runner); a warm one
+# links datamk. The key hashes Cargo.lock, so a dependency bump rebuilds and
+# a version stamp alone does not.
 on:
   push:
     tags: ["v*"]
@@ -29,11 +32,18 @@ env:
 jobs:
   # ci.yml only runs on push/PR — a tag push runs neither, so without this
   # gate a release could ship binaries from a commit tests never touched.
-  # The tag guard lives here too: fail the cheap job in minutes, not a
-  # matrix build after an hour of compiling.
+  # The gate does not re-run the suite: `make release` cuts from a main HEAD
+  # that CI already built and tested, so it asks GitHub whether the CI
+  # workflow succeeded on exactly this commit (a cold re-run cost 13 minutes
+  # per release and proved nothing new). The tag guard lives here too: fail
+  # the cheap job in seconds, not a matrix build after minutes of compiling.
   gate:
-    name: Gate (tag guard + tests)
+    name: Gate (tag guard + CI passed)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     steps:
       - uses: actions/checkout@v4
       - name: Verify tag matches Cargo.toml
@@ -49,10 +59,30 @@ jobs:
             echo "Cut releases with: make release VERSION=${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-      - name: Install toolchain
-        run: rustup show
-      - name: Test
-        run: cargo test --locked
+      - name: Verify CI passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The CI workflow's run for this exact sha on main. `make release`
+          # pushes main and the tag together, so that run is usually still
+          # in flight when this job starts: wait for it (CI is ~3 minutes;
+          # the bound is generous), then require success. Absent after the
+          # wait, or not green, means the commit was never tested as it
+          # ships: stop.
+          for _ in $(seq 1 60); do
+            state="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --commit "$GITHUB_SHA" --branch main --limit 1 \
+              --json status,conclusion --jq '.[0] | "\(.status)/\(.conclusion)"')"
+            case "$state" in
+              completed/success) echo "CI succeeded on ${GITHUB_SHA}"; exit 0 ;;
+              completed/*) break ;;
+              *) echo "CI on ${GITHUB_SHA}: ${state:-not started yet}; waiting"; sleep 20 ;;
+            esac
+          done
+          echo "CI has not passed on ${GITHUB_SHA} (last seen: ${state:-none})." >&2
+          echo "Releases are cut from a main commit CI already tested; fix main, then cut a" >&2
+          echo "fresh release with: make release VERSION=vX.Y.Z" >&2
+          exit 1
 
   build:
     name: Build ${{ matrix.target }}
@@ -85,6 +115,13 @@ jobs:
       - name: Install toolchain
         # rust-toolchain.toml pins the channel; `rustup show` materializes it.
         run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Release profile, one tree per target — never shared with ci.yml's
+          # dev-profile cache, which would only miss.
+          shared-key: release-${{ matrix.target }}
+          cache-on-failure: true
 
       - name: Build
         run: cargo build --release --locked

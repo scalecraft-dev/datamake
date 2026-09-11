@@ -1063,32 +1063,38 @@ mod tests {
 
     #[test]
     fn run_git_timeout_returns_promptly_instead_of_hanging_on_pipes() {
-        // `git ls-remote` against a repo path that doesn't exist still
-        // spawns and exits fast on its own; what this test actually
-        // exercises is that a near-zero timeout takes the timeout branch
-        // (kill + bounded reader join) and returns within a small bound
-        // rather than hanging on `stdout_handle.join()`/`stderr_handle.
-        // join()` the way the pre-fix code could.
+        // A local TCP listener that accepts and never speaks: `ssh` (which
+        // git spawns for `ssh://`) waits for a banner that never comes, so
+        // the whole `git` + `ssh` + pipe chain is exactly the hang the
+        // timeout exists to cut. No network, no external host — the
+        // earlier shape of this test pointed at github.com.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(conn);
+            }
+        });
         let opts = FetchOptions {
             allow_local: true,
-            timeout: Duration::from_millis(1),
+            timeout: Duration::from_millis(300),
         };
         let start = Instant::now();
         let err = run_git(
             None,
             &[
                 "ls-remote".to_string(),
-                "https://github.com/apache/ossie.git".to_string(),
+                format!("ssh://127.0.0.1:{port}/repo.git"),
             ],
             &opts,
         )
         .unwrap_err();
         assert!(err.stderr.contains("timed out"), "{}", err.stderr);
-        // Generous bound (READER_JOIN_GRACE is 2s each for stdout/stderr);
-        // well under what an actual hang would look like (the test
-        // timeout).
+        // READER_JOIN_GRACE is 2s per reader; an actual hang would sit for
+        // the 30s the listener holds the socket.
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(15),
             "{:?}",
             start.elapsed()
         );
