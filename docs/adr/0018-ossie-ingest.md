@@ -79,9 +79,11 @@ relative path so the merged content digest is stable. Each file must be:
    agree. Strict deserialization against the vendored spec: unknown keys
    are errors, except inside `ai_context`'s object form (spec:
    `additionalProperties: true`), whose remainder is carried uninterpreted.
-   `custom_extensions[].data` is a JSON string; it is parsed for
-   `vendor_name == "DATAMAKE"` only and passed through byte-for-byte for
-   every other vendor.
+   `custom_extensions[].data` is a JSON string; it is opaque to datamake
+   for every vendor, always passed through byte-for-byte, never parsed
+   ("Refused" below). `vendor_name` is a closed enum in `osi-0.1.1-rc1`'s
+   schema with no `DATAMAKE` member — `0.2.0.dev0` makes it free-form, but
+   datamake never enforces the enum either way.
 
 Merge: `semantic_model[]` lists concatenate in file order. Semantic model
 names are unique across the walk (error naming both files). Dataset names
@@ -231,6 +233,17 @@ not-found message.
   permissive types wherever the spec is permissive without us choosing.
 - A list of sources, `http(s)://`/`s3://` sources, a profile-bound
   location: meaning must not vary by environment.
+- Anything datamake-specific living inside an Ossie document: a
+  datamake-defined `ai_context` key (an estate-wide glossary term authored
+  beside an Ossie model or dataset was considered and rejected), a
+  `vendor_name: DATAMAKE` `custom_extensions[].data` payload datamake
+  itself parses. `ai_context`'s object form still carries every unknown
+  key through uninterpreted, exactly as the spec's own
+  `additionalProperties: true` allows — datamake just never reads one back
+  out. An expression-less term (no column, no expression to plan-check) is
+  plain `ai_context.instructions` prose under this ADR, not a lookup key:
+  it is not `?terms=`-addressable, the same line `definitions:` (ADR 0017)
+  already draws for concepts Ossie cannot represent.
 
 ## Premises
 

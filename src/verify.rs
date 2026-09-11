@@ -317,11 +317,14 @@ pub(crate) fn check_bind_target(export_name: &str, bind: &str, def: &CellDef) ->
 /// serialization style), stamped with the current `cell.yaml` digest so a
 /// stale record (the config changed since this check ran) is detectable and
 /// silently omitted rather than misapplied — see `context::emit`.
-pub fn run(file: &Path, profile: &str) -> Result<()> {
+pub fn run(file: &Path, profile: &str, semantic_only: bool) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
+    if semantic_only {
+        return run_semantic_only(&cell, file, profile);
+    }
     let has_bound_exports = cell.def.interface.iter().any(|e| e.is_bound());
     let warehouse_columns = if has_bound_exports {
-        let (_, _, warehouse_columns) = engine::bind_sources(&cell, false)
+        let (_, _, warehouse_columns) = engine::bind_sources(&cell, false, false)
             .context("binding sources for live verify of bound exports (issue #6)")?;
         warehouse_columns
     } else {
@@ -329,7 +332,9 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
     };
     let outcome = check(&cell.conn, &cell.def, &warehouse_columns)?;
     if let (Some(index), Some(semantic)) = (&cell.def.semantic, &outcome.semantic) {
-        print_semantic_summary(index, semantic);
+        // `check` above already printed the summary (follow-up 8: it must,
+        // so a failing check prints before it bails) and bailed if
+        // `semantic` carried any failures — reaching here means it passed.
         write_semantic_check_record(file, &cell.dir, profile, index, semantic)
             .context("writing the semantic-check record (.cell/semantic_check.json)")?;
     }
@@ -358,6 +363,63 @@ pub fn run(file: &Path, profile: &str) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// `datamk verify --semantic-only` (follow-up 2): the Ossie checks alone —
+/// `check_semantic`, nothing else. Skips the declared-schema type/grain
+/// checks, the column census, `check_supported_have_descriptions`'s live
+/// half, and `.cell/source_check.json`/`.cell/source_descriptions.json`
+/// entirely; writes only `.cell/semantic_check.json`. Refused on a cell
+/// with no `semantic_model:` — there is nothing for the flag to check.
+///
+/// Still binds every declared source when the cell has a bound export (a
+/// dataset can bind to a bound export's live view) — but with
+/// `schema_only: true` (`engine::schema_only_probe`), which resolves
+/// column types via the identical jobs-API query, wrapped so the connector
+/// returns zero rows instead of staging the whole view. That is what turns
+/// the ~15-minute live-verify bind pass this flag exists to skip (41 bound
+/// views' worth of BigQuery `EXPORT DATA` to a `staging_uri`) into a plan-
+/// time-only bind for every non-incremental view-backed source; an
+/// incremental source still stages for real (`engine::stage_incremental` is
+/// unchanged), and a materialized (unbound) export's semantic checks run
+/// against the already-built lake table either way, untouched by this flag.
+fn run_semantic_only(cell: &crate::engine::Cell, file: &Path, profile: &str) -> Result<()> {
+    let Some(index) = &cell.def.semantic else {
+        bail!(
+            "`--semantic-only` refused: cell '{}' declares no `semantic_model:` — nothing to \
+             check.",
+            cell.def.cell
+        );
+    };
+    let has_bound_exports = cell.def.interface.iter().any(|e| e.is_bound());
+    if has_bound_exports {
+        engine::bind_sources(cell, false, true)
+            .context("binding sources for --semantic-only (schema-only probe, follow-up 2)")?;
+    }
+    let (semantic, errors) = check_semantic(&cell.conn, &cell.def, index)?;
+    print_semantic_summary(index, &semantic, &errors);
+    if !errors.is_empty() {
+        bail!(format_semantic_errors(&errors));
+    }
+    write_semantic_check_record(file, &cell.dir, profile, index, &semantic)
+        .context("writing the semantic-check record (.cell/semantic_check.json)")?;
+    Ok(())
+}
+
+/// Follow-up 8: one error per line, in the order `check_semantic` found
+/// them (deterministic: exports in declared order, then models in declared
+/// order) — the message `check`/`run_semantic_only` bail with after
+/// `print_semantic_summary` has already shown the full block.
+fn format_semantic_errors(errors: &[(String, String)]) -> String {
+    format!(
+        "{} semantic check failure(s):\n{}",
+        errors.len(),
+        errors
+            .iter()
+            .map(|(_, msg)| format!("  - {msg}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 /// Persist `.cell/semantic_check.json` (ADR 0018 §6), sibling of
@@ -393,62 +455,167 @@ fn write_semantic_check_record(
 /// The `verify` summary block for a bound semantic model (ADR 0018 §6/§7
 /// preview) — printed after the per-export `tracing::info!` lines, purely
 /// for a human running `datamk verify` at a terminal; nothing downstream
-/// parses it (the sidecar record is the machine-readable form).
+/// parses it (the sidecar record is the machine-readable form). A thin
+/// wrapper over `semantic_summary_lines`, which does the actual work and is
+/// what tests call (an `eprintln!` block is otherwise unobservable).
 fn print_semantic_summary(
     index: &crate::ossie::bind::SemanticIndex,
     outcome: &crate::ossie::verify::SemanticOutcome,
+    errors: &[(String, String)],
 ) {
-    eprintln!(
+    for line in semantic_summary_lines(index, outcome, errors) {
+        eprintln!("{line}");
+    }
+}
+
+/// `print_semantic_summary`'s content, one `Vec` entry per printed line.
+///
+/// Follow-up 7: the left-hand label is `model/dataset` — never the record
+/// key's `model/dataset@route` suffix, which only repeats the `→ {route}`
+/// printed right after it. The `@route` suffix is added back only when that
+/// dataset binds to more than one route (two majors of one export name),
+/// since then it's the only thing telling two printed lines apart.
+///
+/// Follow-up 8: called with the *complete* outcome and every error this
+/// pass collected — `check`/`run_semantic_only` call this before deciding
+/// whether to bail, so a run that fails after minutes of binding still
+/// prints everything it found, not just the first failure. A failing entry
+/// prints `✗` and the first line of its own error message (from `errors`,
+/// looked up by the same `model/dataset`, `model/relationship`, or
+/// `model/metric` label `check_semantic`'s callees push).
+fn semantic_summary_lines(
+    index: &crate::ossie::bind::SemanticIndex,
+    outcome: &crate::ossie::verify::SemanticOutcome,
+    errors: &[(String, String)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let first_line = |label: &str| -> &str {
+        errors
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, msg)| msg.lines().next().unwrap_or(msg.as_str()))
+            .unwrap_or("semantic check failed")
+    };
+
+    out.push(format!(
         "semantic model  .cell/semantic_model.json (synced {}, {} files, {} models)",
         index.synced_at(),
         index.files().len(),
         index.models().len()
-    );
-    for (key, dc) in &outcome.datasets {
-        match &dc.route {
-            Some(route) => {
-                let verified = dc.fields.values().filter(|f| f.verified).count();
-                let pk = match dc.primary_key.as_str() {
-                    "matches" => " · primary_key = grain".to_string(),
-                    "no_grain" => " · primary_key set, export declares no grain".to_string(),
-                    "absent" => String::new(),
-                    other => format!(" · primary_key {other}"),
-                };
-                eprintln!(
-                    "  {key} → {route}    {verified}/{} fields verified{pk}",
-                    dc.fields.len()
-                );
-            }
-            None => eprintln!("  {key} → (unbound)"),
+    ));
+
+    // A dataset's display label carries `@route` only when more than one
+    // entry in this outcome shares its `model/dataset` — i.e. it's bound to
+    // more than one route (ADR 0018 §5, two majors of one export name).
+    let mut route_counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for dc in outcome.datasets.values() {
+        if dc.route.is_some() {
+            *route_counts
+                .entry((dc.model.as_str(), dc.dataset.as_str()))
+                .or_insert(0) += 1;
         }
     }
+
+    for dc in outcome.datasets.values() {
+        let base = format!("{}/{}", dc.model, dc.dataset);
+        match &dc.route {
+            Some(route) => {
+                let display = if route_counts[&(dc.model.as_str(), dc.dataset.as_str())] > 1 {
+                    format!("{base}@{route}")
+                } else {
+                    base.clone()
+                };
+                let verified = dc.fields.values().filter(|f| f.verified).count();
+                let failed = dc
+                    .fields
+                    .values()
+                    .filter(|f| f.reason.as_deref() == Some("error"))
+                    .count()
+                    + usize::from(dc.primary_key == "error");
+                if failed > 0 {
+                    out.push(format!(
+                        "  ✗ {display} → {route}    {verified}/{} fields verified — {}",
+                        dc.fields.len(),
+                        first_line(&base)
+                    ));
+                } else {
+                    let pk = match dc.primary_key.as_str() {
+                        "matches" => " · primary_key = grain".to_string(),
+                        "no_grain" => " · primary_key set, export declares no grain".to_string(),
+                        "absent" => String::new(),
+                        other => format!(" · primary_key {other}"),
+                    };
+                    out.push(format!(
+                        "  {display} → {route}    {verified}/{} fields verified{pk}",
+                        dc.fields.len()
+                    ));
+                }
+            }
+            None => out.push(format!("  {base} → (unbound)")),
+        }
+    }
+
     if !outcome.metrics.is_empty() {
         let verified = outcome
             .metrics
             .values()
             .filter(|v| v.as_str() == "verified")
             .count();
-        eprintln!(
-            "  metrics                                  {verified} verified · {} unverified",
-            outcome.metrics.len() - verified
-        );
+        let failed = outcome
+            .metrics
+            .values()
+            .filter(|v| v.as_str() == "error")
+            .count();
+        let unverified = outcome.metrics.len() - verified - failed;
+        out.push(format!(
+            "  metrics                                  {verified} verified · {unverified} \
+             unverified{}",
+            if failed > 0 {
+                format!(" · {failed} error(s)")
+            } else {
+                String::new()
+            }
+        ));
+        for (key, status) in &outcome.metrics {
+            if status == "error" {
+                out.push(format!("    ✗ {key} — {}", first_line(key)));
+            }
+        }
     }
+
     if !outcome.relationships.is_empty() {
         let verified = outcome
             .relationships
             .values()
             .filter(|v| v.as_str() == "verified")
             .count();
-        let unbound = outcome.relationships.len() - verified;
-        eprintln!(
-            "  relationships                            {verified} verified{}",
+        let failed = outcome
+            .relationships
+            .values()
+            .filter(|v| v.as_str() == "error")
+            .count();
+        let unbound = outcome.relationships.len() - verified - failed;
+        out.push(format!(
+            "  relationships                            {verified} verified{}{}",
             if unbound > 0 {
                 format!(" · {unbound} unbound")
             } else {
                 String::new()
+            },
+            if failed > 0 {
+                format!(" · {failed} error(s)")
+            } else {
+                String::new()
             }
-        );
+        ));
+        for (key, status) in &outcome.relationships {
+            if status == "error" {
+                out.push(format!("    ✗ {key} — {}", first_line(key)));
+            }
+        }
     }
+
+    out
 }
 
 /// Persist the live-verify source-check record (issue #6): outcome, when,
@@ -551,7 +718,6 @@ pub fn check(
     check_supported_have_descriptions(def, warehouse_columns)?;
 
     let mut measurements = BTreeMap::new();
-    let mut semantic_datasets = BTreeMap::new();
     for export in &def.interface {
         let source = export
             .bind
@@ -731,72 +897,113 @@ pub fn check(
             }
         }
 
-        // ADR 0018 §6: every dataset bound to this route, fields +
-        // `primary_key` — plan-time only, hard errors on a false claim,
-        // exactly like the declared-schema checks above.
-        if let Some(index) = &def.semantic {
-            for dc in crate::ossie::verify::check_export(conn, export, &route, source, index)? {
-                let key =
-                    crate::ossie::verify::dataset_key(&dc.model, &dc.dataset, dc.route.as_deref());
-                semantic_datasets.insert(key, dc);
-            }
-        }
-
         tracing::info!(export = %export.name, version = %export.version, "interface ok");
     }
 
-    // ADR 0018 §6: relationships and metrics are model-level, not
-    // per-export — checked once per model here, after the export loop
-    // above has bound every dataset it's going to, never once per export.
-    let mut relationships = BTreeMap::new();
-    let mut metrics = BTreeMap::new();
-    if let Some(index) = &def.semantic {
-        for model in index.models() {
-            for (name, outcome) in ossie::verify::check_relationships(model, index, def)? {
-                relationships.insert(format!("{}/{}", model.name, name), outcome);
+    // ADR 0018 §6: the Ossie checks, factored out so `--semantic-only`
+    // (follow-up 2) can run exactly this and nothing else. Follow-up 8:
+    // prints the full block (every dataset/relationship/metric this pass
+    // reached, failures marked) before bailing on any collected error — a
+    // false claim never throws away everything else this pass found.
+    let semantic = match &def.semantic {
+        Some(index) => {
+            let (outcome, errors) = check_semantic(conn, def, index)?;
+            print_semantic_summary(index, &outcome, &errors);
+            if !errors.is_empty() {
+                bail!(format_semantic_errors(&errors));
             }
-            for (name, outcome) in ossie::verify::check_metrics(conn, model, index, def)? {
-                metrics.insert(format!("{}/{}", model.name, name), outcome);
-            }
-            // ADR 0018 §5: a dataset that binds to nothing is kept, marked
-            // unbound — never dropped from the record just because no
-            // export claimed it. A bound dataset already has one
-            // "model/dataset@route" entry per route from `check_export`
-            // above; only a dataset with zero routes gets the unbound
-            // backstop entry here.
-            for ds in &model.datasets {
-                if !index.route_for(&model.name, &ds.name).is_empty() {
-                    continue;
-                }
-                semantic_datasets
-                    .entry(crate::ossie::verify::dataset_key(
-                        &model.name,
-                        &ds.name,
-                        None,
-                    ))
-                    .or_insert_with(|| crate::ossie::verify::DatasetCheck {
-                        model: model.name.clone(),
-                        dataset: ds.name.clone(),
-                        route: None,
-                        primary_key: "unbound".to_string(),
-                        fields: BTreeMap::new(),
-                    });
-            }
+            Some(outcome)
         }
-    }
-    let semantic = def
-        .semantic
-        .as_ref()
-        .map(|_| crate::ossie::verify::SemanticOutcome {
-            datasets: semantic_datasets,
-            relationships,
-            metrics,
-        });
+        None => None,
+    };
 
     Ok(CheckOutcome {
         measurements,
         semantic,
     })
+}
+
+/// ADR 0018 §6, the Ossie-only subset of `check`: every dataset bound to
+/// each export (fields + `primary_key`), then relationships and metrics
+/// once per model. Shared by `check` (the full pass) and `run_semantic_only`
+/// (`datamk verify --semantic-only`, follow-up 2) — byte-identical either
+/// way, so the flag can never see a different verdict than a full `verify`
+/// would have reached for the same bound semantic model.
+///
+/// Follow-up 8: never bails on a false claim (`ossie::verify`'s three check
+/// functions no longer do either, except the H2 security shape gate) —
+/// every dataset, relationship, and metric is attempted, and every failure
+/// collected into the returned `Vec`, so the caller can print the complete
+/// picture before deciding whether to fail.
+fn check_semantic(
+    conn: &Connection,
+    def: &CellDef,
+    index: &crate::ossie::bind::SemanticIndex,
+) -> Result<(crate::ossie::verify::SemanticOutcome, Vec<(String, String)>)> {
+    let mut errors = Vec::new();
+    let mut semantic_datasets = BTreeMap::new();
+    for export in &def.interface {
+        let source = export
+            .bind
+            .as_deref()
+            .unwrap_or_else(|| export.source_object());
+        let route = export.route()?;
+        // ADR 0018 §6: every dataset bound to this route, fields +
+        // `primary_key` — plan-time only.
+        for dc in
+            crate::ossie::verify::check_export(conn, export, &route, source, index, &mut errors)?
+        {
+            let key =
+                crate::ossie::verify::dataset_key(&dc.model, &dc.dataset, dc.route.as_deref());
+            semantic_datasets.insert(key, dc);
+        }
+    }
+
+    // Relationships and metrics are model-level, not per-export — checked
+    // once per model here, after the export loop above has bound every
+    // dataset it's going to, never once per export.
+    let mut relationships = BTreeMap::new();
+    let mut metrics = BTreeMap::new();
+    for model in index.models() {
+        for (name, outcome) in ossie::verify::check_relationships(model, index, def, &mut errors)? {
+            relationships.insert(format!("{}/{}", model.name, name), outcome);
+        }
+        for (name, outcome) in ossie::verify::check_metrics(conn, model, index, def, &mut errors)? {
+            metrics.insert(format!("{}/{}", model.name, name), outcome);
+        }
+        // ADR 0018 §5: a dataset that binds to nothing is kept, marked
+        // unbound — never dropped from the record just because no export
+        // claimed it. A bound dataset already has one "model/dataset@route"
+        // entry per route from `check_export` above; only a dataset with
+        // zero routes gets the unbound backstop entry here.
+        for ds in &model.datasets {
+            if !index.route_for(&model.name, &ds.name).is_empty() {
+                continue;
+            }
+            semantic_datasets
+                .entry(crate::ossie::verify::dataset_key(
+                    &model.name,
+                    &ds.name,
+                    None,
+                ))
+                .or_insert_with(|| crate::ossie::verify::DatasetCheck {
+                    model: model.name.clone(),
+                    dataset: ds.name.clone(),
+                    route: None,
+                    primary_key: "unbound".to_string(),
+                    fields: BTreeMap::new(),
+                });
+        }
+    }
+
+    Ok((
+        crate::ossie::verify::SemanticOutcome {
+            datasets: semantic_datasets,
+            relationships,
+            metrics,
+        },
+        errors,
+    ))
 }
 
 /// ADR 0012 §3 ratchet check 4: an export with `contract: supported` must
@@ -2875,7 +3082,7 @@ interface:
         write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
 
         let file = dir.join("cell.yaml");
-        run(&file, "local").expect("live-verify of a clean all-bound cell must pass");
+        run(&file, "local", false).expect("live-verify of a clean all-bound cell must pass");
         assert!(
             dir.join(".cell/source_check.json").is_file(),
             "a passing live check must leave a .cell/source_check.json record behind"
@@ -2884,7 +3091,7 @@ interface:
         // Now break the grain at the source and confirm the live check
         // actually catches it — not a stale skip, a real, running check.
         write_csv(&dir, "data.csv", &[(1, "a"), (1, "b")]);
-        let err = run(&file, "local").unwrap_err().to_string();
+        let err = run(&file, "local", false).unwrap_err().to_string();
         assert!(
             err.contains("is not unique"),
             "a broken grain at the live source must fail verify with the usual grain-violation \
@@ -2929,12 +3136,12 @@ interface:
         // materialized export genuinely has nothing to check without one.
         crate::engine::run(&file, "local", None, crate::engine::RunOptions::default())
             .expect("build the mixed cell");
-        run(&file, "local").expect("live-verify of a clean mixed cell must pass");
+        run(&file, "local", false).expect("live-verify of a clean mixed cell must pass");
 
         // Break the bound export live (the source, re-read fresh on every
         // verify) without touching the lake at all.
         write_csv(&dir, "data.csv", &[(1, "a"), (1, "b")]);
-        let err = run(&file, "local").unwrap_err().to_string();
+        let err = run(&file, "local", false).unwrap_err().to_string();
         assert!(
             err.contains("export 'virtual_pii'") && err.contains("is not unique"),
             "the bound export's live grain violation must be caught: got {err}"
@@ -2951,7 +3158,7 @@ interface:
             .execute_batch("INSERT INTO stg VALUES (1, 'dup');")
             .expect("insert a duplicate key directly into the materialized table");
         drop(cell);
-        let err = run(&file, "local").unwrap_err().to_string();
+        let err = run(&file, "local", false).unwrap_err().to_string();
         assert!(
             err.contains("export 'stg'") && err.contains("is not unique"),
             "the materialized export's grain violation must still be caught against the lake: \
@@ -3029,8 +3236,9 @@ interface:
         write_flight_spend_csv(&dir, &[(1, 10, 100), (2, 20, 200)]);
 
         let file = dir.join("cell.yaml");
-        crate::catalog::sync(&file, "local", false).expect("datamk sync (Ossie half)");
-        run(&file, "local").expect("live-verify of a bound export with a bound semantic model");
+        crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
+        run(&file, "local", false)
+            .expect("live-verify of a bound export with a bound semantic model");
 
         let record = crate::ossie::record::SemanticCheckRecord::load(&dir)
             .expect(".cell/semantic_check.json must exist after a passing verify");
@@ -3039,6 +3247,99 @@ interface:
         assert_eq!(dc.primary_key, "matches");
         assert_eq!(dc.fields.len(), 3);
         assert!(dc.fields.values().all(|f| f.verified));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Follow-up 2: `datamk verify --semantic-only` on the identical cell
+    /// runs only the Ossie checks — `.cell/semantic_check.json` is written,
+    /// but `.cell/source_check.json` (the declared-schema/grain/census
+    /// measurements) is not, because that half never runs at all.
+    #[test]
+    fn semantic_only_writes_semantic_check_and_skips_the_measurements() {
+        let dir = live_verify_dir("semantic-only");
+        std::fs::create_dir_all(dir.join("osi")).unwrap();
+        std::fs::write(
+            dir.join("osi/invoice.yaml"),
+            "version: 0.1.1\n\
+             semantic_model:\n\
+             \x20 - name: invoice\n\
+             \x20   datasets:\n\
+             \x20     - name: flight_spend\n\
+             \x20       source: flight_spend\n\
+             \x20       primary_key: [invoice_id]\n\
+             \x20       fields:\n\
+             \x20         - name: invoice_id\n\
+             \x20           expression:\n\
+             \x20             dialects:\n\
+             \x20               - dialect: ANSI_SQL\n\
+             \x20                 expression: invoice_id\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: t\n\
+             semantic_model:\n\
+             \x20 dir: osi\n\
+             interface:\n\
+             \x20 - name: flight_spend\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [invoice_id]\n\
+             \x20   bind: raw\n\
+             \x20   schema:\n\
+             \x20     invoice_id: bigint\n\
+             \x20     account_id: bigint\n\
+             \x20     amount: bigint\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        write_flight_spend_csv(&dir, &[(1, 10, 100), (2, 20, 200)]);
+
+        let file = dir.join("cell.yaml");
+        crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
+        run(&file, "local", true).expect("--semantic-only must pass on a clean cell");
+
+        assert!(
+            crate::ossie::record::SemanticCheckRecord::load(&dir).is_some(),
+            ".cell/semantic_check.json must exist after --semantic-only"
+        );
+        assert!(
+            !dir.join(".cell/source_check.json").is_file(),
+            "--semantic-only must never write .cell/source_check.json — the measurements it \
+             exists to skip"
+        );
+        assert!(
+            !dir.join(".cell/source_descriptions.json").is_file(),
+            "--semantic-only must never write .cell/source_descriptions.json either"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Follow-up 2: `--semantic-only` on a cell with no `semantic_model:` is
+    /// refused — there is nothing for it to check.
+    #[test]
+    fn semantic_only_is_refused_without_a_semantic_model() {
+        let dir = live_verify_dir("semantic-only-refused");
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: t\n\
+             interface:\n\
+             \x20 - name: flight_spend\n\
+             \x20   version: 1.0.0\n\
+             \x20   grain: [id]\n\
+             \x20   bind: raw\n\
+             sources:\n\
+             \x20 raw: ./data.csv\n",
+        )
+        .unwrap();
+        write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
+
+        let file = dir.join("cell.yaml");
+        let err = run(&file, "local", true).unwrap_err().to_string();
+        assert!(err.contains("--semantic-only"), "{err}");
+        assert!(err.contains("nothing to check"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3152,6 +3453,250 @@ interface:
                 .as_deref(),
             Some("flight_spend@2")
         );
+
+        // Follow-up 7: bound to two routes, so the display label carries
+        // `@route` — the only thing telling the two printed lines apart.
+        let lines = semantic_summary_lines(def.semantic.as_ref().unwrap(), &semantic, &[]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("invoice/flight_spend@flight_spend@1 → flight_spend@1")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("invoice/flight_spend@flight_spend@2 → flight_spend@2")),
+            "{lines:?}"
+        );
+    }
+
+    /// Follow-up 7: a dataset bound to exactly one route prints
+    /// `model/dataset → route` — never the record key's `model/dataset@route`
+    /// on the left *and* the same route repeated on the right (the real-run
+    /// bug: `ape_core/fct_flight@ape_core_fct_flight@1 → ape_core_fct_flight@1`).
+    #[test]
+    fn semantic_summary_omits_the_route_suffix_when_bound_to_exactly_one_route() {
+        use crate::config::Export;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE a_tbl AS SELECT 1 AS id;")
+            .unwrap();
+        let ds = ossie::Dataset {
+            name: "flight_spend".to_string(),
+            source: "flight_spend".to_string(),
+            primary_key: vec![],
+            unique_keys: vec![],
+            description: None,
+            ai_context: None,
+            fields: vec![ossie::Field {
+                name: "id".to_string(),
+                expression: ossie::Expression {
+                    dialects: vec![ossie::DialectExpression {
+                        dialect: ossie::Dialect::AnsiSql,
+                        expression: "id".to_string(),
+                    }],
+                },
+                dimension: None,
+                label: None,
+                description: None,
+                datatype: None,
+                ai_context: None,
+                custom_extensions: vec![],
+            }],
+            custom_extensions: vec![],
+        };
+        let model = ossie::SemanticModel {
+            name: "invoice".to_string(),
+            description: None,
+            ai_context: None,
+            datasets: vec![ds],
+            relationships: vec![],
+            metrics: vec![],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: indexmap::IndexMap::new(),
+            document: ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        let mut exp: Export =
+            serde_yaml::from_str("name: flight_spend\nversion: 1.0.0\nbind: a_tbl\n").unwrap();
+        exp.schema =
+            IndexMap::from([("id".to_string(), crate::config::ColumnSpec::bare("integer"))]);
+        let mut def: CellDef = serde_yaml::from_str("cell: t\n").unwrap();
+        def.interface = vec![exp];
+        def.semantic = Some(crate::ossie::bind::SemanticIndex::build(
+            record,
+            &def.interface,
+        ));
+
+        let outcome = check(&conn, &def, &HashMap::new()).unwrap();
+        let semantic = outcome.semantic.expect("bound semantic model");
+        let lines = semantic_summary_lines(def.semantic.as_ref().unwrap(), &semantic, &[]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("invoice/flight_spend → flight_spend@1")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("@flight_spend@1 → flight_spend@1")),
+            "the left side must never repeat the route the right side already names: {lines:?}"
+        );
+    }
+
+    /// Follow-up 8: two metrics that genuinely fail in the same model are
+    /// both attempted, both named in the aggregated error `run`/`check`
+    /// bails with, and both appear (✗-marked) in the printed summary block —
+    /// the old bail-on-first-failure behavior lost the second metric (and
+    /// the whole block) the moment the first one failed.
+    #[test]
+    fn two_failing_metrics_are_both_named_in_the_error_and_both_in_the_printed_block() {
+        use crate::config::Export;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE a_tbl AS SELECT 1 AS id, 10 AS val; \
+             CREATE TABLE b_tbl AS SELECT 1 AS id, 20 AS other;",
+        )
+        .unwrap();
+        let field_id = |n: &str| ossie::Field {
+            name: n.to_string(),
+            expression: ossie::Expression {
+                dialects: vec![ossie::DialectExpression {
+                    dialect: ossie::Dialect::AnsiSql,
+                    expression: n.to_string(),
+                }],
+            },
+            dimension: None,
+            label: None,
+            description: None,
+            datatype: None,
+            ai_context: None,
+            custom_extensions: vec![],
+        };
+        let metric = |n: &str, expr: &str| ossie::Metric {
+            name: n.to_string(),
+            expression: ossie::Expression {
+                dialects: vec![ossie::DialectExpression {
+                    dialect: ossie::Dialect::AnsiSql,
+                    expression: expr.to_string(),
+                }],
+            },
+            description: None,
+            datatype: None,
+            ai_context: None,
+            custom_extensions: vec![],
+        };
+        let ds_a = ossie::Dataset {
+            name: "dsa".to_string(),
+            source: "dsa".to_string(),
+            primary_key: vec![],
+            unique_keys: vec![],
+            description: None,
+            ai_context: None,
+            fields: vec![field_id("id")],
+            custom_extensions: vec![],
+        };
+        let ds_b = ossie::Dataset {
+            name: "dsb".to_string(),
+            source: "dsb".to_string(),
+            primary_key: vec![],
+            unique_keys: vec![],
+            description: None,
+            ai_context: None,
+            fields: vec![field_id("id")],
+            custom_extensions: vec![],
+        };
+        let model = ossie::SemanticModel {
+            name: "m".to_string(),
+            description: None,
+            ai_context: None,
+            datasets: vec![ds_a, ds_b],
+            relationships: vec![],
+            metrics: vec![
+                metric("first", "SUM(dsa.nonexistent)"),
+                metric("second", "SUM(dsb.alsomissing)"),
+            ],
+            custom_extensions: vec![],
+        };
+        let record = crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: "d".to_string(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Dir {
+                dir: "osi".to_string(),
+            },
+            resolved: crate::ossie::record::Resolved::Dir {
+                dir: "/abs/osi".to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: indexmap::IndexMap::new(),
+            document: ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![model],
+            },
+        };
+        let mut exp_a: Export =
+            serde_yaml::from_str("name: dsa\nversion: 1.0.0\nbind: a_tbl\n").unwrap();
+        exp_a.schema = IndexMap::from([
+            ("id".to_string(), crate::config::ColumnSpec::bare("integer")),
+            (
+                "val".to_string(),
+                crate::config::ColumnSpec::bare("integer"),
+            ),
+        ]);
+        let mut exp_b: Export =
+            serde_yaml::from_str("name: dsb\nversion: 1.0.0\nbind: b_tbl\n").unwrap();
+        exp_b.schema = IndexMap::from([
+            ("id".to_string(), crate::config::ColumnSpec::bare("integer")),
+            (
+                "other".to_string(),
+                crate::config::ColumnSpec::bare("integer"),
+            ),
+        ]);
+        let mut def: CellDef = serde_yaml::from_str("cell: t\n").unwrap();
+        def.interface = vec![exp_a, exp_b];
+        def.semantic = Some(crate::ossie::bind::SemanticIndex::build(
+            record,
+            &def.interface,
+        ));
+
+        let index = def.semantic.as_ref().unwrap();
+        let (outcome, errors) = check_semantic(&conn, &def, index).unwrap();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let agg = format_semantic_errors(&errors);
+        assert!(agg.contains("metric 'first'"), "{agg}");
+        assert!(agg.contains("metric 'second'"), "{agg}");
+
+        let lines = semantic_summary_lines(index, &outcome, &errors);
+        assert!(lines.iter().any(|l| l.contains("✗ m/first")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("✗ m/second")), "{lines:?}");
+
+        // The full `check` entry point must bail with both names too, not
+        // just the first.
+        let err = check(&conn, &def, &HashMap::new()).unwrap_err().to_string();
+        assert!(err.contains("metric 'first'"), "{err}");
+        assert!(err.contains("metric 'second'"), "{err}");
     }
 
     // --- ADR 0008 decision 5: the no-grain warning as the removed-entry -----

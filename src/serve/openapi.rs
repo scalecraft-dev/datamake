@@ -577,7 +577,7 @@ fn semantic_dataset_schema() -> Value {
             "from": from_schema("description, ai_context, fields"),
             "primary_key": { "type": "array", "items": { "type": "string" } },
             "primary_key_check": { "type": "string",
-                "enum": ["matches", "no_grain", "absent"],
+                "enum": ["matches", "no_grain", "absent", "error"],
                 "description": "From a fresh `datamk verify` record; absent when none stands." },
             "routes": { "type": "array", "items": { "type": "string" },
                 "description": "Every route bound; `[]` for a dataset `semantic_model` lists \
@@ -595,7 +595,7 @@ fn semantic_dataset_schema() -> Value {
                     "ai_context": {},
                     "verified": { "type": "boolean",
                         "description": "From a fresh check; absent when none stands." },
-                    "reason": { "type": "string", "enum": ["dialect"] }
+                    "reason": { "type": "string", "enum": ["dialect", "function", "error"] }
                 }}},
             "relationships": { "type": "array", "items": semantic_relationship_schema() },
             "metrics": { "type": "array", "items": semantic_metric_schema() },
@@ -618,7 +618,7 @@ fn semantic_relationship_schema() -> Value {
             "to_columns": { "type": "array", "items": { "type": "string" } },
             "from_route": { "type": "string" },
             "to_route": { "type": "string" },
-            "status": { "type": "string", "enum": ["verified", "unbound"] }
+            "status": { "type": "string", "enum": ["verified", "unbound", "error"] }
         }
     })
 }
@@ -635,7 +635,8 @@ fn semantic_metric_schema() -> Value {
             "description": { "type": "string" },
             "ai_context": {},
             "status": { "type": "string",
-                "enum": ["verified", "unverified:dialect", "unverified:unbound"] }
+                "enum": ["verified", "unverified:dialect", "unverified:unbound",
+                    "unverified:ambiguous", "unverified:function", "error"] }
         }
     })
 }

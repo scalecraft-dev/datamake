@@ -93,8 +93,8 @@ async fn dispatch(command: Command) -> Result<()> {
             };
             engine::run(&a.file, &a.profile, retention_secs, opts)
         }
-        Command::Sync(a) => catalog::sync(&a.file, &a.profile, a.dry_run),
-        Command::Verify(a) => verify::run(&a.file, &a.profile),
+        Command::Sync(a) => catalog::sync(&a.file, &a.profile, a.dry_run, a.refetch),
+        Command::Verify(a) => verify::run(&a.file, &a.profile, a.semantic_only),
         Command::Release(a) => release::run(&a.file, &a.profile),
         Command::Deploy(a) => deploy::run(&a).await,
         Command::Serve(a) => {

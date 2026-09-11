@@ -66,7 +66,7 @@ pub enum Command {
     /// declares `semantic_model:` only.
     Sync(SyncArgs),
     /// Machine-verify actual output against the declared interface
-    Verify(FileArgs),
+    Verify(VerifyArgs),
     /// Pin the current snapshot as the supported contract
     Release(FileArgs),
     /// Deploy the cell as a managed workload on an orchestrator
@@ -146,6 +146,11 @@ pub struct SyncArgs {
     /// Read and report, but write nothing.
     #[arg(long)]
     pub dry_run: bool,
+    /// Force a `semantic_model.git` fetch even when `ref:` is a 40-hex sha
+    /// already recorded in `.cell/semantic_model.json` (the default reuses
+    /// that snapshot with no network access — see `datamk sync`'s own help).
+    #[arg(long)]
+    pub refetch: bool,
 }
 
 #[derive(Args)]
@@ -341,6 +346,26 @@ pub struct FileArgs {
     /// Binding profile to use (reads profiles/<name>.yaml)
     #[arg(short, long, default_value = "local")]
     pub profile: String,
+}
+
+#[derive(Args)]
+pub struct VerifyArgs {
+    /// Path to the cell definition
+    #[arg(short, long, default_value = "cell.yaml")]
+    pub file: PathBuf,
+    /// Binding profile to use (reads profiles/<name>.yaml)
+    #[arg(short, long, default_value = "local")]
+    pub profile: String,
+    /// Run only the Ossie semantic checks (ADR 0018 §6) and write
+    /// `.cell/semantic_check.json` — skips the declared-schema type/grain
+    /// checks, the column census, and `.cell/source_check.json`/
+    /// `.cell/source_descriptions.json` entirely. Refused on a cell with no
+    /// `semantic_model:`. Still binds every declared source when the cell
+    /// has a bound export, but via a schema-only probe (a zero-row read,
+    /// never `EXPORT DATA` staging) rather than the full live-verify bind —
+    /// see docs/guides/semantic-model.md.
+    #[arg(long)]
+    pub semantic_only: bool,
 }
 
 #[derive(Args)]

@@ -137,8 +137,10 @@ pub fn debug_sqlmesh_comments(file: &Path) -> Result<()> {
 }
 
 /// `datamk sync`: read the tool's deployed environment and the warehouse,
-/// write `.cell/deployed_catalog.json`, and say what was found.
-pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
+/// write `.cell/deployed_catalog.json`, and say what was found. `refetch`
+/// forces `sync_semantic`'s git half to re-clone even when a pinned-sha
+/// snapshot could be reused (follow-up 4); it has no effect on `discover:`.
+pub fn sync(file: &Path, profile: &str, dry_run: bool, refetch: bool) -> Result<()> {
     // Pure parse first — a typo fails before any connection is opened.
     let def = crate::config::CellDef::load(file)?;
     let dir = crate::config::cell_dir(file);
@@ -158,7 +160,7 @@ pub fn sync(file: &Path, profile: &str, dry_run: bool) -> Result<()> {
         );
     }
     if def.semantic_model.is_some() {
-        sync_semantic(&def, &dir, file, dry_run)?;
+        sync_semantic(&def, &dir, file, dry_run, refetch)?;
     }
     if def.discover.is_some() {
         sync_discover(&def, &dir, file, profile, dry_run)?;
@@ -270,11 +272,20 @@ fn sync_discover(
 /// (a directory, or a git fetch), walk it, merge every file into one
 /// `Document`, and write `.cell/semantic_model.json`. Opens no database,
 /// needs no profile.
+///
+/// Follow-up 4: when `semantic_model.git.ref` is a pinned 40-hex sha and
+/// `.cell/semantic_model.json` already carries that exact commit from the
+/// identical `source` (url, path, ref), the git half is skipped entirely —
+/// no clone, no fetch, no network. Motivation: the deploy pod has no git
+/// credentials; CI produces the snapshot with the runner's own creds at
+/// build time, and a pinned sha can never mean something different on a
+/// re-sync. `--refetch` forces the clone regardless.
 fn sync_semantic(
     def: &crate::config::CellDef,
     dir: &Path,
     file: &Path,
     dry_run: bool,
+    refetch: bool,
 ) -> Result<()> {
     use crate::ossie::{git, record::Resolved, record::SemanticModelRecord, source};
 
@@ -284,6 +295,27 @@ fn sync_semantic(
         .expect("caller checked semantic_model.is_some()");
     let cell_yaml_digest = crate::context::cell_yaml_digest_of(file)?;
     let now = crate::timeutil::unix_now();
+
+    if let source::SemanticModelSource::Git { r#ref: Some(r), .. } = &src {
+        if !refetch && crate::ossie::record::is_pinned_sha(r) {
+            if let Some(existing) = SemanticModelRecord::load(dir) {
+                let already_pinned =
+                    matches!(&existing.resolved, Resolved::Commit { commit } if commit == r);
+                if existing.source == src && already_pinned {
+                    if !dry_run && existing.cell_yaml_digest != cell_yaml_digest {
+                        let mut restamped = existing.clone();
+                        restamped.cell_yaml_digest = cell_yaml_digest;
+                        restamped.synced_at = crate::timeutil::rfc3339_utc(now);
+                        restamped.save(dir)?;
+                    }
+                    eprintln!(
+                        "reusing .cell/semantic_model.json at {r} (pinned; nothing to fetch)"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
 
     let (root, resolved) = match &src {
         source::SemanticModelSource::Dir { dir: raw } => {
@@ -788,7 +820,7 @@ mod tests {
             Some(crate::config::Discovery::Stale(record::Staleness::Missing))
         ));
 
-        sync(&file, "local", false).expect("sync");
+        sync(&file, "local", false, false).expect("sync");
         let record = DeployedCatalogRecord::load(&dir).unwrap();
         assert_eq!(record.catalog.tool, "sqlmesh");
         assert_eq!(record.catalog.environment, "prod");
@@ -913,7 +945,7 @@ mod tests {
             .contains("CHANGED IN DEV"));
 
         // `verify` live-checks the bound exports against the duckdb file.
-        crate::verify::run(&file, "local").expect("verify the discovered cell");
+        crate::verify::run(&file, "local", false).expect("verify the discovered cell");
         let doc = crate::context::build_document(&file, "local", true).unwrap();
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "verified_at_source", "{v}");
@@ -935,7 +967,7 @@ mod tests {
     fn a_supported_models_upstream_change_refuses_to_sync_until_the_version_moves() {
         let dir = scaffold("pin", CELL);
         let file = dir.join("cell.yaml");
-        sync(&file, "local", false).unwrap();
+        sync(&file, "local", false, false).unwrap();
         // Simulate an upstream data change: rewrite the record's data_hash
         // for the supported model, as a previous sync would have seen it.
         let mut record = DeployedCatalogRecord::load(&dir).unwrap();
@@ -947,7 +979,7 @@ mod tests {
             .unwrap();
         m.data_hash = Some("previous".to_string());
         record.write(&dir).unwrap();
-        let err = sync(&file, "local", false).unwrap_err().to_string();
+        let err = sync(&file, "local", false, false).unwrap_err().to_string();
         assert!(
             err.contains("contract: supported") && err.contains("2.0.0"),
             "{err}"
@@ -955,7 +987,7 @@ mod tests {
         // Bumping the version is the operator's answer.
         let bumped = CELL.replace("version: 2.0.0", "version: 3.0.0");
         std::fs::write(&file, bumped).unwrap();
-        sync(&file, "local", false).expect("a bumped version syncs");
+        sync(&file, "local", false, false).expect("a bumped version syncs");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -963,7 +995,7 @@ mod tests {
     fn stale_records_are_named_not_served() {
         let dir = scaffold("stale", CELL);
         let file = dir.join("cell.yaml");
-        sync(&file, "local", false).unwrap();
+        sync(&file, "local", false, false).unwrap();
         // A profile switch: the record attests `local`, not `prod`.
         std::fs::copy(
             dir.join("profiles/local.yaml"),
@@ -1008,7 +1040,7 @@ mod tests {
             CELL.replace("docs: docs/documented.md", &format!("docs: {absolute}")),
         )
         .unwrap();
-        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        let err = format!("{:#}", sync(&file, "local", false, false).unwrap_err());
         assert!(
             err.contains("absolute paths and `..` are rejected"),
             "{err}"
@@ -1026,7 +1058,7 @@ mod tests {
             CELL.replace("docs: docs/documented.md", &format!("docs: {rel}")),
         )
         .unwrap();
-        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        let err = format!("{:#}", sync(&file, "local", false, false).unwrap_err());
         assert!(
             err.contains("absolute paths and `..` are rejected"),
             "{err}"
@@ -1034,7 +1066,7 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
         std::fs::write(dir.join("docs/documented.md"), "x".repeat(70_000)).unwrap();
         std::fs::write(&file, CELL).unwrap();
-        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        let err = format!("{:#}", sync(&file, "local", false, false).unwrap_err());
         assert!(err.contains("max 65536"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1051,7 +1083,7 @@ mod tests {
             ),
         );
         let file = dir.join("cell.yaml");
-        sync(&file, "local", false).expect("warn is the default");
+        sync(&file, "local", false, false).expect("warn is the default");
         let doc = crate::context::build_document(&file, "local", true).unwrap();
         assert!(doc.exports.iter().all(|e| e.name != "gone"));
         let strict = std::fs::read_to_string(&file).unwrap().replace(
@@ -1059,7 +1091,7 @@ mod tests {
             "  on_missing_override: fail\n  overrides:\n",
         );
         std::fs::write(&file, strict).unwrap();
-        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        let err = format!("{:#}", sync(&file, "local", false, false).unwrap_err());
         assert!(
             err.contains("sqlmesh_example.renamed_away") && err.contains("no longer deployed"),
             "{err}"
@@ -1069,7 +1101,7 @@ mod tests {
             .unwrap()
             .replace("sqlmesh_example.renamed_away", "sqlmesh_example.seed_model");
         std::fs::write(&file, excluded).unwrap();
-        let err = format!("{:#}", sync(&file, "local", false).unwrap_err());
+        let err = format!("{:#}", sync(&file, "local", false, false).unwrap_err());
         assert!(err.contains("excluded by `discover.select`"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1081,14 +1113,14 @@ mod tests {
             &CELL.replace("schemas: [sqlmesh_example]", "tags: [nope]"),
         );
         let file = dir.join("cell.yaml");
-        let err = sync(&file, "local", false).unwrap_err().to_string();
+        let err = sync(&file, "local", false, false).unwrap_err().to_string();
         assert!(err.contains("matched none of the 6 models"), "{err}");
         std::fs::write(
             &file,
             CELL.replace("state: state\n", "state: state\n  environment: staging\n"),
         )
         .unwrap();
-        let err = sync(&file, "local", false).unwrap_err().to_string();
+        let err = sync(&file, "local", false, false).unwrap_err().to_string();
         assert!(err.contains("no environment named 'staging'"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1146,7 +1178,7 @@ mod tests {
         // No profiles/ directory at all — confirms the semantic half never
         // needs one.
         let file = dir.join("cell.yaml");
-        sync(&file, "local", false).unwrap();
+        sync(&file, "local", false, false).unwrap();
         let record = crate::ossie::record::SemanticModelRecord::load(&dir)
             .expect(".cell/semantic_model.json must exist");
         assert_eq!(record.files, vec!["model.yaml".to_string()]);
@@ -1166,12 +1198,103 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cell.yaml"), "cell: c\ninterface: []\n").unwrap();
-        let err = sync(&dir.join("cell.yaml"), "local", false).unwrap_err();
+        let err = sync(&dir.join("cell.yaml"), "local", false, false).unwrap_err();
         assert!(
             err.to_string()
                 .contains("declares neither `discover:` nor `semantic_model:`"),
             "{err}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn semantic_only_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "datamk-catalog-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A cell.yaml + a pre-existing `.cell/semantic_model.json` for a pinned
+    /// `semantic_model.git.ref`, at the given sha — the reuse fixture
+    /// follow-up 4's tests share.
+    fn write_pinned_git_fixture(dir: &Path, url: &str, sha: &str) -> String {
+        let yaml = format!("cell: c\nsemantic_model:\n  git: {url}\n  ref: {sha}\n");
+        std::fs::write(dir.join("cell.yaml"), &yaml).unwrap();
+        let digest = crate::context::sha256_hex(yaml.as_bytes());
+        crate::ossie::record::SemanticModelRecord {
+            datamk_version: "0.0.0".to_string(),
+            cell_yaml_digest: digest.clone(),
+            synced_at: "2026-09-10T00:00:00Z".to_string(),
+            source: crate::ossie::source::SemanticModelSource::Git {
+                git: url.to_string(),
+                path: None,
+                r#ref: Some(sha.to_string()),
+            },
+            resolved: crate::ossie::record::Resolved::Commit {
+                commit: sha.to_string(),
+            },
+            content_sha256: "abc".to_string(),
+            files: vec!["m.yaml".to_string()],
+            model_files: IndexMap::new(),
+            document: crate::ossie::Document {
+                version: "0.1.1".to_string(),
+                dialects: vec![],
+                vendors: vec![],
+                semantic_model: vec![],
+            },
+        }
+        .save(dir)
+        .unwrap();
+        digest
+    }
+
+    /// Follow-up 4: a pinned 40-hex `ref:` whose `.cell/semantic_model.json`
+    /// already records that exact commit from the identical `source` is
+    /// reused with no clone, no fetch — proven here by pointing `git:` at a
+    /// host that can never resolve (`.invalid`, RFC 2606): if `sync` ever
+    /// shelled out to `git`, it would fail (or hang) instead of returning
+    /// `Ok`.
+    #[test]
+    fn sync_semantic_reuses_a_pinned_snapshot_with_no_network() {
+        let dir = semantic_only_dir("semantic-reuse");
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = write_pinned_git_fixture(
+            &dir,
+            "https://this-host-does-not-exist.invalid/repo.git",
+            sha,
+        );
+        sync(&dir.join("cell.yaml"), "local", false, false)
+            .expect("a pinned sha already synced must be reused with no network access");
+        let after = crate::ossie::record::SemanticModelRecord::load(&dir).unwrap();
+        assert_eq!(after.cell_yaml_digest, digest);
+        assert_eq!(
+            after.content_sha256, "abc",
+            "reused verbatim, never re-fetched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Follow-up 4: `--refetch` forces the clone even when the pinned-sha
+    /// reuse condition holds — proven by the identical fixture now failing
+    /// (the unreachable host is actually contacted).
+    #[test]
+    fn sync_semantic_refetch_forces_the_fetch_and_fails_against_an_unreachable_host() {
+        let dir = semantic_only_dir("semantic-refetch");
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        write_pinned_git_fixture(
+            &dir,
+            "https://this-host-does-not-exist.invalid/repo.git",
+            sha,
+        );
+        let err = sync(&dir.join("cell.yaml"), "local", false, true)
+            .expect_err("--refetch must actually attempt the network fetch, which fails here");
+        assert!(!err.to_string().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
