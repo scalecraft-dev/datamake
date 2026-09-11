@@ -5911,29 +5911,50 @@ mod tests {
             .expect("post-accumulation output must still verify cleanly");
     }
 
+    /// ADR 0008 Open verification gates §3: `CREATE TABLE IF NOT EXISTS ...
+    /// AS <select> LIMIT 0` creates the empty table. The default suite checks
+    /// the behaviour, never the clock: every timing shape of this canary
+    /// (a 500ms cap, a ratio against a staged copy, a ratio against the
+    /// SELECT itself) has failed on a loaded 2-vCPU CI runner while the
+    /// gate itself held. The timing claim lives in the `#[ignore]`d test
+    /// below, run by hand with `cargo test -- --ignored` when the planner
+    /// or DuckDB version moves.
     #[test]
-    fn bootstrap_limit_0_short_circuits_an_expensive_select_the_canary_gate_3_requires() {
-        // ADR 0008 Open verification gates §3 (CLEARED, empirical, 2026-07-13):
-        // `CREATE TABLE IF NOT EXISTS ... AS <select> LIMIT 0` short-circuits
-        // rather than fully evaluating an expensive SELECT — proven at 80M
-        // rows (9,579x for a window aggregate). This canary regresses that
-        // claim at a CI-friendly scale, and measures exactly what the gate
-        // claims: the bootstrap DDL over the *expensive SELECT itself*
-        // against a full evaluation of the same SELECT in the same session.
-        // Two earlier shapes flaked on a loaded CI box — a fixed 500ms cap
-        // (573ms observed), then a ratio against copying an already-staged
-        // table (182ms vs 506ms: a copy is cheap, so the ratio was weak by
-        // construction). The windowed SELECT is seconds of work at 10M rows;
-        // its LIMIT 0 is fixed DDL overhead. The bootstrap is timed three
-        // times (fresh table each) and the minimum taken, so first-call
-        // catalog/checkpoint cost on a cold box cannot masquerade as
-        // evaluation. A regression to full evaluation reads ~1x and fails.
+    fn bootstrap_limit_0_creates_an_empty_table_from_an_expensive_select() {
         let (conn, _dir) = probe_attach("bootstrap-canary");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bootstrapped AS SELECT id, \
+               sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running \
+             FROM range(100000) r(id) LIMIT 0;",
+        )
+        .expect("bootstrap DDL");
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM bootstrapped", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "bootstrap must create an empty table");
+        let cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.columns WHERE table_name = 'bootstrapped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 2, "the empty table carries the SELECT's schema");
+    }
+
+    /// Gate 3's timing claim (cleared empirically 2026-07-13 at 80M rows,
+    /// 9,579x for a window aggregate): LIMIT 0 short-circuits the expensive
+    /// SELECT instead of evaluating it. Ignored by default — wall-clock
+    /// ratios are not stable on shared CI runners. Run by hand:
+    /// `cargo test bootstrap_limit_0_short_circuits -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing canary; run by hand when the planner or DuckDB moves"]
+    fn bootstrap_limit_0_short_circuits_an_expensive_select_the_canary_gate_3_requires() {
+        let (conn, _dir) = probe_attach("bootstrap-canary-timing");
         const EXPENSIVE: &str = "SELECT id, \
             sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running, \
             avg(id) OVER (ORDER BY id ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) AS avgw \
           FROM range(10000000) r(id)";
-
         let mut bootstrap = Duration::MAX;
         for i in 0..3 {
             let started = Instant::now();
@@ -5943,21 +5964,15 @@ mod tests {
             .expect("bootstrap DDL");
             bootstrap = bootstrap.min(started.elapsed());
         }
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM bootstrapped_0", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "bootstrap must create an empty table");
-
         let started = Instant::now();
         conn.execute_batch(&format!("CREATE TABLE full_copy AS {EXPENSIVE};"))
             .expect("full evaluation of the expensive SELECT");
         let full = started.elapsed();
+        eprintln!("bootstrap (best of 3) {bootstrap:?} vs full evaluation {full:?}");
         assert!(
             bootstrap * 3 < full,
-            "bootstrap took {bootstrap:?} (best of 3) against a 10M-row windowed SELECT whose \
-             full evaluation took {full:?} — gate 3 expects LIMIT 0 to short-circuit, not \
-             evaluate; a planner regression may have reintroduced full evaluation on every \
-             declarative bootstrap"
+            "bootstrap took {bootstrap:?} against a 10M-row windowed SELECT whose full \
+             evaluation took {full:?} — gate 3 expects LIMIT 0 to short-circuit"
         );
     }
 
