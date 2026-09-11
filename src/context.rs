@@ -394,7 +394,10 @@ impl ExportDoc {
             binding: self.binding.clone(),
             depends_on: self.depends_on.clone(),
             depends_on_unselected: self.depends_on_unselected,
-            deployed: self.deployed.clone(),
+            // Provenance (fingerprint, intervals, cron, tags) that an agent
+            // never reads to pick a surface — 15 KB over 42 entries on a real
+            // cell. It stays on the record and on the route door.
+            deployed: None,
             probe: None,
             check: None,
             semantic: Vec::new(),
