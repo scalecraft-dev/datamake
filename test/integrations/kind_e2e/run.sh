@@ -168,7 +168,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: mc
-          image: minio/mc:latest
+          image: quay.io/minio/mc:RELEASE.2025-07-21T05-28-08Z
           command:
             - /bin/sh
             - -c
@@ -399,7 +399,9 @@ phase_validate() {
   log "validate: GET /openapi.json, discovering the export route"
   local openapi route
   openapi="$(curl -fsS "$base/openapi.json")" || die "GET /openapi.json failed"
-  route="$(echo "$openapi" | jq -r '.paths | keys[0]')"
+  # Export routes carry '@<major>'; the spec also documents /, /context,
+  # /context/{route}, and /openapi.json, which sort ahead of them.
+  route="$(echo "$openapi" | jq -r '[.paths | keys[] | select(contains("@"))][0]')"
   [ -n "$route" ] && [ "$route" != "null" ] || die "openapi.json has no routes"
   log "discovered route: $route"
 
