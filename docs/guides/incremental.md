@@ -85,6 +85,8 @@ Other rules:
   inherits nothing.
 - The composed statements are written to `.cell/materialize/<table>.sql` every
   run (audit and portability; overwritten; not a valid `transforms:` target).
+  `DATAMK_MATERIALIZE_DIR` redirects them; the container image sets it to
+  `/tmp/materialize` because the cell mounts read-only there.
 - One-off backfills and manual corrections: `datamk attach -f cell.yaml -p prod`
   and run SQL against the lake directly.
 

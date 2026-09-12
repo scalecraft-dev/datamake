@@ -1250,13 +1250,26 @@ fn execute_materialize(
 /// only for `replace` (schema-validated — `append`/`upsert` always carry a
 /// non-empty `key:`), which never ran any guard to lose, so its header says
 /// that plainly instead of naming guards that don't apply to it.
+/// Where the eject artifacts land: `DATAMK_MATERIALIZE_DIR` if set, else
+/// `.cell/materialize` under the cell directory. The override exists for
+/// the same reason `DATAMK_LOG=off` does (`logging.rs`): a deployed Builder
+/// mounts the cell read-only from a ConfigMap, so the default path is
+/// unwritable there and the image points this at the scratch emptyDir.
+/// Env-only, deliberately not a CLI flag — a laptop run never needs it.
+fn materialize_dir(dir: &Path) -> PathBuf {
+    match std::env::var_os("DATAMK_MATERIALIZE_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => dir.join(".cell").join("materialize"),
+    }
+}
+
 fn write_eject_artifact(
     dir: &Path,
     table: &str,
     key: &[String],
     statements: &[String],
 ) -> Result<PathBuf> {
-    let materialize_dir = dir.join(".cell").join("materialize");
+    let materialize_dir = materialize_dir(dir);
     std::fs::create_dir_all(&materialize_dir)
         .with_context(|| format!("creating {}", materialize_dir.display()))?;
     let path = materialize_dir.join(format!("{table}.sql"));
@@ -6156,6 +6169,20 @@ mod tests {
             cell.dir.join(".cell").join("materialize").join("fct.sql")
         );
         assert!(artifact.exists());
+    }
+
+    #[test]
+    fn materialize_dir_honours_the_env_override_and_ignores_an_empty_one() {
+        // Nothing else in this binary reads `DATAMK_MATERIALIZE_DIR`, so
+        // mutating it here is safe (same discipline as the DATAMK_LOG test).
+        let dir = Path::new("/some/cell");
+        std::env::remove_var("DATAMK_MATERIALIZE_DIR");
+        assert_eq!(materialize_dir(dir), dir.join(".cell").join("materialize"));
+        std::env::set_var("DATAMK_MATERIALIZE_DIR", "");
+        assert_eq!(materialize_dir(dir), dir.join(".cell").join("materialize"));
+        std::env::set_var("DATAMK_MATERIALIZE_DIR", "/tmp/materialize");
+        assert_eq!(materialize_dir(dir), PathBuf::from("/tmp/materialize"));
+        std::env::remove_var("DATAMK_MATERIALIZE_DIR");
     }
 
     // --- ADR 0008 §3 (founder-ratified): `materialize: replace` ------------

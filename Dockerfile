@@ -91,6 +91,8 @@ ENV SNOWFLAKE_ADBC_DRIVER_PATH=/usr/local/lib/libadbc_driver_snowflake.so
 # persistent-file-log feature in the deployed image; a local/dev invocation
 # of this same binary outside the image still gets it by default.
 ENV DATAMK_LOG=off
+# The cell mounts read-only; eject artifacts go to the scratch emptyDir.
+ENV DATAMK_MATERIALIZE_DIR=/tmp/materialize
 # Bake every DuckDB extension the engine may INSTALL at first use (~200 MB:
 # ducklake, httpfs, json, postgres, sqlite, community bigquery) into the
 # image, so a pod needs no registry egress and no exec-capable scratch
