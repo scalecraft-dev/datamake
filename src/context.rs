@@ -1444,15 +1444,52 @@ fn synonyms_of(ai: &Option<crate::ossie::AiContext>) -> &[String] {
     }
 }
 
-/// Whether a token is addressable via `?terms=`/`--terms` (ADR 0018 §7):
-/// `[A-Za-z0-9_.-]{1,64}`. A synonym outside this grammar is kept in
-/// `semantic_model`'s prose but never indexed here — `datamk sync` warns
-/// about it at ingest time.
+/// Whether a token is addressable via `?terms=`/`--terms` (ADR 0018 §7,
+/// amended 2026-10): `[A-Za-z0-9_.-]{1,64}` with interior spaces allowed,
+/// so a multi-word business term (`white paper`) is addressable as people
+/// actually say it — no leading/trailing whitespace. A synonym outside
+/// this grammar is kept in `semantic_model`'s prose but never indexed here
+/// — `datamk sync` warns about it at ingest time.
 pub(crate) fn is_addressable_token(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
+        && s.trim() == s
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b' '))
+}
+
+/// Whether a name may enter `?model=`'s OpenAPI enum: the `model` door's
+/// own grammar (`[A-Za-z0-9_.-]{1,128}`, `serve::validate_context_query`),
+/// which — unlike `terms` — admits no spaces. A spaced model name is still
+/// addressable through `?terms=` (`is_addressable_token`); it just can't
+/// be the one `?model=` selects.
+pub(crate) fn is_model_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// The key `?terms=`/`--terms` lookups match on (ADR 0017 §3, amended
+/// 2026-10): ASCII-lowercased, trimmed, with every run of whitespace, `_`
+/// or `-` folded to one `_`. `white paper`, `White-Paper` and `white_paper`
+/// are one key, so a caller can ask in the words people use and still hit
+/// the `white_paper` term the glossary spells with an underscore.
+pub(crate) fn term_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_sep = false;
+    for c in s.trim().chars() {
+        if c.is_whitespace() || c == '_' || c == '-' {
+            pending_sep = true;
+            continue;
+        }
+        if pending_sep {
+            out.push('_');
+            pending_sep = false;
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 /// Up to 8 entries of `known` nearest to `token` (case-insensitive, ASCII):
@@ -1648,8 +1685,9 @@ pub fn resolve_semantic_matches(
 ) -> Vec<SemanticMatch> {
     let mut out = Vec::new();
     for tok in tokens {
+        let key = term_key(tok);
         for entry in lookup {
-            if entry.token.eq_ignore_ascii_case(tok) {
+            if term_key(&entry.token) == key {
                 out.push(SemanticMatch {
                     token: tok.clone(),
                     kind: entry.kind.clone(),
@@ -2225,8 +2263,9 @@ impl ContextDocument {
         true
     }
 
-    /// `terms=` (ADR 0017 §3, extended by ADR 0018 §7): case-insensitive
-    /// lookup over `all_definitions`' terms/aliases AND every addressable
+    /// `terms=` (ADR 0017 §3, extended by ADR 0018 §7): `term_key`
+    /// (case-, space-, `_`-, `-`-insensitive) lookup over
+    /// `all_definitions`' terms/aliases AND every addressable
     /// Ossie dataset/field/metric name or synonym (`self.semantic_lookup`).
     /// A token may hit both; every Ossie hit is returned (collisions across
     /// models are all listed, each naming its model). Resolves against the
@@ -2251,20 +2290,16 @@ impl ContextDocument {
     ) -> Vec<String> {
         let mut index: IndexMap<String, &str> = IndexMap::new();
         for d in all_definitions {
-            index
-                .entry(d.term.to_ascii_lowercase())
-                .or_insert(d.term.as_str());
+            index.entry(term_key(&d.term)).or_insert(d.term.as_str());
             for alias in &d.aliases {
-                index
-                    .entry(alias.to_ascii_lowercase())
-                    .or_insert(d.term.as_str());
+                index.entry(term_key(alias)).or_insert(d.term.as_str());
             }
         }
         let mut matched: Vec<String> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
         let semantic_matches = resolve_semantic_matches(tokens, &self.semantic_lookup);
         for tok in tokens {
-            let definitions_hit = index.get(&tok.to_ascii_lowercase());
+            let definitions_hit = index.get(&term_key(tok));
             let ossie_hit = semantic_matches.iter().any(|m| &m.token == tok);
             if let Some(term) = definitions_hit {
                 if !matched.iter().any(|t| t == term) {
@@ -5302,6 +5337,43 @@ interface:
         );
     }
 
+    /// ADR 0017 §3 (amended 2026-10): one key per business term however
+    /// a caller spells the word gap or case.
+    #[test]
+    fn term_key_folds_case_whitespace_underscore_and_hyphen() {
+        for s in [
+            "white paper",
+            "White Paper",
+            "white_paper",
+            "WHITE-PAPER",
+            "  white   paper ",
+            "white_-_paper",
+        ] {
+            assert_eq!(term_key(s), "white_paper", "{s:?}");
+        }
+        assert_eq!(
+            term_key("net.revenue"),
+            "net.revenue",
+            "`.` is not a separator"
+        );
+        assert_eq!(term_key("nr"), "nr");
+        assert_eq!(term_key("   "), "");
+        assert!(is_addressable_token("white paper"));
+        assert!(
+            !is_addressable_token(" white paper"),
+            "no leading whitespace"
+        );
+        assert!(
+            !is_addressable_token("white paper "),
+            "no trailing whitespace"
+        );
+        assert!(
+            !is_addressable_token("white\tpaper"),
+            "only the ASCII space"
+        );
+        assert!(!is_model_token("white paper"), "`?model=` admits no spaces");
+    }
+
     #[test]
     fn terms_resolve_ossie_dataset_field_metric_and_synonym_with_cross_model_collisions() {
         let def = sample_def_with_semantic();
@@ -5344,16 +5416,16 @@ interface:
         assert!(hits[0].field.is_none());
     }
 
-    /// M6: a name outside the addressable token grammar
-    /// (`[A-Za-z0-9_.-]{1,64}`) is not indexed for `?terms=`/the OpenAPI
-    /// enums — it still exists in the document (`semantic_model`/
-    /// `exports[].semantic`), just not in the lookup — mirroring what
-    /// already applied to synonyms before this fix reached dataset/field/
-    /// metric/model names too.
+    /// M6, amended 2026-10: a name with interior spaces IS addressable via
+    /// `?terms=` (people search in their own words), so it is indexed; a
+    /// name outside the grammar for another reason (here, a `!`) is not,
+    /// but still exists in the document (`semantic_model`/
+    /// `exports[].semantic`). `?model=`'s enum keeps the stricter
+    /// `is_model_token` grammar — exercised in `serve::openapi`'s tests.
     #[test]
     fn non_addressable_names_are_not_indexed_but_still_appear_in_the_document() {
         let mut ds = ossie_dataset("has space", "orders_daily", &[], vec![]);
-        ds.fields.push(ossie_field("also bad", "id"));
+        ds.fields.push(ossie_field("also bad!", "id"));
         let model = crate::ossie::SemanticModel {
             name: "model with space".to_string(),
             description: None,
@@ -5392,10 +5464,23 @@ interface:
         };
         let index = crate::ossie::bind::SemanticIndex::build(record, &[]);
         let lookup = semantic_lookup_entries(&index);
-        assert!(lookup.is_empty(), "{lookup:?}");
+        let tokens: Vec<&str> = lookup.iter().map(|e| e.token.as_str()).collect();
+        assert_eq!(
+            tokens,
+            vec!["model with space", "has space", "metric bad"],
+            "{lookup:?}"
+        );
+        assert!(!is_model_token("model with space"));
 
-        // Still present in the model listing itself — not dropped, just
-        // not addressable.
+        // A spaced token resolves however the caller spells the gap.
+        for spelling in ["has space", "Has_Space", "HAS-SPACE", "has  space"] {
+            let hits = resolve_semantic_matches(&[spelling.to_string()], &lookup);
+            assert_eq!(hits.len(), 1, "{spelling}: {hits:?}");
+            assert_eq!(hits[0].kind, "dataset");
+        }
+        assert!(resolve_semantic_matches(&["also bad!".to_string()], &lookup).is_empty());
+
+        // Still present in the model listing itself — not dropped.
         assert_eq!(index.models()[0].name, "model with space");
         assert_eq!(index.models()[0].datasets[0].name, "has space");
     }

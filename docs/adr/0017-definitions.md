@@ -153,11 +153,20 @@ datamk context -f cell.yaml --terms net_revenue,active_customer
 
 Grammar, closed (ADR 0012 §7 / ADR 0013 §4): `/context` and
 `/context/<route>` accept exactly `include` and `terms`; any other parameter
-→ 400. `terms` is comma-separated; an empty value, an empty segment, a token
-outside `[A-Za-z0-9_.-]`, or more than 64 tokens → 400. Repeated identical
-tokens deduplicate. Matching is ASCII-case-insensitive over every term and
-alias; a hit resolves to its canonical `term`, and two tokens resolving to
-one term yield one entry.
+→ 400. `terms` is comma-separated; each token is trimmed; an empty value, an
+empty segment, a token outside `[A-Za-z0-9_.-]` plus space, or more than 64
+tokens → 400. Repeated identical tokens deduplicate. Matching is on a
+normalized key — ASCII-lowercased, every run of whitespace/`_`/`-` folded to
+one `_` — over every term and alias, so `white paper`, `White-Paper` and
+`white_paper` all hit a `white_paper` term; a hit resolves to its canonical
+`term`, and two tokens resolving to one term yield one entry. Uniqueness
+(§1) is checked on the same key.
+
+*Amended 2026-10-15:* spaces were previously a 400. A caller — an agent
+relaying a person's own words — asks for `white paper`, not `white_paper`;
+rewriting the request on the client would have it search for a token the
+person never said. The door now takes the words and the lookup folds the
+separator, so the glossary's spelling is the glossary's concern alone.
 
 **An unknown term is not an error.** A robot asking for three terms and
 getting one wrong must keep the other two, and a 404 would push it back into

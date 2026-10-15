@@ -399,10 +399,12 @@ fn sync_semantic(
     Ok(())
 }
 
-/// ADR 0018 §7: a synonym outside `[A-Za-z0-9_.-]{1,64}` stays in the
-/// document (never rejected — datamake ingests, never rewrites, Ossie) but
-/// cannot join the `terms=` lookup index; warned here so an author notices
-/// at sync time rather than wondering why a lookup silently misses.
+/// ADR 0018 §7: a synonym outside the addressable grammar
+/// (`context::is_addressable_token`: `[A-Za-z0-9_.-]{1,64}`, interior
+/// spaces allowed) stays in the document (never rejected — datamake
+/// ingests, never rewrites, Ossie) but cannot join the `terms=` lookup
+/// index; warned here so an author notices at sync time rather than
+/// wondering why a lookup silently misses.
 fn warn_unaddressable_synonyms(doc: &crate::ossie::Document) {
     let mut bad: Vec<String> = Vec::new();
     let mut check = |ai: &Option<crate::ossie::AiContext>| {
@@ -410,11 +412,7 @@ fn warn_unaddressable_synonyms(doc: &crate::ossie::Document) {
             return;
         };
         for s in &d.synonyms {
-            let ok = !s.is_empty()
-                && s.chars().count() <= 64
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
-            if !ok {
+            if !crate::context::is_addressable_token(s) {
                 bad.push(s.clone());
             }
         }
@@ -434,8 +432,8 @@ fn warn_unaddressable_synonyms(doc: &crate::ossie::Document) {
     if !bad.is_empty() {
         let shown: Vec<&str> = bad.iter().take(5).map(String::as_str).collect();
         eprintln!(
-            "Warning: {} ai_context.synonyms entries are not addressable ([A-Za-z0-9_.-]{{1,64}}) \
-             and will not join the `terms=` lookup index: {}{}",
+            "Warning: {} ai_context.synonyms entries are not addressable ([A-Za-z0-9_.-]{{1,64}}, \
+             spaces allowed inside) and will not join the `terms=` lookup index: {}{}",
             bad.len(),
             shown.join(", "),
             if bad.len() > shown.len() { ", …" } else { "" }

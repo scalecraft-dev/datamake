@@ -60,13 +60,13 @@ pub fn generate_with_all(
     base_path: &str,
 ) -> Value {
     let terms_vocabulary = terms_vocabulary(definitions, semantic_lookup);
-    // M6: a model name outside the addressable token grammar
-    // ([A-Za-z0-9_.-]{1,64}) still lists in the document's `semantic_
-    // models[]`, but must not enter this enum — it would 400 at the door
-    // the moment a caller tried the value the enum itself offered.
+    // M6: a model name outside `?model=`'s grammar ([A-Za-z0-9_.-]{1,128},
+    // no spaces — stricter than `terms`) still lists in the document's
+    // `semantic_models[]`, but must not enter this enum — it would 400 at
+    // the door the moment a caller tried the value the enum itself offered.
     let model_vocabulary: Vec<Value> = semantic_models
         .iter()
-        .filter(|m| crate::context::is_addressable_token(&m.name))
+        .filter(|m| crate::context::is_model_token(&m.name))
         .map(|m| json!(m.name))
         .collect();
     let mut paths = Map::new();
@@ -181,9 +181,12 @@ fn context_path_item(terms_vocabulary: &[Value], model_vocabulary: &[Value]) -> 
                     "explode": false,
                     "description": "Comma-separated term/alias list (ADR 0017) that narrows \
                                     `definitions[]` and, under `include=docs`, `docs[]` to \
-                                    those terms' `definition:<term>` pages only. Matching is \
-                                    case-insensitive; an unmatched token is echoed in \
-                                    `missing_terms`, never a 400 or 404. On this door (never \
+                                    those terms' `definition:<term>` pages only. A token may \
+                                    contain spaces — ask for a multi-word term in its own \
+                                    words (`white paper`). Matching is case-insensitive and \
+                                    treats space, `_` and `-` as one separator; an unmatched \
+                                    token is echoed in `missing_terms`, never a 400 or 404. On \
+                                    this door (never \
                                     `/context/{route}`), also projects `exports[]` to the \
                                     index shape (item 3) — the same projection `?view=index` \
                                     applies — since asking for a handful of terms has no reason \

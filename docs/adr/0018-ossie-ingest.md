@@ -206,7 +206,7 @@ Additive; `datamk_context` stays 4. Ossie content carries `from: ossie`
 | `/context` | `semantic_models[]`: name, description, file, dataset/bound/metric counts. Always present, `[]` without a source. |
 | `/context/<route>` | `exports[].semantic[]`: every dataset bound to the route, with fields, `ai_context`, and per-field verification; the model's relationships touching it (other side named by route or `null`); metrics whose datasets are all bound to this route, in full; other metrics naming the dataset as `{name, model}` pointers. |
 | `/context?model=<name>` | one semantic model in full (`semantic_model` block), composable with `terms`. |
-| `/context?terms=…` | Ossie dataset, field and metric names plus `ai_context.synonyms` join the lookup index beside `definitions:`; hits land in `semantic_matches[]` `{token, kind, model, dataset, field, description}`. Synonyms outside `[A-Za-z0-9_.-]`/64 chars are kept in the document and warned at `sync` as not addressable. Collisions across models return every hit, each naming its model. |
+| `/context?terms=…` | Ossie dataset, field and metric names plus `ai_context.synonyms` join the lookup index beside `definitions:`; hits land in `semantic_matches[]` `{token, kind, model, dataset, field, description}`. Synonyms outside `[A-Za-z0-9_.-]`/64 chars (interior spaces allowed since 2026-10-15; matching folds space/`_`/`-`, ADR 0017 §3) are kept in the document and warned at `sync` as not addressable. Collisions across models return every hit, each naming its model. |
 
 `datamk context --model <name>` mirrors `?model=`. The top-level
 `semantic` block on the document carries `synced_at`, `content_sha256`,

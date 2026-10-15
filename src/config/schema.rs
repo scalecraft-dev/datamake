@@ -1574,7 +1574,9 @@ impl CellDef {
 
     /// ADR 0017 §1: shape validation for `definitions[]` — term/alias
     /// grammar, description length, cell-wide uniqueness (term and alias
-    /// names compared ASCII-case-insensitively across both sets), and the
+    /// names compared on `context::term_key` — case-, `_`- and
+    /// `-`-insensitive — across both sets, since that is the key `?terms=`
+    /// resolves on and two names sharing it would be unreachable), and the
     /// per-cell/per-term caps. Does not resolve `applies_to` against the
     /// interface (`validate_applies_to`'s job) — this runs before a
     /// `discover:` cell's interface exists.
@@ -1612,11 +1614,12 @@ impl CellDef {
                 validate_term_shape(alias, &d.term)?;
             }
             for name in std::iter::once(&d.term).chain(d.aliases.iter()) {
-                let key = name.to_ascii_lowercase();
+                let key = crate::context::term_key(name);
                 if let Some(prev) = seen.get(&key) {
                     bail!(
                         "definitions '{prev}' and '{}' both use the name '{name}' \
-                         (case-insensitive) — term and alias names must be unique cell-wide.",
+                         (case-insensitive; `_` and `-` are the same separator) — term and \
+                         alias names must be unique cell-wide.",
                         d.term
                     );
                 }
