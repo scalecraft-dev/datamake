@@ -1380,7 +1380,9 @@ struct ContextQuery {
 /// model, view}` grammar (ADR 0013 §4, extended by ADR 0017 §3, ADR 0018
 /// §7, and item 2): `include`'s value is a comma-separated list drawn from
 /// `INCLUDE_SECTIONS`; `terms`'s value is a comma-separated list of tokens
-/// matching `[A-Za-z0-9_.-]`, capped at `MAX_TERMS`; `model`'s value is one
+/// matching `[A-Za-z0-9_.-]` or space (a multi-word business term is
+/// asked for in its own words — `white paper` — and matched on
+/// `context::term_key`), each trimmed, capped at `MAX_TERMS`; `model`'s value is one
 /// token matching `[A-Za-z0-9_.-]{1,128}` — given more than once, a 400 (no
 /// comma-list semantics: a document names one model, not several); `view`'s
 /// value is one of `VIEW_SECTIONS`, also given at most once. Any other
@@ -1421,19 +1423,20 @@ fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<Con
             }
             "terms" => {
                 for tok in v.split(',') {
+                    let tok = tok.trim();
                     if tok.is_empty() {
                         return Err(
                             "`terms` must name at least one term or alias — a comma-separated \
-                             list matching [A-Za-z0-9_.-]"
+                             list matching [A-Za-z0-9_.-] (spaces allowed inside a term)"
                                 .to_string(),
                         );
                     }
-                    if !tok
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
-                    {
+                    if !tok.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b' ')
+                    }) {
                         return Err(format!(
-                            "`terms` token '{tok}' has characters outside [A-Za-z0-9_.-]"
+                            "`terms` token '{tok}' has characters outside [A-Za-z0-9_.-] \
+                             (spaces allowed inside a term)"
                         ));
                     }
                     terms_seen += 1;
@@ -1497,7 +1500,7 @@ fn validate_context_query(pairs: &[(String, String)]) -> std::result::Result<Con
     })
 }
 
-/// Case-insensitive term/alias lookup over `s.interface.definitions`,
+/// `context::term_key` term/alias lookup over `s.interface.definitions`,
 /// resolved to canonical terms, deduplicated — the same resolution
 /// `ContextDocument::narrow_terms` performs, exposed standalone so the
 /// `ETag` (ADR 0017 §4) can be computed before assembling the document:
@@ -1507,17 +1510,17 @@ fn resolve_terms(s: &AppState, tokens: &[String]) -> Vec<String> {
     let mut index: HashMap<String, &str> = HashMap::new();
     for d in &s.interface.definitions {
         index
-            .entry(d.term.to_ascii_lowercase())
+            .entry(crate::context::term_key(&d.term))
             .or_insert(d.term.as_str());
         for alias in &d.aliases {
             index
-                .entry(alias.to_ascii_lowercase())
+                .entry(crate::context::term_key(alias))
                 .or_insert(d.term.as_str());
         }
     }
     let mut matched: Vec<String> = Vec::new();
     for tok in tokens {
-        if let Some(term) = index.get(&tok.to_ascii_lowercase()) {
+        if let Some(term) = index.get(&crate::context::term_key(tok)) {
             if !matched.iter().any(|t| t == term) {
                 matched.push(term.to_string());
             }
@@ -4154,9 +4157,14 @@ pub(in crate::serve) mod smoke {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert!(body.contains("must name at least one term"), "{body}");
 
-            let (status, body) = get(&router, "/context?terms=bad%20term", None).await;
+            let (status, body) = get(&router, "/context?terms=bad%21term", None).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert!(body.contains("characters outside"), "{body}");
+
+            // A whitespace-only token is an empty segment once trimmed.
+            let (status, body) = get(&router, "/context?terms=net_revenue,%20", None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("must name at least one term"), "{body}");
 
             let many = (0..65)
                 .map(|i| format!("t{i}"))
@@ -4196,6 +4204,41 @@ pub(in crate::serve) mod smoke {
                 .collect();
             assert_eq!(terms, vec!["net_revenue"]);
             assert_eq!(v["missing_terms"], serde_json::json!(["nope"]));
+        });
+    }
+
+    /// ADR 0017 §3 (amended 2026-10): a multi-word term is asked for in
+    /// its own words. `net%20revenue`, `net+revenue` and `Net-Revenue` all
+    /// resolve to the `net_revenue` term; an unknown spaced token is a 200
+    /// echoed (trimmed) in `missing_terms`, never a 400.
+    #[test]
+    fn terms_accept_spaces_and_match_space_underscore_hyphen_insensitively() {
+        let router = router_definitions(|_| {});
+        rt().block_on(async {
+            for q in [
+                "/context?terms=net%20revenue",
+                "/context?terms=net+revenue",
+                "/context?terms=Net-Revenue",
+                "/context?terms=%20net%20revenue%20",
+            ] {
+                let (status, body) = get(&router, q, None).await;
+                assert_eq!(status, StatusCode::OK, "{q}: {body}");
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let terms: Vec<&str> = v["definitions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d["term"].as_str().unwrap())
+                    .collect();
+                assert_eq!(terms, vec!["net_revenue"], "{q}: {body}");
+                assert_eq!(v["missing_terms"], serde_json::json!([]), "{q}: {body}");
+            }
+
+            let (status, body) = get(&router, "/context?terms=white%20paper", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["definitions"].as_array().unwrap().len(), 0, "{body}");
+            assert_eq!(v["missing_terms"], serde_json::json!(["white paper"]));
         });
     }
 

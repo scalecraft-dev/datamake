@@ -281,7 +281,9 @@ pub struct ContextArgs {
     #[arg(long, value_name = "ROUTE")]
     pub export: Option<String>,
     /// Narrow `definitions[]`/`docs[]` to a comma-separated list of terms
-    /// or aliases (ADR 0017), resolved against the whole cell and composing
+    /// or aliases (ADR 0017), matched case-, space-, `_`- and `-`-
+    /// insensitively (quote a multi-word term: --terms "white paper"),
+    /// resolved against the whole cell and composing
     /// with `--export` exactly as `?terms=` composes with
     /// `/context/<route>`. Unlike the served door, an unknown term exits
     /// non-zero, naming the known ones — a file written by `--out` cannot
