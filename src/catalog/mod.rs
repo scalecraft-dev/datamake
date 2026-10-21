@@ -18,7 +18,10 @@ use std::path::Path;
 use crate::config::{
     Bindings, Contract, Discover, DiscoverFrom, OnUnresolvable, ResolvedConnection,
 };
-use ir::{ColumnsSource, DeployedCatalog, DeployedColumn, DeployedModel, Evidence, Interval};
+use ir::{
+    ColumnsSource, DeployedCatalog, DeployedColumn, DeployedModel, Evidence, Interval,
+    VirtualObject,
+};
 use record::DeployedCatalogRecord;
 
 /// Exit code `sync` uses for "not an error in the cell — the tool's
@@ -553,13 +556,16 @@ fn read_sqlmesh(
     let intervals = state::read_intervals(conn, STATE_ALIAS, schema, &selected)?;
 
     // Warehouse read, batched per schema, for every selected model — the
-    // primary source of column definitions (§4).
+    // primary source of column definitions (§4). Read at the object this
+    // environment exposes (`view`): prod's is the model's name; a dev
+    // environment's is suffixed, and a model only this environment has
+    // exists nowhere else.
     let objects: Vec<warehouse::ObjectRef> = selected
         .iter()
         .map(|m| warehouse::ObjectRef {
-            catalog: m.name.catalog.clone(),
-            schema: m.name.schema.clone(),
-            table: m.name.table.clone(),
+            catalog: m.view.catalog.clone(),
+            schema: m.view.schema.clone(),
+            table: m.view.table.clone(),
         })
         .collect();
     let wh_columns = warehouse::read_columns(
@@ -575,7 +581,8 @@ fn read_sqlmesh(
     let mut excluded_unresolvable = Vec::new();
     for m in selected {
         let object = m.name.object();
-        let wh = wh_columns.get(&object);
+        let view_object = m.view.object();
+        let wh = wh_columns.get(&view_object);
         let (columns, columns_source): (IndexMap<String, DeployedColumn>, ColumnsSource) =
             if !m.declared_columns.is_empty() {
                 (
@@ -616,14 +623,14 @@ fn read_sqlmesh(
                     OnUnresolvable::Fail => bail!(
                         "model {} has no resolvable column types: its MODEL(...) declares no \
                          `columns`, and the warehouse (connection '{}') has no object \
-                         `{object}`. Fix one of: declare `columns` in the model; run `sqlmesh plan \
-                         {}` so the object exists; grant '{}' metadata read on schema '{}'; or \
-                         set `discover.on_unresolvable: exclude`.",
+                         `{view_object}`. Fix one of: declare `columns` in the model; run \
+                         `sqlmesh plan {}` so the object exists; grant '{}' metadata read on \
+                         schema '{}'; or set `discover.on_unresolvable: exclude`.",
                         m.name.unquoted(),
                         d.warehouse,
                         env.name,
                         d.warehouse,
-                        m.name.schema
+                        m.view.schema
                     ),
                     OnUnresolvable::Exclude => {
                         excluded_unresolvable.push(m.name.unquoted());
@@ -653,10 +660,15 @@ fn read_sqlmesh(
             start: crate::timeutil::rfc3339_utc(r.start_ts / 1000),
             end: crate::timeutil::rfc3339_utc(r.end_ts / 1000),
         });
+        let view = (m.view != m.name).then(|| VirtualObject {
+            catalog: m.view.catalog.clone(),
+            object: view_object.clone(),
+        });
         models.push(DeployedModel {
             name: m.name.unquoted(),
             object,
             catalog: m.name.catalog.clone(),
+            view,
             fingerprint: m.identifier.clone(),
             version: Some(m.version.clone()),
             data_hash: Some(m.data_hash.clone()),
@@ -824,6 +836,8 @@ mod tests {
         assert_eq!(record.catalog.tool, "sqlmesh");
         assert_eq!(record.catalog.environment, "prod");
         assert_eq!(record.catalog.total_models, 6);
+        // Prod's virtual objects are the models' own names: no `view`.
+        assert!(record.catalog.models.iter().all(|m| m.view.is_none()));
         // SEED excluded by default: 5 selected.
         assert_eq!(record.catalog.models.len(), 5);
         assert_eq!(record.catalog.unselected_models, 1);
@@ -959,6 +973,78 @@ mod tests {
             .to_string();
         assert!(err.contains("discovers its interface"), "{err}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `discover.environment: <dev env>` — the branch-testing case: the same
+    /// `cell.yaml` (same selection, same overrides, same export names)
+    /// reads that environment's snapshots and binds every export to the
+    /// object SQLMesh exposes *there* (`sqlmesh_example__dev_fixture.*`),
+    /// never prod's.
+    #[test]
+    fn a_dev_environment_binds_to_its_suffixed_virtual_layer() {
+        let cell = CELL.replace(
+            "\x20 state: state\n",
+            "\x20 state: state\n\x20 environment: dev_fixture\n",
+        );
+        let dir = scaffold("dev-env", &cell);
+        let file = dir.join("cell.yaml");
+        sync(&file, "local", false, false).expect("sync against the dev environment");
+        let record = DeployedCatalogRecord::load(&dir).unwrap();
+        assert_eq!(record.catalog.environment, "dev_fixture");
+        assert_eq!(record.catalog.models.len(), 5);
+        let m = record
+            .catalog
+            .models
+            .iter()
+            .find(|m| m.object == "sqlmesh_example.documented_model")
+            .expect("selected and overridden by its model name, as in prod");
+        assert_eq!(m.name, "db.sqlmesh_example.documented_model");
+        assert_eq!(
+            m.view,
+            Some(VirtualObject {
+                catalog: Some("db".to_string()),
+                object: "sqlmesh_example__dev_fixture.documented_model".to_string(),
+            })
+        );
+        assert_eq!(m.description.as_deref(), Some("CHANGED IN DEV"));
+        // Types for an undeclared model came from the dev view, which exists
+        // only under the suffixed schema.
+        let full = record
+            .catalog
+            .models
+            .iter()
+            .find(|m| m.object == "sqlmesh_example.full_model")
+            .unwrap();
+        assert!(matches!(full.columns_source, ColumnsSource::Warehouse));
+        assert_eq!(full.columns["item_id"].ty, "INTEGER");
+
+        let loaded = crate::config::load(&file, "local").unwrap();
+        let names: Vec<&str> = loaded
+            .def
+            .interface
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(names.contains(&"documented"), "{names:?}");
+        let doc = crate::context::build_document(&file, "local", false).unwrap();
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["discovered_from"]["environment"], "dev_fixture");
+        let doc_m = v["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "documented")
+            .unwrap();
+        assert_eq!(
+            doc_m["binding"]["object"],
+            "sqlmesh_example__dev_fixture.documented_model"
+        );
+        assert_eq!(doc_m["route"], "documented@2");
+        // The override's authored description still wins, as in prod.
+        assert_eq!(doc_m["description"], "Authored, so it wins.");
+        // `verify` live-checks the dev views.
+        crate::verify::run(&file, "local", false).expect("verify against the dev views");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

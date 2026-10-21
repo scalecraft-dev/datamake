@@ -221,9 +221,11 @@ pub fn materialize(
             source_name.clone(),
             Source::Connection {
                 connection: d.warehouse.clone(),
-                table: Some(match (&m.catalog, keep_catalog) {
-                    (Some(c), true) => format!("{c}.{}", m.object),
-                    _ => m.object.clone(),
+                // Bound to the object *this* environment exposes — a dev
+                // environment's suffixed view, not prod's.
+                table: Some(match (m.view_catalog(), keep_catalog) {
+                    (Some(c), true) => format!("{c}.{}", m.view_object()),
+                    _ => m.view_object().to_string(),
                 }),
                 query: None,
                 incremental: None,
@@ -290,6 +292,7 @@ mod tests {
             name: format!("db.{object}"),
             object: object.to_string(),
             catalog: Some("db".to_string()),
+            view: None,
             fingerprint: "1".to_string(),
             version: Some("1".to_string()),
             data_hash: Some("d".to_string()),

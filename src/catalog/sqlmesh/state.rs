@@ -41,8 +41,78 @@ pub struct Environment {
     /// Epoch millis; `None` while an apply is between promote and finalize.
     pub finalized_ts: Option<i64>,
     pub catalog_name_override: Option<String>,
+    /// Where a non-prod environment's name lands in its virtual objects
+    /// (`environment_suffix_target` in the project config).
+    pub suffix_target: SuffixTarget,
     /// `(name as stored, fingerprint, version)` per promoted snapshot.
     pub snapshots: Vec<EnvSnapshot>,
+}
+
+/// SQLMesh's `EnvironmentSuffixTarget`: which part of a model's virtual
+/// object carries the environment name when the environment is not prod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuffixTarget {
+    /// `schema__<env>.table` — SQLMesh's default.
+    Schema,
+    /// `schema.table__<env>`.
+    Table,
+    /// `catalog__<env>.schema.table`.
+    Catalog,
+}
+
+impl SuffixTarget {
+    fn parse(raw: Option<&str>, environment: &str) -> Result<Self> {
+        match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Schema),
+            Some(s) if s.eq_ignore_ascii_case("schema") => Ok(Self::Schema),
+            Some(s) if s.eq_ignore_ascii_case("table") => Ok(Self::Table),
+            Some(s) if s.eq_ignore_ascii_case("catalog") => Ok(Self::Catalog),
+            Some(other) => bail!(
+                "environment '{environment}' has suffix_target '{other}', which this datamk \
+                 does not know (schema, table, catalog) — a newer SQLMesh; upgrade datamk"
+            ),
+        }
+    }
+}
+
+impl Environment {
+    /// SQLMesh's `EnvironmentNamingInfo.is_dev`: everything but `prod`.
+    pub fn is_dev(&self) -> bool {
+        !self.name.eq_ignore_ascii_case("prod")
+    }
+
+    /// The virtual object this environment exposes for `model` — what a
+    /// consumer queries — exactly as SQLMesh's
+    /// `QualifiedViewName.table_for_environment` names it. Prod's view is
+    /// the model's own `catalog.schema.table`; a dev environment's carries
+    /// the environment name on the schema (default), table or catalog per
+    /// `suffix_target`, and `catalog_name_override` replaces the catalog
+    /// unless the suffix already went there. The stored environment name is
+    /// already sanitized (`[A-Za-z0-9_]`, lowercased) by SQLMesh, and the
+    /// engines datamk reads (DuckDB, Postgres, BigQuery) normalize
+    /// identifiers to lowercase, so `normalize_name` changes nothing here.
+    pub fn view_of(&self, model: &ModelName) -> ModelName {
+        let mut view = model.clone();
+        let dev = self.is_dev();
+        match self.suffix_target {
+            SuffixTarget::Catalog if dev && view.catalog.is_some() => {
+                view.catalog = view.catalog.map(|c| format!("{c}__{}", self.name));
+            }
+            _ => {
+                if let Some(c) = &self.catalog_name_override {
+                    view.catalog = Some(c.clone());
+                }
+            }
+        }
+        if dev {
+            match self.suffix_target {
+                SuffixTarget::Schema => view.schema = format!("{}__{}", view.schema, self.name),
+                SuffixTarget::Table => view.table = format!("{}__{}", view.table, self.name),
+                SuffixTarget::Catalog => {}
+            }
+        }
+        view
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +128,12 @@ pub struct EnvSnapshot {
 /// fills the rest (`catalog::warehouse`).
 #[derive(Debug, Clone)]
 pub struct StateModel {
+    /// The model's own name — the same in every environment.
     pub name: ModelName,
+    /// The virtual object *this* environment exposes for it
+    /// (`Environment::view_of`): prod's is `name`; a dev environment's is
+    /// suffixed.
+    pub view: ModelName,
     pub raw_name: String,
     pub identifier: String,
     pub version: String,
@@ -167,8 +242,8 @@ pub fn read_environment(
     environment: &str,
 ) -> Result<Environment> {
     let sql = format!(
-        "SELECT name, plan_id, finalized_ts, catalog_name_override, snapshots FROM {} \
-         WHERE name = {}",
+        "SELECT name, plan_id, finalized_ts, catalog_name_override, suffix_target, snapshots \
+         FROM {} WHERE name = {}",
         qualified(alias, schema, "_environments"),
         sql_str(environment)
     );
@@ -181,6 +256,7 @@ pub fn read_environment(
         Option<i64>,
         Option<String>,
         Option<String>,
+        Option<String>,
     );
     let rows: Vec<EnvRow> = stmt
         .query_map([], |r| {
@@ -190,11 +266,12 @@ pub fn read_environment(
                 r.get::<_, Option<i64>>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })
         .context("reading _environments")?
         .collect::<std::result::Result<_, _>>()?;
-    let Some((name, plan_id, finalized_ts, catalog_name_override, snapshots)) =
+    let Some((name, plan_id, finalized_ts, catalog_name_override, suffix_target, snapshots)) =
         rows.into_iter().next()
     else {
         let names = list_environments(conn, alias, schema).unwrap_or_default();
@@ -210,6 +287,7 @@ pub fn read_environment(
         );
     };
     let plan_id = plan_id.with_context(|| format!("environment '{environment}' has no plan_id"))?;
+    let suffix_target = SuffixTarget::parse(suffix_target.as_deref(), environment)?;
     let list: Value = serde_json::from_str(snapshots.as_deref().unwrap_or("[]"))
         .with_context(|| format!("environment '{environment}': `snapshots` is not JSON"))?;
     let Some(entries) = list.as_array() else {
@@ -244,6 +322,7 @@ pub fn read_environment(
         plan_id,
         finalized_ts,
         catalog_name_override: catalog_name_override.filter(|s| !s.is_empty()),
+        suffix_target,
         snapshots: out,
     })
 }
@@ -339,12 +418,8 @@ pub fn read_models(
         let node = snapshot
             .get("node")
             .with_context(|| format!("snapshot {raw_name}: no `node`"))?;
-        let mut name = names::parse(&raw_name)?;
-        // `catalog_name_override` (an environment-wide catalog substitution)
-        // applies to every model's virtual object in that environment.
-        if let Some(c) = &env.catalog_name_override {
-            name.catalog = Some(c.clone());
-        }
+        let name = names::parse(&raw_name)?;
+        let view = env.view_of(&name);
         let data_hash = snapshot
             .get("fingerprint")
             .and_then(|f| f.get("data_hash"))
@@ -397,6 +472,7 @@ pub fn read_models(
             .unwrap_or_default();
         let model = StateModel {
             name,
+            view,
             raw_name: raw_name.clone(),
             identifier: identifier.clone(),
             version: version.unwrap_or_else(|| env_snapshot.version.clone()),
@@ -510,9 +586,11 @@ pub(crate) mod fixture {
 
     /// A state store **file** plus the virtual-layer objects the fixture
     /// project's `prod` environment exposes (`sqlmesh_example.*`, with the
-    /// column/object comments SQLMesh registered) — what a `type: duckdb`
-    /// profile connection points at, so `sync`, `verify` and `context` run
-    /// end to end against a real database on disk.
+    /// column/object comments SQLMesh registered) and the `dev_fixture`
+    /// environment's (`sqlmesh_example__dev_fixture.*`, views as SQLMesh
+    /// creates them) — what a `type: duckdb` profile connection points at,
+    /// so `sync`, `verify` and `context` run end to end against a real
+    /// database on disk.
     pub fn build_file(path: &std::path::Path) {
         let conn = duckdb::Connection::open(path).unwrap();
         load_state_tables(&conn);
@@ -571,6 +649,20 @@ pub(crate) mod fixture {
                     .unwrap();
                 }
             }
+        }
+        // The dev environment's virtual layer: `environment_suffix_target:
+        // schema` (the default) puts every model's view in
+        // `<schema>__<env>`.
+        conn.execute_batch("CREATE SCHEMA sqlmesh_example__dev_fixture;")
+            .unwrap();
+        for o in &objects {
+            let table = o["table"].as_str().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE VIEW sqlmesh_example__dev_fixture.{t} AS SELECT * FROM \
+                 sqlmesh_example.{t};",
+                t = q(table)
+            ))
+            .unwrap();
         }
     }
 
@@ -667,6 +759,14 @@ mod tests {
             .unwrap();
         assert_eq!(dev_doc.description.as_deref(), Some("CHANGED IN DEV"));
         assert_ne!(dev_doc.identifier, doc.identifier);
+        // The model is the same model in both environments; what differs
+        // is the virtual object each environment exposes for it.
+        assert_eq!(dev_doc.name, doc.name);
+        assert_eq!(doc.view.unquoted(), "db.sqlmesh_example.documented_model");
+        assert_eq!(
+            dev_doc.view.unquoted(),
+            "db.sqlmesh_example__dev_fixture.documented_model"
+        );
         assert_eq!(
             dev_doc.version, doc.version,
             "a metadata-only change keeps the data version"
@@ -705,6 +805,73 @@ mod tests {
         let row = &intervals[&inc.raw_name];
         assert!(row.start_ts < row.end_ts);
         assert!(!row.pending_restatement);
+    }
+
+    #[test]
+    fn dev_views_follow_sqlmesh_suffix_target_rules() {
+        let model = names::parse("\"db\".\"sales\".\"orders\"").unwrap();
+        let env = |name: &str, target: SuffixTarget, over: Option<&str>| Environment {
+            name: name.to_string(),
+            plan_id: "p".to_string(),
+            finalized_ts: Some(0),
+            catalog_name_override: over.map(str::to_string),
+            suffix_target: target,
+            snapshots: Vec::new(),
+        };
+        let v = |e: &Environment| e.view_of(&model).unquoted();
+        // Prod: the model's own name, whatever the suffix target.
+        assert_eq!(
+            v(&env("prod", SuffixTarget::Schema, None)),
+            "db.sales.orders"
+        );
+        assert_eq!(
+            v(&env("prod", SuffixTarget::Table, None)),
+            "db.sales.orders"
+        );
+        assert_eq!(
+            v(&env("prod", SuffixTarget::Catalog, None)),
+            "db.sales.orders"
+        );
+        // Dev: the environment name lands where the project said.
+        assert_eq!(
+            v(&env("dev_rachel", SuffixTarget::Schema, None)),
+            "db.sales__dev_rachel.orders"
+        );
+        assert_eq!(
+            v(&env("dev_rachel", SuffixTarget::Table, None)),
+            "db.sales.orders__dev_rachel"
+        );
+        assert_eq!(
+            v(&env("dev_rachel", SuffixTarget::Catalog, None)),
+            "db__dev_rachel.sales.orders"
+        );
+        // `catalog_name_override` replaces the catalog — in prod too — except
+        // when the environment suffix already went on the catalog.
+        assert_eq!(
+            v(&env("prod", SuffixTarget::Schema, Some("dw"))),
+            "dw.sales.orders"
+        );
+        assert_eq!(
+            v(&env("dev_rachel", SuffixTarget::Schema, Some("dw"))),
+            "dw.sales__dev_rachel.orders"
+        );
+        assert_eq!(
+            v(&env("dev_rachel", SuffixTarget::Catalog, Some("dw"))),
+            "db__dev_rachel.sales.orders"
+        );
+        // A two-part name has no catalog to suffix.
+        let two = names::parse("sales.orders").unwrap();
+        assert_eq!(
+            env("dev_rachel", SuffixTarget::Catalog, None)
+                .view_of(&two)
+                .unquoted(),
+            "sales.orders"
+        );
+        // An unknown target is refused by name.
+        let err = SuffixTarget::parse(Some("database"), "dev")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("database") && err.contains("dev"), "{err}");
     }
 
     #[test]

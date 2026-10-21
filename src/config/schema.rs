@@ -206,7 +206,10 @@ pub type FromMap = IndexMap<String, Origin>;
 #[serde(deny_unknown_fields)]
 pub struct Discover {
     pub from: DiscoverFrom,
-    /// The tool environment to read — the deployed one, never a dev env.
+    /// The tool environment to read. `prod` (the default) for a deployed
+    /// cell; a dev environment (`dev_rachel`) to test a branch — exports
+    /// then bind to that environment's virtual objects
+    /// (`schema__dev_rachel.table`), never prod's.
     #[serde(default = "default_environment")]
     pub environment: String,
     /// `profiles/<p>.yaml` `connections.<name>`: the tool's state store.

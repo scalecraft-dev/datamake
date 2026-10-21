@@ -6,6 +6,20 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Fixed: `discover.environment: <dev env>` binds to that environment's views (ADR 0016 §3 amendment)
+
+A discovered cell pointed at a non-prod SQLMesh environment read the
+environment's snapshots but resolved columns from, and bound every export
+to, prod's objects (`ape_core.x`), so a dev run silently served prod rows
+and a model only the dev environment had failed `sync` as unresolvable.
+`sync` now names each model's virtual object the way SQLMesh does for that
+environment — `schema__<env>.table` by default, or the table/catalog
+variant per the environment row's `suffix_target` — and reads the warehouse
+and binds the source there. Selection, `overrides[].model` and export
+names still use the model's own `schema.table`, so one `cell.yaml` tests a
+branch (`environment: dev_rachel`) and serves prod unchanged. The record
+carries the view as `models[].view` when it differs from `object`.
+
 ### Added: `?view=index` — a whole-cell projection cheap enough for an agent to read (ADR 0012 §4, ADR 0017 §2, ADR 0018 §7 amendments)
 
 On a real 42-export/47-dataset cell, `GET /context` measured 429 KB

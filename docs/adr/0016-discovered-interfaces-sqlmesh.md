@@ -80,7 +80,7 @@ description: Deployed invoicing models from the dw-main SQLMesh project.
 
 discover:
   from: sqlmesh                 # closed set; `dbt` when its adapter lands
-  environment: prod             # default prod — the deployed environment, never a dev env
+  environment: prod             # default prod; a dev env binds to its suffixed views (§3)
   state: sqlmesh_state          # profiles/<p>.yaml connections.<name>: the state DB
   warehouse: dw_silver          # profiles/<p>.yaml connections.<name>: INFORMATION_SCHEMA reads
   select:                       # REQUIRED. No "everything" default. At least one of
@@ -187,11 +187,22 @@ Other verbs on a discovered cell:
   round-trips and that the prod row for a model with a coexisting dev
   snapshot resolves to the prod fingerprint.
 - **Names:** parsed by a quoted-identifier splitter (`"a"."b"."c"`, with
-  `""` escapes), never `split('.')`. The virtual (prod) object is
+  `""` escapes), never `split('.')`. The model's object is
   `<schema>.<table>` in `<catalog>`, from the environment entry's name —
   **never the physical `sqlmesh__<schema>.<schema>__<table>__<version>`**,
-  which changes every plan. `catalog_name_override` (NULL on mountain) is
-  applied when present; `gateway_managed` affects execution, not naming.
+  which changes every plan. Selection, overrides and export names use that
+  object, so one `cell.yaml` means the same thing in every environment.
+  What an export *binds to* is the environment's **view** of the model,
+  named as SQLMesh's `QualifiedViewName.table_for_environment` names it:
+  prod's view is the object itself; a dev environment's carries the
+  environment name per the row's `suffix_target` — `schema__<env>.table`
+  (the default), `schema.table__<env>`, or `catalog__<env>.schema.table`.
+  `catalog_name_override` (NULL on mountain) replaces the catalog unless
+  the suffix went there; `gateway_managed` affects execution, not naming.
+  Warehouse column reads and the synthesized source both use the view
+  (amendment 2026-10: before it, a dev-environment sync read and served
+  prod's objects, and a model only the dev environment had failed to
+  resolve).
 - **Pinning:** `_versions.schema_version` must be in a tested set (today
   `{100}`); mismatch is a hard error naming both numbers. The sqlmesh
   version string is **not** pinned (mountain runs a fork). Every blob field

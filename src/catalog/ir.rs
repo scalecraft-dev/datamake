@@ -63,11 +63,20 @@ pub struct DeployedModel {
     /// Unquoted `catalog.schema.table` (or `schema.table`), the tool's own
     /// model name.
     pub name: String,
-    /// `schema.table` — the **virtual** object consumers query in this
-    /// environment, never the version-suffixed physical table.
+    /// `schema.table` — the model's own object, the same in every
+    /// environment: what `discover.select`/`overrides[].model` name and
+    /// what export names derive from. Never the version-suffixed physical
+    /// table.
     pub object: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<String>,
+    /// The **virtual** object this environment exposes for the model —
+    /// what consumers (and the synthesized source) query. Absent when it
+    /// is `catalog`/`object` itself (prod, the common case); a dev
+    /// environment's carries the environment name
+    /// (`schema__dev_x.table`), per the tool's suffix rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<VirtualObject>,
     /// The exact deployed snapshot: SQLMesh's snapshot identifier; dbt's
     /// file checksum. Opaque — a change token, never parsed.
     pub fingerprint: String,
@@ -102,6 +111,33 @@ pub struct DeployedModel {
     pub intervals: Option<Interval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_restatement: Option<bool>,
+}
+
+/// A virtual object that differs from the model's own name: the catalog it
+/// lives in (`None` for a two-part name) and its `schema.table`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualObject {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+    pub object: String,
+}
+
+impl DeployedModel {
+    /// The catalog of the object consumers query in this environment.
+    pub fn view_catalog(&self) -> Option<&str> {
+        match &self.view {
+            Some(v) => v.catalog.as_deref(),
+            None => self.catalog.as_deref(),
+        }
+    }
+
+    /// The `schema.table` consumers query in this environment.
+    pub fn view_object(&self) -> &str {
+        match &self.view {
+            Some(v) => v.object.as_str(),
+            None => self.object.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

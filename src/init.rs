@@ -88,7 +88,7 @@ description: One line — what this set of deployed models is for.
 # warehouse's registered comments); `overrides:` refines, never invents.
 discover:
   from: sqlmesh
-  environment: prod            # the deployed environment — never a dev env
+  environment: prod            # prod to serve; a dev env (dev_rachel) to test a branch
   state: sqlmesh_state         # -> profiles/<p>.yaml connections.sqlmesh_state
   warehouse: warehouse         # -> profiles/<p>.yaml connections.warehouse
   select:                      # REQUIRED: at least one of tags/schemas/models.
