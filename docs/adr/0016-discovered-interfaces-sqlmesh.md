@@ -199,10 +199,16 @@ Other verbs on a discovered cell:
   (the default), `schema.table__<env>`, or `catalog__<env>.schema.table`.
   `catalog_name_override` (NULL on mountain) replaces the catalog unless
   the suffix went there; `gateway_managed` affects execution, not naming.
+  A dev plan creates views only for the snapshots in the row's
+  `promoted_snapshot_ids` (NULL: all of them — prod, or
+  `include_unmodified`); a model the plan did not promote binds to prod's
+  view, since its snapshot *is* prod's and that view is the only one it
+  has — the same resolution SQLMesh applies inside the environment.
   Warehouse column reads and the synthesized source both use the view
   (amendment 2026-10: before it, a dev-environment sync read and served
   prod's objects, and a model only the dev environment had failed to
-  resolve).
+  resolve; v0.0.34 suffixed every model and so failed on the unchanged
+  ones).
 - **Pinning:** `_versions.schema_version` must be in a tested set (today
   `{100}`); mismatch is a hard error naming both numbers. The sqlmesh
   version string is **not** pinned (mountain runs a fork). Every blob field

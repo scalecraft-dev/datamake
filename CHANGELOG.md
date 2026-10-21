@@ -6,6 +6,17 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/); dates are
 
 ## [Unreleased]
 
+### Fixed: a dev environment's unchanged models bind to prod's views (ADR 0016 §3)
+
+v0.0.34 named every model's object with the dev suffix, but a default
+`sqlmesh plan <dev>` (`include_unmodified` off) creates views only for the
+models it changed, so `sync` failed on each unchanged model
+(`ape_core__dev_x.dim_y` does not exist). `sync` now reads the environment
+row's `promoted_snapshot_ids`: a promoted model binds to the dev view, an
+unpromoted one to prod's — its snapshot is prod's, and that is the view
+SQLMesh itself resolves it to inside the environment. A null list (prod,
+or `--include-unmodified`) promotes everything, as before.
+
 ### Fixed: `discover.environment: <dev env>` binds to that environment's views (ADR 0016 §3 amendment)
 
 A discovered cell pointed at a non-prod SQLMesh environment read the

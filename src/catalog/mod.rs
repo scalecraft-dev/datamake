@@ -1008,16 +1008,28 @@ mod tests {
             })
         );
         assert_eq!(m.description.as_deref(), Some("CHANGED IN DEV"));
-        // Types for an undeclared model came from the dev view, which exists
-        // only under the suffixed schema.
+        // The dev plan did not promote `full_model` (unchanged; a default
+        // plan creates no dev view for it), so it binds to prod's object —
+        // and its types still resolve, from there.
         let full = record
             .catalog
             .models
             .iter()
             .find(|m| m.object == "sqlmesh_example.full_model")
             .unwrap();
+        assert!(full.view.is_none(), "{:?}", full.view);
         assert!(matches!(full.columns_source, ColumnsSource::Warehouse));
         assert_eq!(full.columns["item_id"].ty, "INTEGER");
+        assert_eq!(
+            record
+                .catalog
+                .models
+                .iter()
+                .filter(|m| m.view.is_some())
+                .count(),
+            1,
+            "exactly the promoted model carries a dev view"
+        );
 
         let loaded = crate::config::load(&file, "local").unwrap();
         let names: Vec<&str> = loaded
@@ -1041,6 +1053,13 @@ mod tests {
             "sqlmesh_example__dev_fixture.documented_model"
         );
         assert_eq!(doc_m["route"], "documented@2");
+        let full_doc = v["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "sqlmesh_example_full_model")
+            .unwrap();
+        assert_eq!(full_doc["binding"]["object"], "sqlmesh_example.full_model");
         // The override's authored description still wins, as in prod.
         assert_eq!(doc_m["description"], "Authored, so it wins.");
         // `verify` live-checks the dev views.

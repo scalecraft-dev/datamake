@@ -72,9 +72,11 @@ pub struct DeployedModel {
     pub catalog: Option<String>,
     /// The **virtual** object this environment exposes for the model —
     /// what consumers (and the synthesized source) query. Absent when it
-    /// is `catalog`/`object` itself (prod, the common case); a dev
-    /// environment's carries the environment name
-    /// (`schema__dev_x.table`), per the tool's suffix rules.
+    /// is `catalog`/`object` itself: prod, and a dev environment's
+    /// *unchanged* models (a default dev plan creates no view for those;
+    /// their snapshot is prod's). A model the dev plan promoted carries the
+    /// environment name (`schema__dev_x.table`), per the tool's suffix
+    /// rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<VirtualObject>,
     /// The exact deployed snapshot: SQLMesh's snapshot identifier; dbt's
