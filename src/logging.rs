@@ -367,6 +367,7 @@ mod tests {
             file: "cell.yaml".into(),
             profile: "local".into(),
             semantic_only: false,
+            no_doc_checks: false,
         });
         let status = Command::Status(FileArgs {
             file: "cell.yaml".into(),

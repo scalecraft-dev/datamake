@@ -20,6 +20,11 @@ pub struct CellDef {
     /// as `principals:`.
     #[serde(default)]
     pub docs: Option<String>,
+    /// ADR 0019: a profile connection whose free dry run (`verify`) checks
+    /// every fenced `sql` block in this cell's `docs:` page. Requires `docs:`.
+    /// A page that opts in promises its SQL runs as written.
+    #[serde(default)]
+    pub check: Option<String>,
     /// External inputs, bound as session-local TEMP VIEWs before transforms run.
     /// A source is either a raw path/URI or a reference to another cell's table.
     #[serde(default)]
@@ -112,6 +117,10 @@ pub struct Definition {
     /// `target: "definition:<term>"`.
     #[serde(default)]
     pub docs: Option<String>,
+    /// ADR 0019: the connection this page's `sql` blocks are dry-run against
+    /// by `verify`. Requires `docs:`.
+    #[serde(default)]
+    pub check: Option<String>,
     /// `name@major` or `name@major.column`; empty means cell-wide (applies
     /// to no particular export). Validated against the discoverable
     /// interface by `validate_applies_to` — deferred past `config::load`'s
@@ -437,6 +446,10 @@ pub struct Export {
     /// description lint (`verify`, ADR 0013).
     #[serde(default)]
     pub docs: Option<String>,
+    /// ADR 0019: the connection this page's `sql` blocks are dry-run against
+    /// by `verify`. Requires `docs:`.
+    #[serde(default)]
+    pub check: Option<String>,
     /// Grain columns: exposed as equality filters and uniqueness-checked by `verify`.
     #[serde(default)]
     pub grain: Vec<String>,
@@ -1899,6 +1912,7 @@ mod tests {
             bind: None,
             description: None,
             docs: None,
+            check: None,
             grain: vec![],
             schema: IndexMap::new(),
             freshness: None,
@@ -3014,6 +3028,58 @@ cells:
         assert!(def.definitions_file.is_none(), "inline form sets no file");
         def.validate_definitions()
             .expect("well-formed inline definitions must pass");
+    }
+
+    // --- ADR 0019: `check:` on a docs page ---------------------------------
+
+    /// The field is accepted at every level a `docs:` page is declared. The
+    /// connection name is a profile fact, validated when `verify` runs, so
+    /// parsing never needs a profile.
+    #[test]
+    fn check_parses_at_the_cell_export_and_definition_levels() {
+        let def = resolve_defs(
+            "cell: c\n\
+             docs: docs/overview.md\n\
+             check: warehouse\n\
+             interface:\n\
+             \x20 - name: e\n\
+             \x20   version: 1.0.0\n\
+             \x20   docs: docs/e.md\n\
+             \x20   check: warehouse\n\
+             definitions:\n\
+             \x20 - term: net_revenue\n\
+             \x20   description: Invoiced revenue less credit memos.\n\
+             \x20   docs: docs/nr.md\n\
+             \x20   check: reporting\n",
+        )
+        .unwrap();
+        assert_eq!(def.check.as_deref(), Some("warehouse"));
+        assert_eq!(def.interface[0].check.as_deref(), Some("warehouse"));
+        assert_eq!(def.definitions[0].check.as_deref(), Some("reporting"));
+    }
+
+    #[test]
+    fn a_check_typo_on_a_definition_is_denied_as_an_unknown_field() {
+        let err = resolve_defs(
+            "cell: c\n\
+             definitions:\n\
+             \x20 - term: t\n\
+             \x20   description: d\n\
+             \x20   chek: warehouse\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `chek`"), "got: {err}");
+    }
+
+    #[test]
+    fn a_check_typo_on_an_export_is_denied_as_an_unknown_field() {
+        let err = serde_yaml::from_str::<CellDef>(
+            "cell: c\ninterface:\n  - name: e\n    version: 1.0.0\n    chek: warehouse\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `chek`"), "got: {err}");
     }
 
     #[test]

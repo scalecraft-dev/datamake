@@ -958,7 +958,7 @@ mod tests {
             .contains("CHANGED IN DEV"));
 
         // `verify` live-checks the bound exports against the duckdb file.
-        crate::verify::run(&file, "local", false).expect("verify the discovered cell");
+        crate::verify::run(&file, "local", false, true).expect("verify the discovered cell");
         let doc = crate::context::build_document(&file, "local", true).unwrap();
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["status"], "verified_at_source", "{v}");
@@ -1063,7 +1063,7 @@ mod tests {
         // The override's authored description still wins, as in prod.
         assert_eq!(doc_m["description"], "Authored, so it wins.");
         // `verify` live-checks the dev views.
-        crate::verify::run(&file, "local", false).expect("verify against the dev views");
+        crate::verify::run(&file, "local", false, true).expect("verify against the dev views");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

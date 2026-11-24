@@ -2328,6 +2328,7 @@ mod tests {
             bind: None,
             description: None,
             docs: None,
+            check: None,
             grain: vec!["order_date".to_string(), "region".to_string()],
             schema,
             freshness: None,
@@ -2864,7 +2865,7 @@ pub(in crate::serve) mod smoke {
                 "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
             )
             .unwrap();
-            crate::verify::run(&dir.join("cell.yaml"), "local", false)
+            crate::verify::run(&dir.join("cell.yaml"), "local", false, true)
                 .expect("live-verify the all-bound scaffold, writing .cell/source_check.json");
             Scaffold { dir }
         })
@@ -2942,7 +2943,7 @@ pub(in crate::serve) mod smoke {
                 "catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n",
             )
             .unwrap();
-            crate::verify::run(&cell_yaml, "local", false)
+            crate::verify::run(&cell_yaml, "local", false, true)
                 .expect("live-verify the all-bound scaffold, writing .cell/source_check.json");
 
             let cell_yaml_digest = crate::context::cell_yaml_digest_of(&cell_yaml).unwrap();

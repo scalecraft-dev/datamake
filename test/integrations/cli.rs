@@ -848,6 +848,105 @@ fn run_help_documents_full_refresh_and_verify_replay() {
     );
 }
 
+// --- ADR 0019: checked SQL in docs pages -------------------------------
+
+/// A bound cell (no snapshot needed) whose cell page opts into `check:`.
+/// The page's SQL is never actually run here: the connection resolves to a
+/// connector with no free dry run, which is exactly the skip path the
+/// default suite can exercise offline.
+fn docs_check_fixture(tag: &str, profile_connections: &str) -> PathBuf {
+    let dir = scratch_dir(tag);
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    std::fs::write(
+        dir.join("cell.yaml"),
+        "cell: docs_check\n\
+         docs: docs/recipes.md\n\
+         check: warehouse\n\
+         interface:\n\
+         \x20 - name: rows\n\
+         \x20   version: 1.0.0\n\
+         \x20   description: One row per id.\n\
+         \x20   bind: raw\n\
+         \x20   schema:\n\
+         \x20     id: bigint\n\
+         sources:\n\
+         \x20 raw: ./data.csv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("docs/recipes.md"),
+        "# Recipes\n\n```sql\nSELECT 1\n```\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("data.csv"), "id\n1\n").unwrap();
+    std::fs::write(
+        dir.join("profiles/local.yaml"),
+        format!("catalog: ./.cell/catalog.ducklake\nstorage: ./.cell/data\n{profile_connections}"),
+    )
+    .unwrap();
+    dir
+}
+
+/// The lean for the ADR's open question 1: a rollout that runs `verify`
+/// before `serve` can skip page checks entirely, and `--no-doc-checks` skips
+/// the connection-name validation with them.
+#[test]
+fn verify_doc_checks_validate_the_connection_and_the_flag_skips_them() {
+    let dir = docs_check_fixture("doc-check-unknown", "");
+    let out = run(&dir, &["verify", "-f", "cell.yaml", "-p", "local"]);
+    assert!(
+        !out.status.success(),
+        "an unknown `check:` connection must fail verify"
+    );
+    let text = combined(&out);
+    assert!(text.contains("`check: warehouse`"), "got: {text}");
+    assert!(text.contains("`connections.warehouse`"), "got: {text}");
+
+    run_ok(
+        &dir,
+        &[
+            "verify",
+            "-f",
+            "cell.yaml",
+            "-p",
+            "local",
+            "--no-doc-checks",
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A connector with no free dry run skips the page with one note naming the
+/// connector, never a failure (the same capability-gap rule ADR 0007 §4
+/// applies to the `query:` preflight).
+#[test]
+fn verify_skips_a_docs_page_when_its_connector_has_no_dry_run() {
+    let dir = docs_check_fixture(
+        "doc-check-no-dry-run",
+        "connections:\n  warehouse:\n    type: duckdb\n    path: ./wh.duckdb\n",
+    );
+    let out = run_ok(&dir, &["verify", "-f", "cell.yaml", "-p", "local"]);
+    let text = combined(&out);
+    assert!(
+        text.contains("connector 'duckdb' has no free dry run"),
+        "got: {text}"
+    );
+    assert!(text.contains("docs/recipes.md"), "got: {text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn verify_help_documents_no_doc_checks() {
+    let out = Command::new(bin())
+        .args(["verify", "--help"])
+        .output()
+        .expect("spawning datamk verify --help");
+    assert!(out.status.success(), "verify --help must succeed");
+    let help = combined(&out);
+    assert!(help.contains("--no-doc-checks"), "help: {help}");
+    assert!(help.contains("docs-page SQL checks"), "help: {help}");
+}
+
 /// A `connection` source with an `incremental:` block still goes through the
 /// same profile-resolution path as a plain connection source: if the profile
 /// has no matching `connections.<name>` entry, `run` must fail with the
