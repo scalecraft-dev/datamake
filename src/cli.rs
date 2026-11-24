@@ -386,6 +386,12 @@ pub struct VerifyArgs {
     /// see docs/guides/semantic-model.md.
     #[arg(long)]
     pub semantic_only: bool,
+    /// Skip the docs-page SQL checks (ADR 0019): no `check:` page's `sql`
+    /// blocks are dry-run against their connection, and `check:` names go
+    /// unvalidated. For deployments that run `verify` before `serve`, where
+    /// prose must not be able to block a rollout; CI runs the full check.
+    #[arg(long)]
+    pub no_doc_checks: bool,
 }
 
 #[derive(Args)]

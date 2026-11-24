@@ -125,6 +125,7 @@ definitions:                                       # or: definitions: definition
 | `description` | Cell: one line. Export and column: ~2 sentences. Length-capped at parse. |
 | `unit` | Token, ≤16 chars, no whitespace. |
 | `docs` | One relative path per level. ≤64 KiB per page, ≤256 KiB per cell. Empty, non-UTF-8, or oversized is a parse error. No `/docs/:name` route. |
+| `check` | A profile connection name. `verify` dry-runs every fenced block whose info string is exactly `sql` in that page, in order, and fails on a query error; `sql no-check` opts a block out. Requires `docs:`. Connectors with no free dry run (Postgres, Snowflake, DuckDB) skip the page with one note. `verify --no-doc-checks` skips this step. ADR 0019. |
 | `definitions` | Inline list or one file path. Lookup by term or alias, case-insensitive, exact only. |
 | `terms=` | Narrows `definitions[]` and `docs[]` to those terms' pages. Served: unknown term is 200 with `missing_terms`. `datamk context --terms`: unknown term exits non-zero, naming the known-term count and up to 8 nearest matches (prefix, then substring, then same-first-3-characters) — never the whole vocabulary. `--model` naming an unknown model gets the same treatment. |
 

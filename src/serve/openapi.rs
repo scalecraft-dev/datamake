@@ -895,6 +895,7 @@ mod tests {
             bind: None,
             description: None,
             docs: None,
+            check: None,
             grain: vec!["order_date".to_string()],
             schema,
             freshness: None,
@@ -933,6 +934,7 @@ mod tests {
             cell: "orders".to_string(),
             description: None,
             docs: None,
+            check: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![
@@ -1183,6 +1185,7 @@ mod tests {
             cell: "orders".to_string(),
             description: None,
             docs: None,
+            check: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![export_with(
@@ -1286,6 +1289,7 @@ mod tests {
             cell: "orders".to_string(),
             description: None,
             docs: None,
+            check: None,
             sources: IndexMap::new(),
             transforms: vec![],
             interface: vec![],

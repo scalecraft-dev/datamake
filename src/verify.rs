@@ -317,7 +317,7 @@ pub(crate) fn check_bind_target(export_name: &str, bind: &str, def: &CellDef) ->
 /// serialization style), stamped with the current `cell.yaml` digest so a
 /// stale record (the config changed since this check ran) is detectable and
 /// silently omitted rather than misapplied — see `context::emit`.
-pub fn run(file: &Path, profile: &str, semantic_only: bool) -> Result<()> {
+pub fn run(file: &Path, profile: &str, semantic_only: bool, doc_checks: bool) -> Result<()> {
     let cell = engine::open(file, profile, true)?;
     if semantic_only {
         return run_semantic_only(&cell, file, profile);
@@ -361,6 +361,16 @@ pub fn run(file: &Path, profile: &str, semantic_only: bool) -> Result<()> {
             "writing the live-verify source-descriptions record \
              (.cell/source_descriptions.json)",
         )?;
+    }
+    // ADR 0019: the docs-page SQL checks run last, on the same DuckDB
+    // connection. The profile is re-read here rather than threaded through
+    // `engine::Cell` because `check:` names an environment fact only this
+    // step needs, and a connections-free Server profile must still load.
+    if doc_checks {
+        let profile_path = cell.dir.join("profiles").join(format!("{profile}.yaml"));
+        let bindings = crate::config::Bindings::load(&profile_path)
+            .context("reading the profile for the docs-page SQL checks (ADR 0019)")?;
+        crate::doc_checks::run(&cell.conn, &cell.dir, &cell.def, &bindings, profile)?;
     }
     Ok(())
 }
@@ -3082,7 +3092,7 @@ interface:
         write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
 
         let file = dir.join("cell.yaml");
-        run(&file, "local", false).expect("live-verify of a clean all-bound cell must pass");
+        run(&file, "local", false, true).expect("live-verify of a clean all-bound cell must pass");
         assert!(
             dir.join(".cell/source_check.json").is_file(),
             "a passing live check must leave a .cell/source_check.json record behind"
@@ -3091,7 +3101,7 @@ interface:
         // Now break the grain at the source and confirm the live check
         // actually catches it — not a stale skip, a real, running check.
         write_csv(&dir, "data.csv", &[(1, "a"), (1, "b")]);
-        let err = run(&file, "local", false).unwrap_err().to_string();
+        let err = run(&file, "local", false, true).unwrap_err().to_string();
         assert!(
             err.contains("is not unique"),
             "a broken grain at the live source must fail verify with the usual grain-violation \
@@ -3136,12 +3146,12 @@ interface:
         // materialized export genuinely has nothing to check without one.
         crate::engine::run(&file, "local", None, crate::engine::RunOptions::default())
             .expect("build the mixed cell");
-        run(&file, "local", false).expect("live-verify of a clean mixed cell must pass");
+        run(&file, "local", false, true).expect("live-verify of a clean mixed cell must pass");
 
         // Break the bound export live (the source, re-read fresh on every
         // verify) without touching the lake at all.
         write_csv(&dir, "data.csv", &[(1, "a"), (1, "b")]);
-        let err = run(&file, "local", false).unwrap_err().to_string();
+        let err = run(&file, "local", false, true).unwrap_err().to_string();
         assert!(
             err.contains("export 'virtual_pii'") && err.contains("is not unique"),
             "the bound export's live grain violation must be caught: got {err}"
@@ -3158,7 +3168,7 @@ interface:
             .execute_batch("INSERT INTO stg VALUES (1, 'dup');")
             .expect("insert a duplicate key directly into the materialized table");
         drop(cell);
-        let err = run(&file, "local", false).unwrap_err().to_string();
+        let err = run(&file, "local", false, true).unwrap_err().to_string();
         assert!(
             err.contains("export 'stg'") && err.contains("is not unique"),
             "the materialized export's grain violation must still be caught against the lake: \
@@ -3237,7 +3247,7 @@ interface:
 
         let file = dir.join("cell.yaml");
         crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
-        run(&file, "local", false)
+        run(&file, "local", false, true)
             .expect("live-verify of a bound export with a bound semantic model");
 
         let record = crate::ossie::record::SemanticCheckRecord::load(&dir)
@@ -3298,7 +3308,7 @@ interface:
 
         let file = dir.join("cell.yaml");
         crate::catalog::sync(&file, "local", false, false).expect("datamk sync (Ossie half)");
-        run(&file, "local", true).expect("--semantic-only must pass on a clean cell");
+        run(&file, "local", true, true).expect("--semantic-only must pass on a clean cell");
 
         assert!(
             crate::ossie::record::SemanticCheckRecord::load(&dir).is_some(),
@@ -3337,7 +3347,7 @@ interface:
         write_csv(&dir, "data.csv", &[(1, "a"), (2, "b")]);
 
         let file = dir.join("cell.yaml");
-        let err = run(&file, "local", true).unwrap_err().to_string();
+        let err = run(&file, "local", true, true).unwrap_err().to_string();
         assert!(err.contains("--semantic-only"), "{err}");
         assert!(err.contains("nothing to check"), "{err}");
 

@@ -4229,7 +4229,7 @@ interface:
     fn context_embeds_source_check_and_reports_verified_at_source_after_a_passing_live_verify() {
         let dir = all_bound_cell_dir("fresh");
         let file = dir.join("cell.yaml");
-        crate::verify::run(&file, "local", false).expect("live-verify the all-never cell");
+        crate::verify::run(&file, "local", false, true).expect("live-verify the all-never cell");
         assert!(
             dir.join(".cell/source_check.json").is_file(),
             "verify must have written the source-check record"
@@ -4327,7 +4327,7 @@ interface:
     fn source_check_carries_the_grain_measurement_through_to_the_document() {
         let dir = all_bound_cell_dir("measurements");
         let file = dir.join("cell.yaml");
-        crate::verify::run(&file, "local", false).expect("live-verify the all-bound cell");
+        crate::verify::run(&file, "local", false, true).expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
         emit(&file, "local", Some(&out), false, None, None, None, false)
@@ -4358,7 +4358,7 @@ interface:
         // along as if it still applied.
         let dir = all_bound_cell_dir("stale");
         let file = dir.join("cell.yaml");
-        crate::verify::run(&file, "local", false).expect("live-verify the all-never cell");
+        crate::verify::run(&file, "local", false, true).expect("live-verify the all-never cell");
         assert!(dir.join(".cell/source_check.json").is_file());
 
         // Edit cell.yaml after the check ran — the record's digest no
@@ -4836,7 +4836,7 @@ interface:
              \x20 raw: ./data.csv\n",
         )
         .unwrap();
-        crate::verify::run(&file, "local", false).expect("live-verify the all-bound cell");
+        crate::verify::run(&file, "local", false, true).expect("live-verify the all-bound cell");
 
         let out = dir.join("context.json");
         emit(&file, "local", Some(&out), false, None, None, None, false)

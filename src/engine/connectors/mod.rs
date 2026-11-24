@@ -720,6 +720,14 @@ impl ResolvedConnection {
         }
     }
 
+    /// Whether `query_dry_run_sql` can produce a statement for this
+    /// connector. Derived from it rather than a second match so the two can
+    /// never disagree; ADR 0019's docs-page check uses it to skip a page with
+    /// one note instead of dry-running nothing silently.
+    pub fn has_dry_run(&self) -> bool {
+        self.query_dry_run_sql("SELECT 1").is_some()
+    }
+
     /// Whether `err` (from the ADR 0007 §4 dry-run preflight) is the
     /// connector's shape of "the author's query itself is wrong" —
     /// narrowly matched; anything else is treated as a transport-ish

@@ -1,6 +1,6 @@
 # ADR 0019: Checked SQL in docs pages (`check:` and a dry-run verify step)
 
-- **Status:** Proposed, 2026-11-23. Design first; no code until this is agreed.
+- **Status:** Accepted, 2026-11-24.
 - **Date:** 2026-11-23
 - **Deciders:** Datamake team
 - **Author:** @tonytusharjr
@@ -74,12 +74,16 @@ from starting, and handlers never touch the warehouse for docs (ADR 0013).
 
 ### 4. Where the result lives
 
-A check result is a machine fact, so it goes beside the page's existing
-fingerprint in `observed`, carried through `published.json` like
-`docs[].{sha256, bytes}`: `{checked_at, connection, blocks, failed}`. Never in
-`declared` and never in the interface digest: a recipe edit is not an
-interface change (ADR 0013 §5's reasoning, unchanged). An agent reading a
-page can then see whether its SQL was last checked and when.
+**Deferred to a follow-up.** This slice ships the check itself (sections 1 to
+3) and nothing else; a result recorded in `observed` lands separately.
+
+The decision when it does: a check result is a machine fact, so it goes
+beside the page's existing fingerprint in `observed`, carried through
+`published.json` like `docs[].{sha256, bytes}`:
+`{checked_at, connection, blocks, failed}`. Never in `declared` and never in
+the interface digest: a recipe edit is not an interface change (ADR 0013 §5's
+reasoning, unchanged). An agent reading a page can then see whether its SQL
+was last checked and when.
 
 ## Consequences
 
@@ -90,17 +94,18 @@ page can then see whether its SQL was last checked and when.
 - Pages that opt in must keep their default parameters runnable. That is a
   real constraint on authors and the intended one.
 
-## Open questions for the deciders
+## Resolved questions
 
-1. **Deployed cells that verify on start.** Some deployments run `verify`
-   before `serve` in the container entrypoint. Should a failed page check fail
-   that start (consistent with "verify fails loud"), or should checks be
-   skippable there with a flag (`verify --no-doc-checks`) so prose can never
-   block a rollout? This ADR leans to the flag, with CI running the full check.
-2. **Info string.** Is `sql no-check` the right opt-out spelling, or should the
-   opt-in be per block (`sql check`) instead of per page?
-3. **Scope.** Is the cell page worth including, or should `check:` be limited
-   to definition and export pages, where recipes actually live?
+1. **Deployed cells that verify on start.** `verify` gains
+   `--no-doc-checks`, which skips the whole step, connection-name validation
+   included, so prose can never block a rollout. It stays on by default and CI
+   runs the full check.
+2. **Info string.** `sql no-check` is the per-block opt-out, and the page is
+   still the opt-in: an untouched page costs nothing, and an author never has
+   to remember to opt each runnable block in.
+3. **Scope.** The cell page is included. `check:` is accepted anywhere a
+   `docs:` page is declared (cell, export, definition), and it is an error to
+   set it without a page.
 
 ## Alternatives considered
 

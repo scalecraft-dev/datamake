@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod context;
 mod deploy;
+mod doc_checks;
 mod engine;
 mod init;
 mod interface;
@@ -94,7 +95,7 @@ async fn dispatch(command: Command) -> Result<()> {
             engine::run(&a.file, &a.profile, retention_secs, opts)
         }
         Command::Sync(a) => catalog::sync(&a.file, &a.profile, a.dry_run, a.refetch),
-        Command::Verify(a) => verify::run(&a.file, &a.profile, a.semantic_only),
+        Command::Verify(a) => verify::run(&a.file, &a.profile, a.semantic_only, !a.no_doc_checks),
         Command::Release(a) => release::run(&a.file, &a.profile),
         Command::Deploy(a) => deploy::run(&a).await,
         Command::Serve(a) => {

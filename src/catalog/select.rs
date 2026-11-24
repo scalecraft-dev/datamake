@@ -240,6 +240,7 @@ pub fn materialize(
             bind: Some(source_name),
             description,
             docs: o.and_then(|o| o.docs.clone()),
+            check: None,
             grain,
             schema,
             freshness: None,

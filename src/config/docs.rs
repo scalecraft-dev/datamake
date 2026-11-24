@@ -79,7 +79,7 @@ pub(crate) fn guess_media_type(path: &str) -> &'static str {
 /// `definition '{term}':`. Every docs error is phrased around one of these
 /// shapes, matching `validate_prose`'s existing "cell `description`" /
 /// "export '{name}': `description`" split.
-fn clause(owner: DocsOwner) -> String {
+pub(crate) fn clause(owner: DocsOwner) -> String {
     match owner {
         DocsOwner::Cell => "cell".to_string(),
         DocsOwner::Export(n) => format!("export '{n}':"),
@@ -213,6 +213,33 @@ pub(crate) fn read_definitions_file(cell_dir: &Path, raw: &str) -> Result<String
         .map_err(|_| anyhow::anyhow!("the definitions file {raw} is not valid UTF-8."))
 }
 
+/// ADR 0019: `check:` names the connection a page's SQL blocks are dry-run
+/// against, so it is meaningless without a page. Pure and offline (the
+/// connection itself is a profile fact, validated when `verify` runs):
+/// checked here so every command rejects the mispairing at parse time.
+fn validate_check_requires_docs(
+    owner: DocsOwner,
+    check: &Option<String>,
+    docs: &Option<String>,
+) -> Result<()> {
+    if check.is_some() && docs.is_none() {
+        bail!(
+            "{} `check:` names a connection to dry-run a docs page's SQL blocks against, but \
+             this level declares no `docs:` page; add one, or drop `check:`.",
+            clause(owner)
+        );
+    }
+    Ok(())
+}
+
+/// Read one already-validated `docs:` page's content. The path went through
+/// `validate_all` at load; re-resolving it here keeps the same allowlist for
+/// callers that read it later (`verify`'s ADR 0019 SQL checks) rather than
+/// joining a raw string onto the cell dir.
+pub(crate) fn read_page(cell_dir: &Path, raw: &str, owner: DocsOwner) -> Result<String> {
+    Ok(read_one(cell_dir, raw, owner)?.1)
+}
+
 /// Validate every declared `docs:` page — cell-level plus every export
 /// (private and public alike; a malformed page is a `cell.yaml` error
 /// regardless of whether it would ever be served) — resolving paths,
@@ -222,6 +249,14 @@ pub(crate) fn read_definitions_file(cell_dir: &Path, raw: &str) -> Result<String
 /// `deploy`, `serve`, `datamk context`) gets a validated cell before
 /// anything opens a connection.
 pub fn validate_all(cell_dir: &Path, def: &CellDef) -> Result<()> {
+    validate_check_requires_docs(DocsOwner::Cell, &def.check, &def.docs)?;
+    for export in &def.interface {
+        validate_check_requires_docs(DocsOwner::Export(&export.name), &export.check, &export.docs)?;
+    }
+    for d in &def.definitions {
+        validate_check_requires_docs(DocsOwner::Definition(&d.term), &d.check, &d.docs)?;
+    }
+
     let mut total = 0usize;
     if let Some(raw) = &def.docs {
         let (_, content) = read_one(cell_dir, raw, DocsOwner::Cell)?;
@@ -341,6 +376,35 @@ mod tests {
         serde_yaml::from_str(&yaml).unwrap()
     }
 
+    // --- ADR 0019: `check:` requires a page ----------------------------
+
+    #[test]
+    fn rejects_a_cell_level_check_without_a_docs_page() {
+        let dir = tempdir("check-without-docs");
+        let def: CellDef = serde_yaml::from_str(
+            "cell: c\ncheck: warehouse\ninterface:\n  - name: e\n    version: 1.0.0\n",
+        )
+        .unwrap();
+        let err = validate_all(&dir, &def).unwrap_err().to_string();
+        assert!(err.contains("`check:`"), "{err}");
+        assert!(err.contains("declares no `docs:` page"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_definition_check_without_a_docs_page_naming_the_term() {
+        let dir = tempdir("definition-check-without-docs");
+        // Through `CellDef::load` so the inline definitions are collapsed
+        // into `definitions` first, as they are on the real load path.
+        std::fs::write(
+            dir.join("cell.yaml"),
+            "cell: c\ndefinitions:\n  - term: net_revenue\n    description: d\n    check: warehouse\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", CellDef::load(&dir.join("cell.yaml")).unwrap_err());
+        assert!(err.contains("definition 'net_revenue':"), "{err}");
+        assert!(err.contains("declares no `docs:` page"), "{err}");
+    }
+
     // --- security: path resolution -----------------------------------
 
     #[test]
@@ -451,6 +515,7 @@ mod tests {
                 bind: None,
                 description: None,
                 docs: Some(name),
+                check: None,
                 grain: vec![],
                 schema: Default::default(),
                 freshness: None,
